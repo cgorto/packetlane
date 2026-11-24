@@ -1,0 +1,267 @@
+//! Reading log files. Inputs are opened read-only and never written.
+
+use std::fmt;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
+
+use crate::pure::checksum::{FNV_OFFSET, fnv1a_update};
+use crate::pure::decode::{
+    DecodeEnd, DecodeError, Decoder, Format, MAX_ENTRY, Record, SNIFF_LEN, Step, sniff,
+};
+
+const CHUNK: usize = 64 * 1024;
+
+/// Opens a file read-only and guesses its format from the first bytes.
+/// The returned file is positioned at the start.
+pub fn open_sniffed(path: &Path) -> io::Result<(Format, File)> {
+    let mut file = File::open(path)?;
+    let mut prefix = vec![0u8; SNIFF_LEN];
+    let n = read_full(&mut file, &mut prefix)?;
+    prefix.truncate(n);
+    file.seek(SeekFrom::Start(0))?;
+    Ok((sniff(&prefix), file))
+}
+
+/// Fills `buf` as far as the source allows and returns how many bytes it got.
+pub fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(k) => n += k,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(n)
+}
+
+/// Passes reads through while keeping a checksum and byte count of them.
+pub struct Hashing<R> {
+    inner: R,
+    state: u64,
+    bytes: u64,
+}
+
+impl<R: Read> Hashing<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: FNV_OFFSET,
+            bytes: 0,
+        }
+    }
+
+    /// Reads whatever is left, then returns (checksum, total bytes).
+    pub fn finish(mut self) -> io::Result<(u64, u64)> {
+        let mut sink = vec![0u8; CHUNK];
+        while self.read(&mut sink)? > 0 {}
+        Ok((self.state, self.bytes))
+    }
+}
+
+impl<R: Read> Read for Hashing<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.state = fnv1a_update(self.state, &buf[..n]);
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+
+#[derive(Debug)]
+pub enum ReadError {
+    Io(io::Error),
+    Decode(DecodeEnd),
+}
+
+impl fmt::Display for ReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReadError::Io(e) => write!(f, "Read failed: {e}"),
+            ReadError::Decode(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+/// Drives a decoder from a reader: the read loop that the pure decoders do
+/// not have. Yields records, then at most one error, then stops.
+pub struct Records<R> {
+    inner: R,
+    decoder: Box<dyn Decoder>,
+    buf: Vec<u8>,
+    start: usize,
+    base: u64,
+    eof: bool,
+    done: bool,
+}
+
+impl<R: Read> Records<R> {
+    pub fn new(inner: R, decoder: Box<dyn Decoder>) -> Self {
+        Self {
+            inner,
+            decoder,
+            buf: Vec::new(),
+            start: 0,
+            base: 0,
+            eof: false,
+            done: false,
+        }
+    }
+
+    /// Gives the reader back, for example to finish a checksum.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
+    fn fail(&mut self, e: ReadError) -> Option<Result<Record, ReadError>> {
+        self.done = true;
+        Some(Err(e))
+    }
+
+    fn implausible(&mut self, reason: &'static str) -> Option<Result<Record, ReadError>> {
+        let offset = self.base + self.start as u64;
+        self.fail(ReadError::Decode(DecodeEnd::Error(
+            DecodeError::Implausible { offset, reason },
+        )))
+    }
+}
+
+impl<R: Read> Iterator for Records<R> {
+    type Item = Result<Record, ReadError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let offset = self.base + self.start as u64;
+            let pending = &self.buf[self.start..];
+            match self.decoder.step(pending, offset) {
+                Step::Record { consumed, record } => {
+                    if consumed == 0 || consumed > pending.len() {
+                        return self.implausible("invalid decoder step");
+                    }
+                    self.start += consumed;
+                    return Some(Ok(record));
+                }
+                Step::Skip { consumed } => {
+                    if consumed == 0 || consumed > pending.len() {
+                        return self.implausible("invalid decoder step");
+                    }
+                    self.start += consumed;
+                }
+                Step::Fatal(e) => return self.fail(ReadError::Decode(DecodeEnd::Error(e))),
+                Step::NeedMore => {
+                    let available = pending.len();
+                    if self.eof {
+                        self.done = true;
+                        if available == 0 {
+                            return None;
+                        }
+                        return Some(Err(ReadError::Decode(DecodeEnd::Truncated {
+                            offset,
+                            available,
+                        })));
+                    }
+                    if available > MAX_ENTRY {
+                        return self.implausible("entry too large");
+                    }
+                    self.buf.drain(..self.start);
+                    self.base += self.start as u64;
+                    self.start = 0;
+                    let old = self.buf.len();
+                    self.buf.resize(old + CHUNK, 0);
+                    match read_full(&mut self.inner, &mut self.buf[old..]) {
+                        Ok(n) => {
+                            self.buf.truncate(old + n);
+                            if n < CHUNK {
+                                self.eof = true;
+                            }
+                        }
+                        Err(e) => {
+                            self.buf.truncate(old);
+                            return self.fail(ReadError::Io(e));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pure::decode::raw::RawDecoder;
+    use crate::pure::synth::Source;
+
+    /// Hands out one byte per read, to exercise every refill path.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match (self.0.split_first(), buf.first_mut()) {
+                (Some((&b, rest)), Some(slot)) => {
+                    *slot = b;
+                    self.0 = rest;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    fn sample(n: usize) -> Vec<u8> {
+        let mut src = Source::new(0x1A3, 0, 500);
+        (0..n).flat_map(|_| src.emit()).collect()
+    }
+
+    #[test]
+    fn streams_across_chunk_boundaries() {
+        let data = sample(400); // about 200 KiB: several refills
+        let records: Vec<_> = Records::new(&data[..], Box::new(RawDecoder::new()))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 400);
+        assert_eq!(records[399].offset, 399 * 506);
+    }
+
+    #[test]
+    fn trickled_input_gives_the_same_records() {
+        let data = sample(5);
+        let records: Vec<_> = Records::new(Trickle(&data), Box::new(RawDecoder::new()))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 5);
+    }
+
+    #[test]
+    fn truncated_tail_is_reported_once() {
+        let data = sample(3);
+        let items: Vec<_> =
+            Records::new(&data[..data.len() - 7], Box::new(RawDecoder::new())).collect();
+        assert_eq!(items.len(), 3);
+        assert!(items[0].is_ok() && items[1].is_ok());
+        assert!(matches!(
+            items[2],
+            Err(ReadError::Decode(DecodeEnd::Truncated {
+                offset: 1012,
+                available: 499
+            }))
+        ));
+    }
+
+    #[test]
+    fn hashing_matches_a_direct_checksum() {
+        let data = sample(50);
+        let mut records = Records::new(Hashing::new(&data[..]), Box::new(RawDecoder::new()));
+        assert_eq!(records.by_ref().take(2).count(), 2);
+        let (sum, bytes) = records.into_inner().finish().unwrap();
+        assert_eq!(bytes, data.len() as u64);
+        assert_eq!(sum, crate::pure::checksum::fnv1a(&data));
+    }
+}

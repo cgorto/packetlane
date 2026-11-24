@@ -1,0 +1,59 @@
+# Development container: the Rust toolchain and the Helix editor on a RHEL 9
+# base image.
+#
+# A stub. It has not been built as part of this repository's checks; expect to
+# adjust it for your base image and network. Build from the repository root:
+#
+#   podman build -t packetlane-dev -f container/Containerfile \
+#       --build-arg BASE_IMAGE=<your RHEL 9 base image> .
+#
+# See container/README.md for how to run it.
+
+ARG BASE_IMAGE=registry.access.redhat.com/ubi9/ubi
+FROM ${BASE_IMAGE}
+
+ARG RUST_VERSION=stable
+ARG HELIX_REF=25.07.1
+
+# gcc: the bundled SQLite is C. gcc-c++: Helix's grammars need C++14.
+# clang-tools-extra: clang-format and clangd, for the C++ editor settings.
+RUN dnf install -y gcc gcc-c++ make git tar xz which clang-tools-extra \
+    && dnf clean all
+
+# Rust, installed once for every user. The toolchain lives in /opt/rust; each
+# user's own registry cache and builds stay in their home (~/.cargo).
+#
+# Without internet access, either point rustup at a mirror with
+# RUSTUP_DIST_SERVER and RUSTUP_UPDATE_ROOT, or replace this step with
+# `dnf install -y rust-toolset` if that provides Rust 1.88 or newer, which
+# this project needs.
+ENV RUSTUP_HOME=/opt/rust/rustup \
+    PATH=/opt/rust/cargo/bin:/usr/local/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | CARGO_HOME=/opt/rust/cargo sh -s -- -y --no-modify-path \
+          --profile default --default-toolchain ${RUST_VERSION} \
+    && rustup component add rust-analyzer \
+    && chmod -R a+rX /opt/rust
+
+# Helix, built from source as its documentation describes. The build also
+# fetches and compiles the tree-sitter grammars into runtime/, so it needs
+# network access to github.com (or a mirror) and to a crate registry.
+RUN git clone --depth 1 --branch ${HELIX_REF} \
+      https://github.com/helix-editor/helix /tmp/helix \
+    && cd /tmp/helix \
+    && CARGO_HOME=/opt/rust/cargo cargo install --path helix-term --locked --root /usr/local \
+    && rm -rf runtime/grammars/sources \
+    && mkdir -p /usr/local/share/helix \
+    && cp -r runtime /usr/local/share/helix/runtime \
+    && cd / && rm -rf /tmp/helix /opt/rust/cargo/registry /opt/rust/cargo/git
+ENV HELIX_RUNTIME=/usr/local/share/helix/runtime
+
+# Editor settings. Helix reads them from ~/.config/helix, and the home folder
+# is normally mounted from the host, so they are kept here and copied into
+# place at start-up only if the home has none.
+COPY container/helix /usr/local/share/helix/config
+COPY container/entrypoint.sh /usr/local/bin/dev-entrypoint
+RUN chmod 0755 /usr/local/bin/dev-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/dev-entrypoint"]
+CMD ["bash"]

@@ -1,0 +1,51 @@
+<header id="bar">
+  <select id="run" aria-label="Run"></select>
+  <div id="clock" role="group" aria-label="Clock">
+    <button data-clock="receive">Receive</button>
+    <button data-clock="packet">Packet</button>
+    <button data-clock="order">Order</button>
+  </div>
+  <input id="search" type="search" placeholder="Search" aria-label="Search" autocomplete="off" spellcheck="false">
+  <span class="grow"></span>
+  <button id="fit">Fit</button>
+  <button id="open-files">Files</button>
+  <button id="open-sql">SQL</button>
+</header>
+<div id="main">
+  <section id="center">
+    <div id="axis-row"><button id="unhide" aria-label="Show hidden" hidden></button><canvas id="axis"></canvas></div>
+    <div id="scroll"><div id="rows"><div id="labels"></div><div id="stage"><canvas id="tl"></canvas></div></div></div>
+    <div id="over-row"><span id="date"></span><canvas id="over"></canvas></div>
+  </section>
+  <aside id="side">
+    <nav id="tabs">
+      <button data-tab="problems">Problems <b id="n-problems"></b></button>
+      <button data-tab="detail">Details</button>
+      <button data-tab="hits">Hits <b id="n-hits"></b></button>
+    </nav>
+    <div id="problems" class="pane"></div>
+    <div id="detail" class="pane"></div>
+    <div id="hits" class="pane"></div>
+  </aside>
+</div>
+<div id="tip" hidden></div>
+<dialog id="files">
+  <div class="dlg-head"><button id="up" aria-label="Up">&#8593;</button><span id="cwd"></span><span class="grow"></span><button id="ingest">Ingest</button><button data-close aria-label="Close">&#10005;</button></div>
+  <div id="entries"></div>
+  <div id="files-error" class="error"></div>
+</dialog>
+<dialog id="sql">
+  <div class="dlg-head"><span class="grow"></span><button id="run-sql">Run</button><button data-close aria-label="Close">&#10005;</button></div>
+  <div id="qb">
+    <select id="qb-table" aria-label="Table"></select>
+    <div id="qb-filters"></div>
+    <button id="qb-add" aria-label="Add filter">+</button>
+    <span class="grow"></span>
+    <select id="qb-sort" aria-label="Sort"></select>
+    <button id="qb-desc" aria-label="Descending">&#8595;</button>
+    <input id="qb-limit" type="number" min="1" max="1000" value="100" aria-label="Limit">
+  </div>
+  <textarea id="sql-text" spellcheck="false" aria-label="SQL"></textarea>
+  <div id="sql-error" class="error"></div>
+  <div id="sql-result"></div>
+</dialog>
