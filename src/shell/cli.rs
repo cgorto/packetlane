@@ -86,13 +86,15 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     } else {
         " (guessed)"
     };
-    println!("{path}: format {}{certainty}", format.name());
+    let wrapped = if file.is_gzip() { ", in gzip" } else { "" };
+    println!("{path}: format {}{certainty}{wrapped}", format.name());
 
     let mut checker = Checker::new();
     let mut packets = 0u64;
     let mut other = 0u64;
     let mut read_problem = None;
-    let mut records = Records::new(BufReader::new(file), decoder);
+    let mut file = file;
+    let mut records = Records::new(BufReader::new(&mut file), decoder);
     for item in &mut records {
         match item {
             Ok(record) => match whole_packet_header(&record.payload) {
@@ -102,7 +104,7 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
                 }
                 None => other += 1,
             },
-            Err(e) => read_problem = Some(e),
+            Err(e) => read_problem = Some(e.to_string()),
         }
     }
     let report = checker.finish();
@@ -125,7 +127,12 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     for finding in &report.findings {
         println!("  Problem: {finding}");
     }
-    let notices = records.notices();
+    let notices = records.notices().clone();
+    drop(records);
+    if let Some(why) = file.fault() {
+        read_problem
+            .get_or_insert_with(|| format!("Compressed data unreadable past this point: {why}"));
+    }
     for notice in &notices.list {
         let what = if notice.is_problem() {
             "Problem"

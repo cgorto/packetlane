@@ -963,3 +963,125 @@ fn a_cadu_file_needs_no_configuration_when_its_frames_say_enough() {
     );
     assert_eq!(count(&store, "SELECT COUNT(*) FROM findings"), 0);
 }
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Gzip files are read as what they hold: packet logs, CADUs and text.
+/// Offsets count bytes of the content, and packets can be read back.
+#[test]
+fn gzip_files_are_read_as_their_content() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::format::hex;
+    use packetlane::pure::synth::{Source, cosmos2_entry, cosmos2_header, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("a")).unwrap();
+    let mut src = Source::new(0x1A3, 0, 300);
+    let packets: Vec<Vec<u8>> = (0..20).map(|_| src.emit()).collect();
+
+    let mut cosmos = cosmos2_header(true, "CFG", "host");
+    for (i, p) in packets.iter().enumerate() {
+        cosmos.extend(cosmos2_entry(
+            1_700_000_000_000_000_000 + i as i64,
+            "SIM",
+            "HK",
+            p,
+        ));
+    }
+    fs::write(run.join("a/tlm.bin.gz"), gzip(&cosmos)).unwrap();
+    let params = Config::default().frame_params(256);
+    let mut framed = Config::parse("[frames]\nrandomized = true\ncrc = true\n")
+        .unwrap()
+        .frame_params(256);
+    framed.cadu_len = params.cadu_len;
+    fs::write(
+        run.join("a/pass.cadu.gz"),
+        gzip(&demo_cadus(&framed, &packets.concat())),
+    )
+    .unwrap();
+    fs::write(
+        run.join("a/messages.txt.gz"),
+        gzip(b"2026/01/02 03:04:05.123  INFO: one\n2026/01/02 03:04:06.000  WARN: two\n"),
+    )
+    .unwrap();
+    // Two members back to back are one file's content.
+    let (first, second) = cosmos.split_at(cosmos.len() / 2);
+    fs::write(
+        run.join("a/split.bin.gz"),
+        [gzip(first), gzip(second)].concat(),
+    )
+    .unwrap();
+    // Cut short: what decompresses is used, and the cut is reported.
+    let whole = gzip(&cosmos);
+    fs::write(run.join("a/cut.bin.gz"), &whole[..whole.len() * 2 / 3]).unwrap();
+    // A gzip file inside a gzip file is not unwrapped twice.
+    fs::write(
+        run.join("a/twice.gz"),
+        gzip(&gzip(b"2026-01-02 03:04:05 x\n")),
+    )
+    .unwrap();
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let file = |rel: &str| summary.files.iter().find(|f| f.rel == rel).unwrap();
+
+    let tlm = file("a/tlm.bin.gz");
+    assert_eq!((tlm.format, tlm.packets), ("cosmos2", 20));
+    assert_eq!(tlm.note, "gzip; COSMOS config CFG on host");
+    let pass = file("a/pass.cadu.gz");
+    assert_eq!((pass.format, pass.packets), ("cadu", 20), "{}", pass.note);
+    assert!(
+        pass.note
+            .starts_with("gzip; TM frames in 256-byte CADUs, randomised, CRC")
+    );
+    let text = file("a/messages.txt.gz");
+    assert_eq!(
+        (text.format, text.entries, text.note.as_str()),
+        ("text", 2, "gzip")
+    );
+    assert_eq!(file("a/split.bin.gz").packets, 20);
+    assert_eq!(file("a/twice.gz").status, Status::NotReadable);
+
+    let cut = file("a/cut.bin.gz");
+    assert_eq!(cut.status, Status::Ingested);
+    assert!(cut.packets > 0 && cut.packets < 20, "{}", cut.packets);
+    assert!(
+        cut.note
+            .contains("Compressed data unreadable past this point"),
+        "{}",
+        cut.note
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM findings f JOIN files x ON x.id = f.file_id
+             WHERE x.rel = 'a/cut.bin.gz' AND f.message LIKE 'Compressed data%'"
+        ),
+        1
+    );
+
+    let ids = store
+        .query_user(
+            "SELECT p.id, p.idx FROM packets p JOIN files f ON f.id = p.file_id
+             WHERE f.rel IN ('a/tlm.bin.gz', 'a/pass.cadu.gz') AND p.idx IN (0, 7, 19)
+             ORDER BY p.id",
+            100,
+        )
+        .unwrap();
+    assert_eq!(ids.rows.len(), 6);
+    drop(store);
+    let get = serve(db, run);
+    for row in &ids.rows {
+        let body = get(&format!("/api/packet?id={}", row[0].int().unwrap()));
+        assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+        let packet = &packets[row[1].int().unwrap() as usize];
+        let shown = &packet[..packet.len().min(body["hex"].as_str().unwrap().len() / 2)];
+        assert_eq!(body["hex"], hex(shown));
+    }
+}

@@ -17,10 +17,12 @@ use crate::pure::config::{Config, ResolvedTime, SourceInfo};
 use crate::pure::continuity::Checker;
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
-use crate::pure::ingest::{FindingRow, LaneKey, file_findings, packet_row, ptype_code};
+use crate::pure::ingest::{
+    FindingRow, LaneKey, SEVERITY_PROBLEM, file_findings, packet_row, ptype_code,
+};
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
-use crate::shell::files::{Hashing, ReadError, Records, open_sniffed};
+use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -335,13 +337,13 @@ impl Store {
             }
         }
 
-        let (format, file) = open_sniffed(path)?;
+        let (format, mut file) = open_sniffed(path)?;
         let decoder = decoder_for(format, config);
         if format != Format::Text && decoder.is_none() {
             // Nothing to store. Keep the removal of an earlier version, if any.
             tx.commit()?;
             let note = match format {
-                Format::Gzip => "Compressed file; decompress a copy and ingest that",
+                Format::Gzip => "Compressed file that cannot be read, or holds another one",
                 Format::Empty => "Empty file",
                 _ => "Unrecognised format",
             };
@@ -369,16 +371,43 @@ impl Store {
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
                 let (packets, note) = ingest_packets(
-                    &tx, file, decoder, file_id, run_id, &source, time_rule, &mut lanes,
+                    &tx, &mut file, decoder, file_id, run_id, &source, time_rule, &mut lanes,
                 )?;
                 (packets, 0, note)
             }
             None => {
                 let assembler = Assembler::new(config.log_format_for(rel, source.utc_offset_s));
-                let entries = ingest_text(&tx, file, file_id, &source, assembler, &mut lanes)?;
+                let entries = ingest_text(&tx, &mut file, file_id, &source, assembler, &mut lanes)?;
                 (0, entries, String::new())
             }
         };
+        // How the content was reached, what it says about itself and how
+        // reading ended, then why the compressed data gave out, if it did.
+        let fault = file
+            .fault()
+            .map(|why| format!("Compressed data unreadable past this point: {why}"));
+        let note: Vec<String> = file
+            .is_gzip()
+            .then(|| "gzip".to_string())
+            .into_iter()
+            .chain((!note.is_empty()).then_some(note))
+            .chain(fault.clone())
+            .collect();
+        let note = note.join("; ");
+        if let Some(message) = fault {
+            tx.execute(
+                sql::INSERT_FINDING,
+                params![
+                    run_id,
+                    file_id,
+                    None::<i64>,
+                    None::<i64>,
+                    SEVERITY_PROBLEM,
+                    "truncated",
+                    message
+                ],
+            )?;
+        }
 
         tx.execute(
             sql::FINISH_FILE,
@@ -435,7 +464,7 @@ impl<'a> Lanes<'a> {
 #[allow(clippy::too_many_arguments)]
 fn ingest_packets(
     conn: &Connection,
-    file: File,
+    file: &mut Source,
     decoder: Box<dyn Decoder>,
     file_id: i64,
     run_id: i64,
@@ -548,7 +577,7 @@ fn read_line_bounded<R: BufRead>(r: &mut R, out: &mut Vec<u8>, max: usize) -> io
 
 fn ingest_text(
     conn: &Connection,
-    file: File,
+    file: &mut Source,
     file_id: i64,
     source: &SourceInfo,
     mut assembler: Assembler,

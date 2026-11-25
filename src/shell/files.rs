@@ -5,6 +5,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+use flate2::read::MultiGzDecoder;
+
 use crate::pure::checksum::{FNV_OFFSET, fnv1a_update};
 use crate::pure::config::Config;
 use crate::pure::decode::cadu::MAX_CADU_LEN;
@@ -16,15 +18,89 @@ use crate::pure::frame::SYNC;
 
 const CHUNK: usize = 64 * 1024;
 
-/// Opens a file read-only and guesses its format from the first bytes.
-/// The returned file is positioned at the start.
-pub fn open_sniffed(path: &Path) -> io::Result<(Format, File)> {
+/// A log file's content: the file itself, or what its gzip wrapper holds.
+/// Offsets everywhere else in this program count bytes of this content.
+pub struct Source {
+    inner: Inner,
+    fault: Option<String>,
+}
+
+enum Inner {
+    Plain(File),
+    Gzip(Box<MultiGzDecoder<File>>),
+}
+
+impl Source {
+    pub fn is_gzip(&self) -> bool {
+        matches!(self.inner, Inner::Gzip(_))
+    }
+
+    /// Why the compressed data could not be read to its end, if it could
+    /// not. Reading stops there as if the content ended, so that what came
+    /// before is still used.
+    pub fn fault(&self) -> Option<&str> {
+        self.fault.as_deref()
+    }
+
+    /// Moves from the start of the content to `offset`. A plain file seeks;
+    /// compressed content has to be decompressed up to there.
+    fn skip_to(&mut self, offset: u64) -> io::Result<()> {
+        match &mut self.inner {
+            Inner::Plain(file) => file.seek(SeekFrom::Start(offset)).map(|_| ()),
+            Inner::Gzip(_) => io::copy(&mut self.take(offset), &mut io::sink()).map(|_| ()),
+        }
+    }
+}
+
+impl Read for Source {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match &mut self.inner {
+            Inner::Plain(file) => file.read(buf),
+            Inner::Gzip(_) if self.fault.is_some() => Ok(0),
+            Inner::Gzip(gz) => match gz.read(buf) {
+                Err(e) if e.kind() != io::ErrorKind::Interrupted => {
+                    self.fault = Some(e.to_string());
+                    Ok(0)
+                }
+                other => other,
+            },
+        }
+    }
+}
+
+/// Opens a file read-only and guesses its format from the first bytes. A
+/// gzip file is opened as what it holds, and the format is that content's.
+/// `Format::Gzip` is left for one that cannot be decompressed at all, or
+/// that holds another gzip file. The returned source is at the start.
+pub fn open_sniffed(path: &Path) -> io::Result<(Format, Source)> {
+    let plain = |file| Source {
+        inner: Inner::Plain(file),
+        fault: None,
+    };
     let mut file = File::open(path)?;
     let mut prefix = vec![0u8; SNIFF_LEN];
     let n = read_full(&mut file, &mut prefix)?;
-    prefix.truncate(n);
     file.seek(SeekFrom::Start(0))?;
-    Ok((sniff(&prefix), file))
+    let format = sniff(&prefix[..n]);
+    if format != Format::Gzip {
+        return Ok((format, plain(file)));
+    }
+    let mut unzipped = Source {
+        inner: Inner::Gzip(Box::new(MultiGzDecoder::new(File::open(path)?))),
+        fault: None,
+    };
+    let n = read_full(&mut unzipped, &mut prefix)?;
+    let inside = sniff(&prefix[..n]);
+    if n == 0 || inside == Format::Gzip {
+        return Ok((Format::Gzip, plain(file)));
+    }
+    Ok((
+        inside,
+        Source {
+            inner: Inner::Gzip(Box::new(MultiGzDecoder::new(file))),
+            fault: None,
+        },
+    ))
 }
 
 /// How far past a packet's first byte to keep decoding before giving up on
@@ -49,31 +125,34 @@ pub fn read_back(
     length: usize,
     accept: impl Fn(&[u8]) -> bool,
 ) -> io::Result<Option<Vec<u8>>> {
-    let (format, mut file) = open_sniffed(path)?;
+    let (format, mut source) = open_sniffed(path)?;
     if !matches!(format, Format::Cadu(_)) {
-        file.seek(SeekFrom::Start(offset))?;
+        source.skip_to(offset)?;
         let mut bytes = vec![0u8; length];
-        let got = read_full(&mut file, &mut bytes)?;
+        let got = read_full(&mut source, &mut bytes)?;
         return Ok((got == length && accept(&bytes)).then_some(bytes));
     }
 
+    // Everything that could matter, in memory: back far enough to hold the
+    // marker of the frame the packet starts in, and on to its end.
     let from = offset.saturating_sub(MAX_CADU_LEN as u64);
-    file.seek(SeekFrom::Start(from))?;
-    let mut window = vec![0u8; (offset - from) as usize];
-    let got = read_full(&mut file, &mut window)?;
-    window.truncate(got);
-    let markers: Vec<u64> = window
+    source.skip_to(from)?;
+    let before = (offset - from) as usize;
+    let mut bytes = Vec::new();
+    source
+        .take(before as u64 + READ_BACK_SPAN)
+        .read_to_end(&mut bytes)?;
+    let markers: Vec<usize> = bytes[..before.min(bytes.len())]
         .windows(SYNC.len())
         .enumerate()
         .filter(|(_, w)| *w == SYNC)
-        .map(|(i, _)| from + i as u64)
+        .map(|(i, _)| i)
         .collect();
     for &start in markers.iter().rev().take(READ_BACK_TRIES) {
         let Some(decoder) = decoder_for(format, config) else {
             break;
         };
-        file.seek(SeekFrom::Start(start))?;
-        for item in Records::starting_at(io::BufReader::new(&file), decoder, start) {
+        for item in Records::starting_at(&bytes[start..], decoder, from + start as u64) {
             match item {
                 Ok(r) if r.offset == offset => {
                     if r.payload.len() == length && accept(&r.payload) {
