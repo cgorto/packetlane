@@ -43,7 +43,8 @@ file container      whatever the logging program wraps around each entry
   are packed inside frames and can straddle two frames, so they must be
   reassembled before packet parsing. Treat transfer frames as a separate layer
   that outputs a packet stream; do not mix reassembly into a packet parser.
-  (This codebase does not implement a transfer-frame layer yet.)
+  Here that layer is `src/pure/frame.rs` (one frame) and
+  `src/pure/decode/cadu.rs` (finding frames and reassembling packets).
 
 A decoder's job ends at: "here is one logged item, the byte offset where its
 payload starts in the file, and the receive time and label if the container
@@ -484,6 +485,9 @@ pub enum Step {
     /// `consumed` bytes of structure (a file header, a declaration) that
     /// produced no record. Drop them and call again.
     Skip { consumed: usize },
+    /// `consumed` bytes that could not be turned into records, and what
+    /// that cost. Drop them and call again.
+    Lost { consumed: usize, notice: Notice },
     /// The next entry is not complete in the bytes offered. Call again with
     /// the same bytes plus more. At end of file this means a truncated tail.
     NeedMore,
@@ -767,17 +771,19 @@ can jump straight to the bytes with `xxd -s 0x4f2a10 -l 64 file.bin`.
 **Rule:** Decide the resynchronisation policy per format:
 
 - **Formats with a sync marker** (such as transfer frames starting with
-  `1A CF FC 1D`): scan forward to the next marker, verify markers repeat at the
-  expected frame spacing, and report how many bytes were skipped. (Not yet
-  implemented in this codebase.)
+  `1A CF FC 1D`): scan forward to the next marker and report what was passed
+  over with `Step::Lost`. `cadu.rs` does this for bytes outside any frame,
+  frames that fail to parse, and jumps in a virtual channel's frame count.
+  It does not yet check that a marker found after junk is followed by
+  another at the frame spacing, so without a frame CRC a chance marker in
+  junk is read as a frame.
 - **Length-prefixed formats with no marker** (bare packets, COSMOS 4, COSMOS 5,
   `PKLG`): one bad length loses the rest of the stream. The built-in decoders
-  stop with `Step::Fatal`. Note that `Step` currently has no "skipped corrupt
-  range with warning" variant — `Step::Skip` is silent and is only for normal
+  stop with `Step::Fatal`. `Step::Skip` is silent and is only for normal
   container structure such as file headers or declarations. If a custom format
   ever requires scanning past corruption, resync only at a position where
   several entries in a row chain cleanly (plausible lengths, CCSDS version 0,
-  known APIDs) and report the skipped byte range explicitly.
+  known APIDs) and report the skipped byte range with `Step::Lost`.
 
 ---
 
