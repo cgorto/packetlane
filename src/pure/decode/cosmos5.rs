@@ -579,4 +579,49 @@ mod tests {
             );
         }
     }
+
+    /// A file laid out as the COSMOS 5 writer lays one out once it has
+    /// written others: targets numbered on from 15, a target declared again
+    /// for its commands, packet declarations with ids, a closing marker.
+    #[test]
+    fn reads_a_file_laid_out_as_cosmos_5_writes_them() {
+        let mut writer = Cosmos5Writer::like_cosmos(15);
+        let mut data = Cosmos5Writer::magic();
+        let tlm = packet(3, 1, &[1, 2, 3]);
+        let cmd = packet(999, 0, &[4]);
+        data.extend(writer.entry(1_000, "INST", "PARAMS", &tlm, false));
+        data.extend(writer.entry(2_000, "INST", "ABORT", &cmd, true));
+        data.extend(writer.entry(3_000, "SYSTEM", "META", &[1, 0], false));
+        data.extend(writer.entry(4_000, "INST", "PARAMS", &tlm, false));
+        data.extend(Cosmos5Writer::offset_marker("1614891537276-0"));
+
+        // As in a real file: target declared with no id, as number 15 ...
+        assert_eq!(
+            data[8..18],
+            [0, 0, 0, 6, 0x10, 0x00, b'I', b'N', b'S', b'T']
+        );
+        // ... then the packet, pointing at 15, with a 32-byte id.
+        assert_eq!(
+            data[18..26],
+            [0, 0, 0, 2 + 2 + 6 + 32, 0x22, 0x00, 0x00, 0x0F]
+        );
+
+        let (records, end) = decode_all(&mut Cosmos5Decoder::new(), &data);
+        assert_eq!(end, None);
+        let labels: Vec<&str> = records
+            .iter()
+            .map(|r| r.label.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            ["INST PARAMS", "INST ABORT", "SYSTEM META", "INST PARAMS"]
+        );
+        assert_eq!(records[0].payload, tlm);
+        assert_eq!(records[1].payload, cmd);
+        assert_eq!(records[3].receive_time_ns, Some(4_000));
+        for r in &records {
+            let at = r.offset as usize;
+            assert_eq!(data[at..at + r.payload.len()], r.payload[..]);
+        }
+    }
 }

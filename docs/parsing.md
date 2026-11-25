@@ -960,9 +960,30 @@ what follows it), a 2-byte flags field, then a body chosen by `flags & 0xF000`:
 
 Other flag bits: `0x0800` command (otherwise telemetry), `0x0400` stored,
 `0x0200` an id is present. Names appear once, in declarations; packets refer to
-them by index, counted from zero in order of appearance. The reader therefore
-keeps the two name tables as it goes. A separate `.idx` file maps entries to
-byte offsets and is not needed for a forward read.
+them by index. The reader therefore keeps the two name tables as it goes.
+Packets are counted from zero in each file, in order of appearance. Targets
+are not: the writer counts them across every file it has written, so a file
+may declare target 15 first. A target is declared just before the first packet
+that refers to it, and that is how the decoder learns where a file's target
+numbers start. A target used for both commands and telemetry is declared
+twice. The file ends with an offset marker. A separate `.idx` file (it starts
+`COSIDX5_`) maps entries to byte offsets and is not needed for a forward read.
+
+These details, and the COSMOS 4 ones below, were checked against real log
+files from the COSMOS repository; `tests/real_cosmos_files.rs` repeats the
+check on any you point it at.
+
+What COSMOS 4's own example target puts in such logs is worth knowing, since
+definitions copied from it are common:
+
+- Telemetry packets do not set the secondary header flag, though bytes 6 to 13
+  hold a time: seconds, then microseconds, since 1970. A 16-bit packet id
+  follows. Sequence counts start at 1.
+- Every command is on one APID, told apart by a 16-bit packet id at byte 6.
+  The sequence count is always 0, and the length field holds the definition's
+  default, which need not be the packet's length. This tool does not take such
+  a command for a space packet; it is kept, under the name COSMOS logged it
+  with, as a non-packet entry.
 
 In both COSMOS formats, do not assume the stored bytes are space packets: these
 systems log whatever their interfaces deliver. Check the header and report

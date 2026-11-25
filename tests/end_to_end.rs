@@ -87,7 +87,8 @@ fn ingest_finds_the_built_in_faults_and_leaves_the_logs_alone() {
     let reader = Store::open_read_only(&db, Duration::from_secs(10)).unwrap();
     assert_eq!(
         count(&reader, "select count(*) from packets"),
-        360 + 180 + 537 + 3
+        // Each COSMOS 4 file also opens with its SYSTEM META packet.
+        360 + (180 + 1) + 537 + (3 + 1)
     );
     assert_eq!(
         count(
@@ -143,7 +144,7 @@ fn ingest_finds_the_built_in_faults_and_leaves_the_logs_alone() {
             .iter()
             .all(|f| f.status == Status::AlreadyIngested)
     );
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
     assert_eq!(again.problems, 4);
 
     // The input folder holds exactly what it held before, byte for byte.
@@ -158,7 +159,9 @@ fn a_cut_off_log_is_read_as_far_as_it_goes() {
     let run = scratch.demo();
     let log = run.join("ground/downlink.bin");
     let bytes = fs::read(&log).unwrap();
-    fs::write(&log, &bytes[..bytes.len() - 5]).unwrap();
+    // Cut into the last packet: past the closing marker the file ends with.
+    let cut = packetlane::pure::synth::DEMO_COSMOS5_TAIL + 5;
+    fs::write(&log, &bytes[..bytes.len() - cut]).unwrap();
     fs::write(run.join("ground/notes.gz"), [0x1F, 0x8B, 8, 0]).unwrap();
 
     let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
@@ -275,7 +278,7 @@ fn the_server_refuses_anything_it_should_not_serve() {
         &auth,
     );
     assert_eq!(status, 200);
-    assert!(density.contains("\"total\":1097"), "{density}");
+    assert!(density.contains("\"total\":1099"), "{density}");
 
     // Without the token, or with the wrong one.
     assert_eq!(get("/", "").0, 401);
@@ -353,7 +356,7 @@ fn the_server_refuses_anything_it_should_not_serve() {
         );
     }
     let (_, n) = post("/api/query", "{\"sql\":\"select count(*) from packets\"}");
-    assert!(n.contains("[[1080]]"), "{n}");
+    assert!(n.contains("[[1082]]"), "{n}");
 
     // Malformed requests get an answer, not a hang or a crash.
     assert_eq!(http(port, "BREW / HTTP/1.1\r\n\r\n").0, 405);
@@ -417,7 +420,7 @@ fn ingest_through_the_page_and_again_after_the_configuration_changes() {
         "{runs}"
     );
     let reader = Store::open_read_only(&db, Duration::from_secs(10)).unwrap();
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
     // Without configuration there is no packet time and no packet names.
     assert_eq!(count(&reader, "select count(packet_ns) from packets"), 0);
     assert!(!get("/api/run?run=1").1.contains("PAYLOAD_SCIENCE"));
@@ -425,14 +428,14 @@ fn ingest_through_the_page_and_again_after_the_configuration_changes() {
     // The same request again changes nothing.
     let (_, body) = ingest();
     assert!(!body.contains("\"status\":\"ingested\""), "{body}");
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
 
     // With the configuration in place the run is read afresh, once.
     fs::rename(&aside, &config).unwrap();
     let (status, body) = ingest();
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("\"reread\":true"), "{body}");
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
     assert_eq!(count(&reader, "select count(packet_ns) from packets"), 1077);
     assert_eq!(count(&reader, "select count(*) from runs"), 1);
     assert!(get("/api/run?run=1").1.contains("PAYLOAD_SCIENCE"));
@@ -447,7 +450,7 @@ fn ingest_through_the_page_and_again_after_the_configuration_changes() {
     let (status, body) = ingest();
     assert_eq!(status, 400);
     assert!(body.contains("0 to 2047"), "{body}");
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
 }
 
 #[test]
@@ -1391,4 +1394,151 @@ fn segment_order_and_packet_time_are_checked() {
             ("time_back", "info", "Packet time went back 13.000 s", 4),
         ]
     );
+}
+
+/// Logs shaped like the ones COSMOS 4 writes for its own example target,
+/// checked against real files from the COSMOS repository: what this tool
+/// makes of them today. Two of these are limits, written down as such.
+#[test]
+fn logs_shaped_like_cosmos_4s_own() {
+    use packetlane::pure::synth::{
+        cosmos_cmd, cosmos_tlm, cosmos2_entry, cosmos2_header, system_meta,
+    };
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("logs")).unwrap();
+    fs::write(
+        run.join("packetlane.toml"),
+        r#"
+[packet_time]
+code = "cuc"
+epoch = "1970-01-01T00:00:00Z"
+
+[[packet]]
+apid = 999
+type = "tc"
+label = "INST COLLECT"
+name = "INST COLLECT"
+  [[packet.field]]
+  name = "TYPE"
+  bit_offset = 64
+  bit_length = 16
+"#,
+    )
+    .unwrap();
+    let config = "d82d7059e8372580a928fd5c0b995685";
+    let t0 = 1_389_370_487_000_000_000;
+
+    // Telemetry: one APID per packet, counts that start at 1, no secondary
+    // header flag, seconds and microseconds, a packet id.
+    let mut tlm = cosmos2_header(true, config, "GSE-PC");
+    tlm.extend(cosmos2_entry(
+        t0,
+        "SYSTEM",
+        "META",
+        &system_meta(config, "4.2.4"),
+    ));
+    for i in 1..=40u16 {
+        let t = t0 + i64::from(i) * 100_000_000;
+        tlm.extend(cosmos2_entry(
+            t,
+            "INST",
+            "ADCS",
+            &cosmos_tlm(2, i, t, 1, &[0; 70]),
+        ));
+        if i % 10 == 1 {
+            let seq = i / 10 + 1;
+            tlm.extend(cosmos2_entry(
+                t,
+                "INST",
+                "PARAMS",
+                &cosmos_tlm(3, seq, t, 1, &[0; 10]),
+            ));
+        }
+    }
+    tlm.extend(cosmos2_entry(
+        t0 + 5_000_000_000,
+        "UNKNOWN",
+        "UNKNOWN",
+        &[0xAB; 10],
+    ));
+    fs::write(run.join("logs/2014_01_10_16_14_47_tlm.bin"), tlm).unwrap();
+
+    // Commands: all on APID 999, every count 0, and a length field that is
+    // the definition's default, not the packet's length.
+    let mut cmd = cosmos2_header(false, config, "GSE-PC");
+    for i in 0..6i64 {
+        let t = t0 + i * 1_000_000_000;
+        cmd.extend(cosmos2_entry(
+            t,
+            "INST",
+            "ABORT",
+            &cosmos_cmd(999, 0, 2, &[]),
+        ));
+        let collect = cosmos_cmd(999, 0, 1, &[0x00, 0x07, 0x3F, 0x80, 0, 0, 0xAB, 0, 0, 0, 0]);
+        cmd.extend(cosmos2_entry(t, "INST", "COLLECT", &collect));
+    }
+    fs::write(run.join("logs/2014_01_10_16_14_47_cmd.bin"), cmd).unwrap();
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    // Telemetry reads cleanly: nothing to report but the two entries that
+    // are not space packets, the metadata and the unidentified one.
+    assert_eq!(summary.problems, 0);
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM packet_view WHERE apid = 2"),
+        40
+    );
+    assert_eq!(
+        count(&store, "SELECT MIN(seq) FROM packet_view WHERE apid = 3"),
+        1
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM packet_view WHERE file LIKE '%tlm.bin' AND apid IS NULL"
+        ),
+        2
+    );
+
+    // Limit: the time in these packets is not read. It is seconds and
+    // microseconds with no secondary header flag, and packet time is only
+    // read as CUC or CDS from packets that set the flag.
+    assert_eq!(count(&store, "SELECT COUNT(packet_ns) FROM packets"), 0);
+
+    // Limit: no command is taken for a space packet, because its length
+    // field does not match its length. So commands get no APID lane and no
+    // sequence check (which every count being 0 would fail anyway).
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM packet_view WHERE file LIKE '%cmd.bin'"
+        ),
+        12
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM packet_view WHERE file LIKE '%cmd.bin' AND apid IS NOT NULL"
+        ),
+        0
+    );
+    // They are still told apart by the name COSMOS logged them under, and
+    // a definition labelled with that name decodes them.
+    let id = store
+        .query_user(
+            "SELECT id FROM packet_view WHERE label = 'INST COLLECT' LIMIT 1",
+            1,
+        )
+        .unwrap()
+        .rows[0][0]
+        .int()
+        .unwrap();
+    drop(store);
+    let body = serve(db, run)(&format!("/api/packet?id={id}"));
+    assert_eq!(body["name"], "INST COLLECT");
+    assert_eq!(body["fields"][0]["value"], 7);
+    assert_eq!(body["header"], serde_json::Value::Null);
 }
