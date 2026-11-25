@@ -7,6 +7,7 @@
 use std::fmt;
 
 use crate::pure::config::Config;
+use crate::pure::frame::Layout;
 
 pub mod cadu;
 pub mod cosmos4;
@@ -207,9 +208,7 @@ pub enum Format {
     /// Starts with `COSMOS5_`.
     Cosmos5,
     /// Sync markers at a fixed spacing, each followed by a transfer frame.
-    Cadu {
-        cadu_len: usize,
-    },
+    Cadu(Layout),
     /// Space packets back to back with no container.
     RawCcsds,
     /// Lines of text.
@@ -227,7 +226,7 @@ impl Format {
             Format::Cosmos2 => "cosmos2",
             Format::Cosmos4 => "cosmos4",
             Format::Cosmos5 => "cosmos5",
-            Format::Cadu { .. } => "cadu",
+            Format::Cadu(_) => "cadu",
             Format::RawCcsds => "raw",
             Format::Text => "text",
             Format::Gzip => "gzip",
@@ -244,7 +243,7 @@ impl Format {
             Format::Cosmos2
                 | Format::Cosmos4
                 | Format::Cosmos5
-                | Format::Cadu { .. }
+                | Format::Cadu(_)
                 | Format::Gzip
                 | Format::Empty
         )
@@ -275,8 +274,8 @@ pub fn sniff(prefix: &[u8]) -> Format {
         Format::Cosmos1
     } else if prefix.starts_with(&[0x1F, 0x8B]) {
         Format::Gzip
-    } else if let Some(cadu_len) = cadu::sniff_cadu_len(prefix) {
-        Format::Cadu { cadu_len }
+    } else if let Some(layout) = cadu::sniff_layout(prefix) {
+        Format::Cadu(layout)
     } else if raw::chains_as_packets(prefix) {
         Format::RawCcsds
     } else if looks_like_text(prefix) {
@@ -316,8 +315,8 @@ pub fn decoder_for(format: Format, config: &Config) -> Option<Box<dyn Decoder>> 
             Some(Box::new(cosmos4::Cosmos4Decoder::new()))
         }
         Format::Cosmos5 => Some(Box::new(cosmos5::Cosmos5Decoder::new())),
-        Format::Cadu { cadu_len } => {
-            let decoder = cadu::CaduDecoder::new(config.frame_params(cadu_len))?;
+        Format::Cadu(layout) => {
+            let decoder = cadu::CaduDecoder::new(config.frame_params_for(&layout))?;
             Some(Box::new(decoder))
         }
         Format::RawCcsds => Some(Box::new(raw::RawDecoder::new())),
@@ -422,7 +421,13 @@ mod tests {
         // recognised before packets are.
         let cadus =
             crate::pure::synth::demo_cadus(&Config::default().frame_params(64), &packets.repeat(4));
-        assert_eq!(sniff(&cadus), Format::Cadu { cadu_len: 64 });
+        let Format::Cadu(layout) = sniff(&cadus) else {
+            panic!("not sniffed as CADUs");
+        };
+        assert_eq!(layout.cadu_len, 64);
+        assert_eq!(layout.kind, Some(crate::pure::frame::FrameKind::Tm));
+        assert_eq!(layout.randomized, Some(false));
+        assert_eq!(layout.crc_parity, None);
         // Sync markers alone must not pass as frames, packets or text.
         assert_eq!(sniff(&[0x1A, 0xCF, 0xFC, 0x1D].repeat(50)), Format::Unknown);
     }

@@ -26,8 +26,10 @@
 //! epoch = "1958-01-01T00:00:00Z"
 //! subtract_seconds = 0       # for example the difference between the timescale and UTC
 //!
-//! [frames]                   # only for files of CADUs: sync marker + transfer frame
-//! kind = "tm"                # "tm" (default) or "aos"
+//! [frames]                   # only for files of CADUs: sync marker + transfer frame.
+//!                            # The first four are detected from each file where its
+//!                            # bytes allow; give them to overrule that.
+//! kind = "tm"                # "tm" or "aos"
 //! randomized = false         # frames are still XORed with the CCSDS random sequence
 //! crc = false                # each frame ends with a 16-bit CRC
 //! rs_parity_bytes = 0        # Reed-Solomon check symbols kept after each frame
@@ -56,7 +58,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::pure::ccsds::{PacketType, PrimaryHeader};
-use crate::pure::frame::{FrameKind, FrameParams};
+use crate::pure::frame::{FrameKind, FrameParams, Layout};
 use crate::pure::textlog::LogFormat;
 use crate::pure::time::{NS_PER_SEC, parse_iso, parse_utc_offset};
 
@@ -83,10 +85,10 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Frames {
-    pub kind: FrameKind,
-    pub randomized: bool,
-    pub crc: bool,
-    pub rs_parity_bytes: usize,
+    pub kind: Option<FrameKind>,
+    pub randomized: Option<bool>,
+    pub crc: Option<bool>,
+    pub rs_parity_bytes: Option<usize>,
     pub ocf: bool,
     pub header_check: bool,
     pub insert_zone_bytes: usize,
@@ -274,7 +276,7 @@ impl Config {
         if let Some(time) = &self.packet_time {
             time.resolve()?;
         }
-        if self.frames.rs_parity_bytes > MAX_FRAME_EXTRA {
+        if self.frames.rs_parity_bytes.unwrap_or(0) > MAX_FRAME_EXTRA {
             return Err(format!(
                 "frames: rs_parity_bytes must be 0 to {MAX_FRAME_EXTRA}"
             ));
@@ -426,13 +428,30 @@ impl Config {
 
     /// The frame layout for a file whose CADUs are `cadu_len` bytes apart.
     pub fn frame_params(&self, cadu_len: usize) -> FrameParams {
+        self.frame_params_for(&Layout::of_len(cadu_len))
+    }
+
+    /// The frame layout for a file, from what was detected in it and what
+    /// this configuration says. The configuration wins wherever it speaks;
+    /// what neither settles defaults to plain TM frames with no extras.
+    pub fn frame_params_for(&self, layout: &Layout) -> FrameParams {
         let f = &self.frames;
+        // A detected CRC is tied to the check-symbol length it was found
+        // with: if the configuration gives a different length, it is not there.
+        let has_crc = f
+            .crc
+            .unwrap_or(match (f.rs_parity_bytes, layout.crc_parity) {
+                (Some(given), Some(found)) => given == found,
+                (None, found) => found.is_some(),
+                (Some(_), None) => false,
+            });
+        let detected_parity = if has_crc { layout.crc_parity } else { None };
         FrameParams {
-            cadu_len,
-            kind: f.kind,
-            randomized: f.randomized,
-            rs_parity_len: f.rs_parity_bytes,
-            has_crc: f.crc,
+            cadu_len: layout.cadu_len,
+            kind: f.kind.or(layout.kind).unwrap_or_default(),
+            randomized: f.randomized.or(layout.randomized).unwrap_or(false),
+            rs_parity_len: f.rs_parity_bytes.or(detected_parity).unwrap_or(0),
+            has_crc,
             aos_has_ocf: f.ocf,
             aos_has_header_check: f.header_check,
             aos_insert_zone_len: f.insert_zone_bytes,
@@ -667,6 +686,38 @@ mod frame_tests {
         let plain = Config::default().frame_params(1119);
         assert_eq!(plain.kind, FrameKind::Tm);
         assert!(!plain.randomized && !plain.has_crc && plain.rs_parity_len == 0);
+
+        // What a file shows is used where the configuration is silent.
+        let seen = Layout {
+            cadu_len: 1279,
+            kind: Some(FrameKind::Aos),
+            randomized: Some(true),
+            crc_parity: Some(160),
+        };
+        let p = Config::default().frame_params_for(&seen);
+        assert_eq!(
+            (p.kind, p.randomized, p.has_crc, p.rs_parity_len),
+            (FrameKind::Aos, true, true, 160)
+        );
+        // And overruled where it speaks.
+        let p = Config::parse(
+            r#"[frames]
+kind = "tm"
+randomized = false
+crc = false
+"#,
+        )
+        .unwrap()
+        .frame_params_for(&seen);
+        assert_eq!(
+            (p.kind, p.randomized, p.has_crc, p.rs_parity_len),
+            (FrameKind::Tm, false, false, 0)
+        );
+        // A CRC found before 160 check bytes is not a CRC before 32.
+        let p = Config::parse("[frames]\nrs_parity_bytes = 32")
+            .unwrap()
+            .frame_params_for(&seen);
+        assert_eq!((p.has_crc, p.rs_parity_len), (false, 32));
         let err = Config::parse("[frames]\nrs_parity_bytes = 99999\n").unwrap_err();
         assert!(err.contains("rs_parity_bytes"), "{err}");
         assert!(Config::parse("[frames]\nkind = \"tc\"\n").is_err());

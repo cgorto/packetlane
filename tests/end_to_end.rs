@@ -757,7 +757,10 @@ fn a_file_of_cadus_is_ingested_as_its_packets() {
         .unwrap();
     assert_eq!(file.status, Status::Ingested);
     assert_eq!(file.packets, 80, "{}", file.note);
-    assert_eq!(file.note, "");
+    assert_eq!(
+        file.note,
+        "TM frames in 256-byte CADUs, randomised, CRC, 32 check bytes"
+    );
     assert_eq!(
         count(&store, "SELECT COUNT(*) FROM files WHERE format = 'cadu'"),
         1
@@ -932,4 +935,31 @@ fn frames_lost_from_a_cadu_file_become_findings() {
         "{:?}",
         gap[2]
     );
+}
+
+/// With no configuration at all, a CADU file's layout is read off its
+/// frames, and the file says what it was read as.
+#[test]
+fn a_cadu_file_needs_no_configuration_when_its_frames_say_enough() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let written = "[frames]\nkind = \"aos\"\nrandomized = true\ncrc = true\nrs_parity_bytes = 64\n";
+    let mut src = Source::new(0x1A3, 0, 300);
+    let packets: Vec<u8> = (0..30).flat_map(|_| src.emit()).collect();
+    let params = Config::parse(written).unwrap().frame_params(256);
+    fs::write(run.join("station/pass.cadu"), demo_cadus(&params, &packets)).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let summary = ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let file = &summary.files[0];
+    assert_eq!(file.packets, 30, "{}", file.note);
+    assert_eq!(
+        file.note,
+        "AOS frames in 256-byte CADUs, randomised, CRC, 64 check bytes"
+    );
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM findings"), 0);
 }

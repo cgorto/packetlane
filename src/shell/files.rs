@@ -50,7 +50,7 @@ pub fn read_back(
     accept: impl Fn(&[u8]) -> bool,
 ) -> io::Result<Option<Vec<u8>>> {
     let (format, mut file) = open_sniffed(path)?;
-    if !matches!(format, Format::Cadu { .. }) {
+    if !matches!(format, Format::Cadu(_)) {
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = vec![0u8; length];
         let got = read_full(&mut file, &mut bytes)?;

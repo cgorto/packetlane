@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use super::{DecodeError, Decoder, Loss, Notice, Record, Step};
 use crate::pure::ccsds::{IDLE_APID, PRIMARY_HEADER_LEN, PrimaryHeader};
-use crate::pure::frame::{self, FrameParams, Pointer, SYNC};
+use crate::pure::frame::{self, FrameKind, FrameParams, Layout, Pointer, SYNC};
 
 pub const MIN_CADU_LEN: usize = 32;
 pub const MAX_CADU_LEN: usize = 16 * 1024;
@@ -277,26 +277,67 @@ impl Decoder for CaduDecoder {
             Some(open) => self.read_zone(open, buf, offset),
         }
     }
+
+    /// The layout the file was read with: part of it is detected or
+    /// defaulted, so it is worth being able to see what was assumed.
+    fn describe(&self) -> Option<String> {
+        let p = &self.params;
+        let mut text = format!(
+            "{} frames in {}-byte CADUs",
+            match p.kind {
+                FrameKind::Tm => "TM",
+                FrameKind::Aos => "AOS",
+            },
+            p.cadu_len
+        );
+        if p.randomized {
+            text.push_str(", randomised");
+        }
+        if p.has_crc {
+            text.push_str(", CRC");
+        }
+        if p.rs_parity_len > 0 {
+            text.push_str(&format!(", {} check bytes", p.rs_parity_len));
+        }
+        Some(text)
+    }
 }
 
 fn find_sync(bytes: &[u8]) -> Option<usize> {
     bytes.windows(SYNC.len()).position(|w| w == SYNC)
 }
 
-/// The CADU length, if `prefix` reads as CADUs: three sync markers at one
+/// How many whole CADUs from the start of a file layout detection looks at.
+const SNIFF_FRAMES: usize = 8;
+
+/// The layout, if `prefix` reads as CADUs: three sync markers at one
 /// spacing of a believable size, with no marker between the first two.
-pub fn sniff_cadu_len(prefix: &[u8]) -> Option<usize> {
+/// The rest of the layout is read from the whole CADUs that follow the
+/// first marker, as far as they can tell it.
+pub fn sniff_layout(prefix: &[u8]) -> Option<Layout> {
     let body = &prefix[find_sync(prefix)?..];
     let len = find_sync(body.get(SYNC.len()..)?)? + SYNC.len();
     let third = body.get(2 * len..2 * len + SYNC.len())?;
-    ((MIN_CADU_LEN..=MAX_CADU_LEN).contains(&len) && third == SYNC).then_some(len)
+    if !(MIN_CADU_LEN..=MAX_CADU_LEN).contains(&len) || third != SYNC {
+        return None;
+    }
+    let cadus: Vec<&[u8]> = body
+        .chunks_exact(len)
+        .take(SNIFF_FRAMES)
+        .take_while(|c| c.starts_with(&SYNC))
+        .collect();
+    Layout::detect(&cadus)
+}
+
+/// The CADU length alone. See [`sniff_layout`].
+pub fn sniff_cadu_len(prefix: &[u8]) -> Option<usize> {
+    sniff_layout(prefix).map(|layout| layout.cadu_len)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pure::decode::{DecodeEnd, decode_all};
-    use crate::pure::frame::FrameKind;
     use crate::pure::synth::{Source, cadus, frame_zones};
 
     const ZONE: usize = 50;
@@ -668,5 +709,40 @@ mod tests {
         let notices = crate::pure::decode::decode_all_noting(&mut decoder, &data).1;
         assert_eq!(notices.list.len(), crate::pure::decode::MAX_NOTICES);
         assert_eq!(notices.list.len() as u64 + notices.more, 1499);
+    }
+
+    #[test]
+    fn sniffs_the_layout_from_the_frames() {
+        for kind in [FrameKind::Tm, FrameKind::Aos] {
+            for (randomized, has_crc, rs_parity_len) in [
+                (true, true, 32),
+                (false, true, 0),
+                (true, false, 32),
+                (false, false, 0),
+                (true, true, 160),
+            ] {
+                let mut p = params(kind);
+                p.randomized = randomized;
+                p.has_crc = has_crc;
+                p.rs_parity_len = rs_parity_len;
+                p.cadu_len = p.cadu_len - 34 + rs_parity_len + if has_crc { 2 } else { 0 };
+                let data = crate::pure::synth::demo_cadus(&p, &packets().concat());
+                let layout = sniff_layout(&data).unwrap();
+                assert_eq!(layout.cadu_len, p.cadu_len);
+                assert_eq!(layout.kind, Some(kind));
+                assert_eq!(layout.randomized, Some(randomized));
+                // Without a CRC there is nothing to say how long the check
+                // symbols are; that stays for the configuration.
+                assert_eq!(layout.crc_parity, has_crc.then_some(rs_parity_len), "{p:?}");
+            }
+        }
+        // Frames that disagree about their version settle nothing.
+        let p = params(FrameKind::Tm);
+        let mut cadus = pack(&p, &packets());
+        cadus[1][4] ^= 0x40;
+        assert_eq!(
+            sniff_layout(&cadus.concat()),
+            Some(Layout::of_len(p.cadu_len))
+        );
     }
 }

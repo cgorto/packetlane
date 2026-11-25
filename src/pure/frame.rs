@@ -66,6 +66,85 @@ pub struct FrameParams {
     pub aos_insert_zone_len: usize,
 }
 
+/// What can be read off a file of CADUs before decoding it. Anything left
+/// `None` could not be told from the bytes and has to come from the
+/// configuration or a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Layout {
+    /// Marker to marker, in bytes.
+    pub cadu_len: usize,
+    pub kind: Option<FrameKind>,
+    pub randomized: Option<bool>,
+    /// `Some(n)` if every frame looked at ends with a valid CRC followed by
+    /// `n` bytes of check symbols.
+    pub crc_parity: Option<usize>,
+}
+
+impl Layout {
+    /// A layout of which only the CADU length is known.
+    pub fn of_len(cadu_len: usize) -> Self {
+        Self {
+            cadu_len,
+            kind: None,
+            randomized: None,
+            crc_parity: None,
+        }
+    }
+
+    /// Reads what it can from whole CADUs, each starting with the marker.
+    ///
+    /// The first two bits after the marker are the frame version: 0 for TM,
+    /// 1 for AOS. The random sequence starts with `0xFF`, so a randomised
+    /// frame shows them inverted: 3 for TM, 2 for AOS. All the frames must
+    /// agree. With that known, a CRC is looked for at each place it can be:
+    /// before 0 to 8 interleaves of Reed-Solomon check symbols.
+    pub fn detect(cadus: &[&[u8]]) -> Option<Self> {
+        let cadu_len = cadus.first()?.len();
+        let mut layout = Self::of_len(cadu_len);
+        let bits = cadus.first()?.get(SYNC.len())? >> 6;
+        if cadus.len() < 2
+            || cadus
+                .iter()
+                .any(|c| c.get(SYNC.len()).map(|b| b >> 6) != Some(bits))
+        {
+            return Some(layout);
+        }
+        let (kind, randomized) = match bits {
+            0 => (FrameKind::Tm, false),
+            1 => (FrameKind::Aos, false),
+            3 => (FrameKind::Tm, true),
+            _ => (FrameKind::Aos, true),
+        };
+        layout.kind = Some(kind);
+        layout.randomized = Some(randomized);
+
+        let plain: Vec<Vec<u8>> = cadus
+            .iter()
+            .map(|c| {
+                let mut c = c.to_vec();
+                if randomized {
+                    derandomize(&mut c[SYNC.len()..]);
+                }
+                c
+            })
+            .collect();
+        // Longest first: a valid CRC followed by zeros still checks out when
+        // the zeros are taken for part of the frame, so a shorter guess can
+        // pass by accident where check symbols were zero-filled.
+        layout.crc_parity = (0..=8).rev().map(|depth| depth * 32).find(|parity| {
+            plain.iter().all(|c| {
+                c.len()
+                    .checked_sub(parity + CRC_LEN)
+                    .filter(|&at| at >= SYNC.len() + HEADER_LEN)
+                    .is_some_and(|at| {
+                        crc16(&c[SYNC.len()..at]).to_be_bytes() == c[at..at + CRC_LEN]
+                    })
+            })
+        });
+        Some(layout)
+    }
+}
+
 /// Where the first packet header in a frame's data zone is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pointer {
