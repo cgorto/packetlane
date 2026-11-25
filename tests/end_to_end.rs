@@ -825,3 +825,67 @@ fn a_cosmos2_log_is_ingested_and_described() {
         9
     );
 }
+
+/// Starts a server over `db` and returns a function that GETs an API path
+/// and parses the JSON reply.
+fn serve(db: PathBuf, root: PathBuf) -> impl Fn(&str) -> serde_json::Value {
+    let server = Server::bind(Options {
+        db,
+        roots: vec![root],
+        config: None,
+        user_config: None,
+        port: 0,
+    })
+    .unwrap();
+    let (port, token) = (server.port(), server.token().to_string());
+    std::thread::spawn(move || server.run());
+    move |target: &str| {
+        let (status, body) = http(
+            port,
+            &format!(
+                "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Packetlane-Token: {token}\r\n\r\n"
+            ),
+        );
+        assert_eq!(status, 200, "{target}: {body}");
+        serde_json::from_str(&body).unwrap()
+    }
+}
+
+/// A packet in a CADU file is not a run of bytes in that file: it is spread
+/// over frames and may be randomised. The packet view must still show it.
+#[test]
+fn packets_inside_cadus_can_be_read_back() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::format::hex;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let mut a = Source::new(0x1A3, 0, 5);
+    let mut b = Source::new(0x0B0, 0, 700);
+    let packets: Vec<Vec<u8>> = (0..12).flat_map(|_| [a.emit(), b.emit()]).collect();
+    let params = Config::parse(toml).unwrap().frame_params(256);
+    let mut file = vec![0x55u8; 100]; // the capture starts mid-frame
+    file.extend(demo_cadus(&params, &packets.concat()));
+    fs::write(run.join("station/pass.cadu"), file).unwrap();
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let ids = store
+        .query_user("SELECT id FROM packets ORDER BY idx", 100)
+        .unwrap();
+    assert_eq!(ids.rows.len(), packets.len());
+    drop(store);
+
+    let get = serve(db, run);
+    for (row, packet) in ids.rows.iter().zip(&packets) {
+        let body = get(&format!("/api/packet?id={}", row[0].int().unwrap()));
+        assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+        let shown = &packet[..packet.len().min(body["hex"].as_str().unwrap().len() / 2)];
+        assert_eq!(body["hex"], hex(shown));
+    }
+}

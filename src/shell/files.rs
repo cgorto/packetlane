@@ -6,9 +6,12 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::pure::checksum::{FNV_OFFSET, fnv1a_update};
+use crate::pure::config::Config;
+use crate::pure::decode::cadu::MAX_CADU_LEN;
 use crate::pure::decode::{
-    DecodeEnd, DecodeError, Decoder, Format, MAX_ENTRY, Record, SNIFF_LEN, Step, sniff,
+    DecodeEnd, DecodeError, Decoder, Format, MAX_ENTRY, Record, SNIFF_LEN, Step, decoder_for, sniff,
 };
+use crate::pure::frame::SYNC;
 
 const CHUNK: usize = 64 * 1024;
 
@@ -21,6 +24,70 @@ pub fn open_sniffed(path: &Path) -> io::Result<(Format, File)> {
     prefix.truncate(n);
     file.seek(SeekFrom::Start(0))?;
     Ok((sniff(&prefix), file))
+}
+
+/// How far past a packet's first byte to keep decoding before giving up on
+/// finding its end: packets of other virtual channels may lie in between.
+const READ_BACK_SPAN: u64 = 4 * 1024 * 1024;
+/// How many sync markers before a packet to try starting from. The nearest
+/// is the right one unless the marker's bytes also occur in the data.
+const READ_BACK_TRIES: usize = 8;
+
+/// Reads one logged item back from its file: the `length` bytes whose first
+/// byte is at `offset`, as the decoder delivered them at ingest. `accept`
+/// says whether bytes are the ones wanted (a checksum); `None` means the
+/// file no longer holds them.
+///
+/// In most formats an item is a plain run of bytes. In a CADU file it is
+/// not: it is spread over frames and may be randomised, so the frames from
+/// the sync marker before it are decoded again.
+pub fn read_back(
+    path: &Path,
+    config: &Config,
+    offset: u64,
+    length: usize,
+    accept: impl Fn(&[u8]) -> bool,
+) -> io::Result<Option<Vec<u8>>> {
+    let (format, mut file) = open_sniffed(path)?;
+    if !matches!(format, Format::Cadu { .. }) {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0u8; length];
+        let got = read_full(&mut file, &mut bytes)?;
+        return Ok((got == length && accept(&bytes)).then_some(bytes));
+    }
+
+    let from = offset.saturating_sub(MAX_CADU_LEN as u64);
+    file.seek(SeekFrom::Start(from))?;
+    let mut window = vec![0u8; (offset - from) as usize];
+    let got = read_full(&mut file, &mut window)?;
+    window.truncate(got);
+    let markers: Vec<u64> = window
+        .windows(SYNC.len())
+        .enumerate()
+        .filter(|(_, w)| *w == SYNC)
+        .map(|(i, _)| from + i as u64)
+        .collect();
+    for &start in markers.iter().rev().take(READ_BACK_TRIES) {
+        let Some(decoder) = decoder_for(format, config) else {
+            break;
+        };
+        file.seek(SeekFrom::Start(start))?;
+        for item in Records::starting_at(io::BufReader::new(&file), decoder, start) {
+            match item {
+                Ok(r) if r.offset == offset => {
+                    if r.payload.len() == length && accept(&r.payload) {
+                        return Ok(Some(r.payload));
+                    }
+                    break;
+                }
+                Ok(r) if r.offset > offset + READ_BACK_SPAN => break,
+                Ok(_) => {}
+                Err(ReadError::Io(e)) => return Err(e),
+                Err(ReadError::Decode(_)) => break,
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Fills `buf` as far as the source allows and returns how many bytes it got.
@@ -101,12 +168,18 @@ pub struct Records<R> {
 
 impl<R: Read> Records<R> {
     pub fn new(inner: R, decoder: Box<dyn Decoder>) -> Self {
+        Self::starting_at(inner, decoder, 0)
+    }
+
+    /// For a reader that is already `base` bytes into its file, so that
+    /// record offsets still count from the start of the file.
+    pub fn starting_at(inner: R, decoder: Box<dyn Decoder>, base: u64) -> Self {
         Self {
             inner,
             decoder,
             buf: Vec::new(),
             start: 0,
-            base: 0,
+            base,
             eof: false,
             done: false,
         }
