@@ -3,7 +3,7 @@
 
 use serde::Serialize;
 
-use crate::pure::config::{FieldDef, FieldKind, PacketDef, ResolvedTime, TimeCode};
+use crate::pure::config::{ByteOrder, FieldDef, FieldKind, PacketDef, ResolvedTime, TimeCode};
 
 /// Reads up to 64 bits starting `bit_offset` bits into `bytes`, most
 /// significant bit first. `None` if the range runs past the end.
@@ -45,6 +45,8 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Text(String),
+    /// The elements of an array field.
+    List(Vec<Value>),
 }
 
 impl Serialize for Value {
@@ -59,6 +61,7 @@ impl Serialize for Value {
             Value::Int(v) => s.serialize_str(&v.to_string()),
             Value::Float(v) => s.serialize_f64(*v),
             Value::Text(v) => s.serialize_str(v),
+            Value::List(v) => s.collect_seq(v),
         }
     }
 }
@@ -75,30 +78,22 @@ pub struct Decoded {
     pub error: Option<&'static str>,
 }
 
-fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String>), &'static str> {
-    const PAST_END: &str = "Past end of packet";
+const PAST_END: &str = "Past end of packet";
+
+/// One number of a field's kind and byte order, `bit_offset` bits in.
+fn number(field: &FieldDef, packet: &[u8], bit_offset: u64) -> Result<Value, &'static str> {
+    let bits = field.bit_length;
+    let mut raw = extract_bits(packet, bit_offset, bits).ok_or(PAST_END)?;
+    if field.byte_order == ByteOrder::Little {
+        // Validation allows this only for whole bytes on a byte boundary,
+        // where the first byte in the packet is the least significant.
+        raw = raw.swap_bytes() >> (64 - bits.min(64));
+    }
     match field.kind {
-        FieldKind::Uint => {
-            let raw = extract_bits(packet, u64::from(field.bit_offset), field.bit_length)
-                .ok_or(PAST_END)?;
-            Ok((
-                Value::UInt(raw),
-                field.labels.get(&raw.to_string()).cloned(),
-            ))
-        }
-        FieldKind::Int => {
-            let raw = extract_bits(packet, u64::from(field.bit_offset), field.bit_length)
-                .ok_or(PAST_END)?;
-            let value = sign_extend(raw, field.bit_length);
-            Ok((
-                Value::Int(value),
-                field.labels.get(&value.to_string()).cloned(),
-            ))
-        }
-        FieldKind::Float => {
-            let raw = extract_bits(packet, u64::from(field.bit_offset), field.bit_length)
-                .ok_or(PAST_END)?;
-            let value = match field.bit_length {
+        FieldKind::Uint => Ok(Value::UInt(raw)),
+        FieldKind::Int => Ok(Value::Int(sign_extend(raw, bits))),
+        _ => {
+            let value = match bits {
                 // Through text, so a 32-bit value shows as 28.05, not as the
                 // nearest 64-bit number to it, 28.049999237060547.
                 32 => {
@@ -109,11 +104,35 @@ fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String
                 _ => return Err("Float must be 32 or 64 bits"),
             };
             if value.is_finite() {
-                Ok((Value::Float(value), None))
+                Ok(Value::Float(value))
             } else {
                 // JSON has no way to write these as numbers.
-                Ok((Value::Text(value.to_string()), None))
+                Ok(Value::Text(value.to_string()))
             }
+        }
+    }
+}
+
+fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String>), &'static str> {
+    match field.kind {
+        FieldKind::Uint | FieldKind::Int | FieldKind::Float if field.count > 1 => {
+            let each = (0..u64::from(field.count)).map(|i| {
+                number(
+                    field,
+                    packet,
+                    u64::from(field.bit_offset) + i * u64::from(field.bit_length),
+                )
+            });
+            Ok((Value::List(each.collect::<Result<_, _>>()?), None))
+        }
+        FieldKind::Uint | FieldKind::Int | FieldKind::Float => {
+            let value = number(field, packet, u64::from(field.bit_offset))?;
+            let label = match &value {
+                Value::UInt(v) => field.labels.get(&v.to_string()).cloned(),
+                Value::Int(v) => field.labels.get(&v.to_string()).cloned(),
+                _ => None,
+            };
+            Ok((value, label))
         }
         FieldKind::Hex | FieldKind::Ascii => {
             if !field.bit_offset.is_multiple_of(8) || !field.bit_length.is_multiple_of(8) {
@@ -432,5 +451,69 @@ bit_length = 8
             serde_json::to_string(&values).unwrap(),
             r#"["81985529216486895",42,"-9223372036854775808",-7]"#
         );
+    }
+
+    #[test]
+    fn little_endian_numbers_and_arrays() {
+        let def = def(
+            "[[packet.field]]\nname = \"W\"\nbit_offset = 0\nbit_length = 16\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"I\"\nbit_offset = 16\nbit_length = 32\nkind = \"int\"\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"F\"\nbit_offset = 48\nbit_length = 32\nkind = \"float\"\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"D\"\nbit_offset = 80\nbit_length = 64\nkind = \"float\"\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"A\"\nbit_offset = 144\nbit_length = 16\ncount = 3\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"N\"\nbit_offset = 192\nbit_length = 4\nkind = \"int\"\ncount = 4\n\
+             [[packet.field]]\nname = \"PAST\"\nbit_offset = 200\nbit_length = 8\ncount = 2\n",
+        );
+        let mut packet = vec![0x34, 0x12];
+        packet.extend((-2i32).to_le_bytes());
+        packet.extend(21.5f32.to_le_bytes());
+        packet.extend((-0.125f64).to_le_bytes());
+        packet.extend([1, 0, 2, 0, 0xFF, 0xFF]);
+        packet.extend([0x1F, 0x80]);
+        let out = decode_fields(&def, &packet);
+        let value = |i: usize| out[i].value.clone().unwrap();
+        assert_eq!(value(0), Value::UInt(0x1234));
+        assert_eq!(value(1), Value::Int(-2));
+        assert_eq!(value(2), Value::Float(21.5));
+        assert_eq!(value(3), Value::Float(-0.125));
+        assert_eq!(
+            value(4),
+            Value::List(vec![Value::UInt(1), Value::UInt(2), Value::UInt(65535)])
+        );
+        let nibbles = [1, -1, -8, 0].map(Value::Int).to_vec();
+        assert_eq!(value(5), Value::List(nibbles));
+        assert_eq!(serde_json::to_string(&value(4)).unwrap(), "[1,2,65535]");
+        // An array that runs off the end is an error as a whole.
+        assert_eq!(out[6].error, Some("Past end of packet"));
+
+        for (bad, want) in [
+            (
+                "bit_offset = 4\nbit_length = 16\nbyte_order = \"little\"",
+                "byte_order little",
+            ),
+            (
+                "bit_offset = 0\nbit_length = 12\nbyte_order = \"little\"",
+                "byte_order little",
+            ),
+            ("bit_offset = 0\nbit_length = 8\ncount = 0", "count must be"),
+            (
+                "bit_offset = 0\nbit_length = 8\ncount = 2000",
+                "count must be",
+            ),
+            (
+                "bit_offset = 0\nbit_length = 8\nkind = \"hex\"\ncount = 2",
+                "count must be",
+            ),
+            (
+                "bit_offset = 0\nbit_length = 8\ncount = 2\nlabels = { \"1\" = \"A\" }",
+                "cannot have labels",
+            ),
+        ] {
+            let text = format!(
+                "[[packet]]\napid = 1\nname = \"T\"\n[[packet.field]]\nname = \"X\"\n{bad}"
+            );
+            let err = Config::parse(&text).unwrap_err();
+            assert!(err.contains(want), "{bad:?} gave {err:?}");
+        }
     }
 }

@@ -49,6 +49,8 @@
 //!   bit_offset = 96          # from the start of the packet; bit 0 is the top bit of byte 0
 //!   bit_length = 8
 //!   kind = "uint"            # uint (default), int, float, hex, ascii
+//!   byte_order = "big"       # "big" (default) or "little": whole bytes on a byte boundary
+//!   count = 1                # more than 1: an array of that many numbers
 //!   unit = ""
 //!   labels = { "0" = "IDLE", "1" = "OBSERVE" }
 //! ```
@@ -221,6 +223,29 @@ pub struct FieldDef {
     /// Names for particular raw values, keyed by the value in decimal.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Which byte of a number comes first in the packet.
+    #[serde(default)]
+    pub byte_order: ByteOrder,
+    /// How many numbers of `bit_length` bits follow one another: more than
+    /// one makes the field an array.
+    #[serde(default = "one")]
+    pub count: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+/// Most elements an array field may have.
+pub const MAX_COUNT: u32 = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ByteOrder {
+    /// Most significant byte first, as space packets themselves are.
+    #[default]
+    Big,
+    Little,
 }
 
 /// A packet time rule with its epoch already turned into a number.
@@ -537,6 +562,24 @@ impl FieldDef {
                     ));
                 }
             }
+        }
+        let number = !matches!(self.kind, FieldKind::Hex | FieldKind::Ascii);
+        if self.byte_order == ByteOrder::Little
+            && !(number
+                && matches!(self.bit_length, 16 | 32 | 64)
+                && self.bit_offset.is_multiple_of(8))
+        {
+            return Err(
+                "byte_order little needs a byte-aligned number of 16, 32 or 64 bits".to_string(),
+            );
+        }
+        if !(1..=MAX_COUNT).contains(&self.count) || (self.count > 1 && !number) {
+            return Err(format!(
+                "count must be 1 to {MAX_COUNT}, and 1 for hex and ascii"
+            ));
+        }
+        if self.count > 1 && !self.labels.is_empty() {
+            return Err("an array field cannot have labels".to_string());
         }
         if let Some(key) = self.labels.keys().find(|k| k.parse::<i128>().is_err()) {
             return Err(format!("labels key {key:?} must be a whole number"));

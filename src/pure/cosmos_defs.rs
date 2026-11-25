@@ -10,10 +10,10 @@
 //!   an identifier item at bit 5, 11 bits, unsigned. Outside COSMOS logs
 //!   there is no name to go by, and a packet is only decoded if its APID
 //!   and type belong to one definition.
-//! - Items become fields when they are fixed-size, at a known position, and
-//!   big-endian (or a single byte or less, where the order cannot matter).
-//!   Arrays, derived items, sizes of zero or less, and offsets from the end
-//!   are skipped.
+//! - Items become fields when they are fixed-size and at a known position.
+//!   Little-endian numbers must be 16, 32 or 64 bits on a byte boundary;
+//!   arrays must be of numbers. Derived items, sizes of zero or less,
+//!   offsets from the end and little-endian bit fields are skipped.
 //! - `STATE` becomes a label and `UNITS` the unit. Conversions, limits and
 //!   format strings are dropped: values are shown raw.
 //! - ERB (`<% ... %>`) is not run. After one, the position of appended items
@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::pure::config::{FieldDef, FieldKind, Kind, PacketDef};
+use crate::pure::config::{ByteOrder, FieldDef, FieldKind, Kind, MAX_COUNT, PacketDef};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Import {
@@ -328,9 +328,16 @@ impl Importer<'_> {
         let after = offset.checked_add(total as u64).ok_or("it is too large")?;
         b.end = b.end.map(|end| end.max(after));
 
-        if array {
-            return Err("arrays are not supported".into());
-        }
+        let count = if array {
+            if text || total % size != 0 || total / size > i64::from(MAX_COUNT) {
+                return Err(format!(
+                    "only arrays of up to {MAX_COUNT} whole numbers are supported"
+                ));
+            }
+            (total / size) as u32
+        } else {
+            1
+        };
         let kind = match data_type.as_str() {
             "UINT" => FieldKind::Uint,
             "INT" => FieldKind::Int,
@@ -340,10 +347,15 @@ impl Importer<'_> {
             other => return Err(format!("type {other} is not supported")),
         };
         // Byte order cannot matter for text, or for a number within one byte.
-        let one_byte = size <= 8 && offset / 8 == (after - 1) / 8;
-        if little_endian && !text && !one_byte {
-            return Err("little-endian numbers are not supported".into());
-        }
+        let one_byte = match array {
+            true => size == 8 && offset % 8 == 0,
+            false => size <= 8 && offset / 8 == (after - 1) / 8,
+        };
+        let byte_order = if little_endian && !text && !one_byte {
+            ByteOrder::Little
+        } else {
+            ByteOrder::Big
+        };
         let field = FieldDef {
             name: name.clone(),
             bit_offset: u32::try_from(offset).map_err(|_| "it is too far into the packet")?,
@@ -351,6 +363,8 @@ impl Importer<'_> {
             kind,
             unit: String::new(),
             labels: BTreeMap::new(),
+            byte_order,
+            count,
         };
         field.validate()?;
         if id && kind == FieldKind::Uint && offset == 5 && size == 11 {
@@ -454,6 +468,12 @@ pub fn to_toml(packets: &[PacketDef]) -> String {
                 FieldKind::Ascii => "ascii",
             };
             out.push_str(&format!("  kind = \"{kind}\"\n"));
+            if f.byte_order == ByteOrder::Little {
+                out.push_str("  byte_order = \"little\"\n");
+            }
+            if f.count > 1 {
+                out.push_str(&format!("  count = {}\n", f.count));
+            }
             if !f.unit.is_empty() {
                 out.push_str(&format!("  unit = {}\n", quoted(&f.unit)));
             }
@@ -527,13 +547,16 @@ TELEMETRY inst HEALTH_STATUS BIG_ENDIAN "Health and status"
         assert_eq!(at("TEMP1"), Some((48, 16, FieldKind::Uint)));
         assert_eq!(field("TEMP1").unwrap().unit, "C");
         assert_eq!(at("TEMP2"), Some((64, 32, FieldKind::Float)));
-        // The skipped 80-bit array still takes up its room.
-        assert_eq!(at("ARY"), None);
+        // An array of ten bytes.
+        assert_eq!(at("ARY"), Some((96, 8, FieldKind::Uint)));
+        assert_eq!(field("ARY").unwrap().count, 10);
         assert_eq!(at("MODE"), Some((176, 8, FieldKind::Int)));
         assert_eq!(field("MODE").unwrap().labels["-1"], "SAFE");
         assert_eq!(field("MODE").unwrap().labels["2"], "RUN");
-        // So does the skipped little-endian word; a single byte is kept.
-        assert_eq!(at("WORD"), None);
+        // A little-endian word is kept as one; a single byte has no order.
+        assert_eq!(at("WORD"), Some((184, 16, FieldKind::Uint)));
+        assert_eq!(field("WORD").unwrap().byte_order, ByteOrder::Little);
+        assert_eq!(field("FLAG").unwrap().byte_order, ByteOrder::Big);
         assert_eq!(at("FLAG"), Some((200, 8, FieldKind::Uint)));
         assert_eq!(at("CALC"), None);
         assert_eq!(at("NOTE"), Some((208, 64, FieldKind::Ascii)));
@@ -543,8 +566,6 @@ TELEMETRY inst HEALTH_STATUS BIG_ENDIAN "Health and status"
 
         let all = got.warnings.join("\n");
         for needle in [
-            "t.txt:18: INST HEALTH_STATUS ARY: skipped, arrays are not supported",
-            "WORD: skipped, little-endian numbers are not supported",
             "CALC: skipped, derived items have no bits to show",
             "REST: skipped, its size is not fixed",
             "AFTER: skipped, its position is unknown",
@@ -552,7 +573,7 @@ TELEMETRY inst HEALTH_STATUS BIG_ENDIAN "Health and status"
         ] {
             assert!(all.contains(needle), "missing {needle:?} in:\n{all}");
         }
-        assert_eq!(got.warnings.len(), 6, "{all}");
+        assert_eq!(got.warnings.len(), 4, "{all}");
     }
 
     #[test]
@@ -586,10 +607,11 @@ COMMAND INST COLLECT BIG_ENDIAN "Start a collect"
             (Some(99), Kind::Tc, "INST COLLECT")
         );
         let names: Vec<&str> = p.fields.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, ["CCSDSAPID", "DURATION", "LABEL", "OPCODE"]);
-        assert_eq!(p.fields[1].bit_offset, 64);
-        assert_eq!(p.fields[3].bit_offset, 128);
-        assert_eq!(got.warnings.len(), 1, "{:?}", got.warnings);
+        assert_eq!(names, ["CCSDSAPID", "TYPE", "DURATION", "LABEL", "OPCODE"]);
+        assert_eq!(p.fields[1].byte_order, ByteOrder::Little);
+        assert_eq!(p.fields[2].bit_offset, 64);
+        assert_eq!(p.fields[4].bit_offset, 128);
+        assert_eq!(got.warnings, [] as [String; 0]);
     }
 
     #[test]

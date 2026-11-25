@@ -557,7 +557,7 @@ async function select(item, keepTab) {
       const h = document.createElement("h2");
       h.textContent = p.name || (p.apid !== null ? apidText(p.apid) : p.label || "Other");
       pane.append(h);
-      if (p.fields.length) pane.append(kv(p.fields.map((f) => [f.name, f.error ? f.error : f.label ? [String(f.value), f.label] : String(f.value) + (f.unit ? " " + f.unit : ""), f.error ? "error" : ""])));
+      if (p.fields.length) pane.append(kv(p.fields.map((f) => [f.name, f.error ? f.error : f.label ? [String(f.value), f.label] : (Array.isArray(f.value) ? f.value.join(", ") : String(f.value)) + (f.unit ? " " + f.unit : ""), f.error ? "error" : ""])));
       pane.append(kv([
         ["Receive", short(p.receive)], ["Packet", short(p.packet)],
         ["APID", p.apid !== null ? apidText(p.apid) + (p.command ? " TC" : "") : ""],
