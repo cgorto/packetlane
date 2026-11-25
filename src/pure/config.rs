@@ -18,13 +18,20 @@
 //! pattern = '^\[(?P<epoch>\d+\.\d+)\]'
 //! default_year = 2026        # only for patterns with no year
 //!
-//! [packet_time]              # where the time is in a packet's secondary header
-//! code = "cuc"               # "cuc": seconds + binary fraction; "cds": days + ms of day
+//! [packet_time]              # where the time is in a packet
+//! code = "cuc"               # "cuc": seconds + binary fraction; "cds": days + ms of day;
+//!                            # "unix": seconds, then microseconds as a 32-bit number
 //! byte_offset = 6            # from the start of the packet
-//! coarse_bytes = 4           # cuc
+//! coarse_bytes = 4           # cuc, unix: bytes of whole seconds
 //! fine_bytes = 2             # cuc
-//! epoch = "1958-01-01T00:00:00Z"
+//! epoch = "1958-01-01T00:00:00Z"   # the default, except for unix: 1970
 //! subtract_seconds = 0       # for example the difference between the timescale and UTC
+//! require_secondary_header = true  # false: read the time whatever the header's flag
+//!                            # says, as COSMOS's example packets need
+//! applies_to = "all"         # or "telemetry", "commands". The default is "all", or
+//!                            # "telemetry" where the flag is not required: with no
+//!                            # flag to go by, a command's arguments would be read
+//!                            # as a time
 //!
 //! [frames]                   # only for files of CADUs: sync marker + transfer frame.
 //!                            # The first four are detected from each file where its
@@ -128,6 +135,18 @@ pub struct LogRule {
 pub enum TimeCode {
     Cuc,
     Cds,
+    /// Whole seconds, then microseconds as a 32-bit number: what Unix calls
+    /// a timeval, and what COSMOS's example packets carry.
+    Unix,
+}
+
+/// Which packets the time rule is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppliesTo {
+    All,
+    Telemetry,
+    Commands,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -144,10 +163,19 @@ pub struct PacketTime {
     pub day_bytes: usize,
     #[serde(default)]
     pub submillis_bytes: usize,
-    #[serde(default = "default_epoch")]
-    pub epoch: String,
+    /// Where unset: 1958 (TAI's), or 1970 for the unix code.
+    #[serde(default)]
+    pub epoch: Option<String>,
     #[serde(default)]
     pub subtract_seconds: i64,
+    #[serde(default = "default_true")]
+    pub require_secondary_header: bool,
+    #[serde(default)]
+    pub applies_to: Option<AppliesTo>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_time_offset() -> usize {
@@ -162,9 +190,8 @@ fn default_fine() -> usize {
 fn default_day_bytes() -> usize {
     2
 }
-fn default_epoch() -> String {
-    "1958-01-01T00:00:00Z".to_string()
-}
+const TAI_EPOCH: &str = "1958-01-01T00:00:00Z";
+const UNIX_EPOCH: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -335,6 +362,20 @@ pub struct ResolvedTime {
     pub submillis_bytes: usize,
     pub epoch_ns: i64,
     pub subtract_ns: i64,
+    pub require_secondary_header: bool,
+    pub applies_to: AppliesTo,
+}
+
+impl ResolvedTime {
+    /// Whether a packet with this header is one the rule reads a time from.
+    pub fn applies(&self, header: &PrimaryHeader) -> bool {
+        let kind = match self.applies_to {
+            AppliesTo::All => true,
+            AppliesTo::Telemetry => header.packet_type == PacketType::Telemetry,
+            AppliesTo::Commands => header.packet_type == PacketType::Command,
+        };
+        kind && (header.has_secondary_header || !self.require_secondary_header)
+    }
 }
 
 /// What the configuration says about one file.
@@ -566,18 +607,19 @@ impl Config {
 
 impl PacketTime {
     pub fn resolve(&self) -> Result<ResolvedTime, String> {
-        let epoch_ns = parse_iso(&self.epoch).ok_or_else(|| {
-            format!(
-                "packet_time: epoch {:?} must look like \"1958-01-01T00:00:00Z\"",
-                self.epoch
-            )
+        let epoch = self.epoch.as_deref().unwrap_or(match self.code {
+            TimeCode::Unix => UNIX_EPOCH,
+            TimeCode::Cuc | TimeCode::Cds => TAI_EPOCH,
+        });
+        let epoch_ns = parse_iso(epoch).ok_or_else(|| {
+            format!("packet_time: epoch {epoch:?} must look like \"1958-01-01T00:00:00Z\"")
         })?;
         match self.code {
-            TimeCode::Cuc => {
+            TimeCode::Cuc | TimeCode::Unix => {
                 if !(1..=4).contains(&self.coarse_bytes) {
                     return Err("packet_time: coarse_bytes must be 1 to 4".to_string());
                 }
-                if self.fine_bytes > 3 {
+                if self.code == TimeCode::Cuc && self.fine_bytes > 3 {
                     return Err("packet_time: fine_bytes must be 0 to 3".to_string());
                 }
             }
@@ -606,6 +648,12 @@ impl PacketTime {
             submillis_bytes: self.submillis_bytes,
             epoch_ns,
             subtract_ns,
+            require_secondary_header: self.require_secondary_header,
+            applies_to: self.applies_to.unwrap_or(if self.require_secondary_header {
+                AppliesTo::All
+            } else {
+                AppliesTo::Telemetry
+            }),
         })
     }
 }
@@ -733,6 +781,53 @@ name = "PAYLOAD_CMD"
         assert_eq!(time.coarse_bytes, 4);
         assert_eq!(time.subtract_ns, 37 * NS_PER_SEC);
         assert_eq!(time.epoch_ns, -378_691_200 * NS_PER_SEC);
+    }
+
+    #[test]
+    fn packet_time_defaults_follow_the_code_and_the_flag() {
+        let time = |text: &str| {
+            Config::parse(&format!("[packet_time]\n{text}"))
+                .unwrap()
+                .resolved_time()
+                .unwrap()
+        };
+        let header = |first: u8| PrimaryHeader::parse(&[first, 1, 0xC0, 0, 0, 0]).unwrap();
+        let (tm, tm_flag, tc, tc_flag) = (header(0x00), header(0x08), header(0x10), header(0x18));
+
+        // As it always was: any packet that sets the flag, 1958.
+        let cuc = time("code = \"cuc\"");
+        assert_eq!(cuc.epoch_ns, -378_691_200 * NS_PER_SEC);
+        assert_eq!(
+            [&tm, &tm_flag, &tc, &tc_flag].map(|h| cuc.applies(h)),
+            [false, true, false, true]
+        );
+
+        // Unix time counts from 1970 unless told otherwise.
+        assert_eq!(time("code = \"unix\"").epoch_ns, 0);
+        assert_eq!(
+            time("code = \"unix\"\nepoch = \"1980-01-06T00:00:00Z\"").epoch_ns,
+            315_964_800 * NS_PER_SEC
+        );
+
+        // Without the flag to go by, only telemetry, unless told otherwise.
+        let loose = time("code = \"unix\"\nrequire_secondary_header = false");
+        assert_eq!(
+            [&tm, &tm_flag, &tc, &tc_flag].map(|h| loose.applies(h)),
+            [true, true, false, false]
+        );
+        let all = time("code = \"unix\"\nrequire_secondary_header = false\napplies_to = \"all\"");
+        assert!(
+            [&tm, &tm_flag, &tc, &tc_flag]
+                .iter()
+                .all(|h| all.applies(h))
+        );
+        let commands = time("code = \"cuc\"\napplies_to = \"commands\"");
+        assert_eq!(
+            [&tm, &tm_flag, &tc, &tc_flag].map(|h| commands.applies(h)),
+            [false, false, false, true]
+        );
+        assert!(Config::parse("[packet_time]\ncode = \"unix\"\ncoarse_bytes = 5").is_err());
+        assert!(Config::parse("[packet_time]\ncode = \"cuc\"\napplies_to = \"some\"").is_err());
     }
 
     #[test]

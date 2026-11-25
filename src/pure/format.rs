@@ -281,7 +281,8 @@ fn be_uint(bytes: &[u8]) -> u64 {
 }
 
 /// The packet's own timestamp, in nanoseconds since the Unix epoch, read
-/// from its secondary header as the configuration describes. `None` if the
+/// as the configuration describes. Whether the packet is one to read a time
+/// from at all is the caller's question: see `ResolvedTime::applies`. `None` if the
 /// packet is too short or the result does not fit.
 pub fn packet_time_ns(rule: &ResolvedTime, packet: &[u8]) -> Option<i64> {
     let field = |start: usize, len: usize| -> Option<u64> {
@@ -298,6 +299,15 @@ pub fn packet_time_ns(rule: &ResolvedTime, packet: &[u8]) -> Option<i64> {
             // fine / 256^n seconds, in nanoseconds, rounded down.
             let denominator = 1i128 << (8 * rule.fine_bytes as u32);
             i128::from(coarse) * 1_000_000_000 + i128::from(fine) * 1_000_000_000 / denominator
+        }
+        TimeCode::Unix => {
+            let seconds = field(rule.byte_offset, rule.coarse_bytes)?;
+            let micros_start = rule.byte_offset.checked_add(rule.coarse_bytes)?;
+            let micros = field(micros_start, 4)?;
+            if micros >= 1_000_000 {
+                return None;
+            }
+            i128::from(seconds) * 1_000_000_000 + i128::from(micros) * 1_000
         }
         TimeCode::Cds => {
             let days = field(rule.byte_offset, rule.day_bytes)?;
@@ -466,6 +476,32 @@ bit_length = 8
             &packet[6..]
         );
         assert_eq!(cuc_bytes(&rule, epoch - 1), None);
+    }
+
+    #[test]
+    fn unix_time() {
+        use crate::pure::synth::cosmos_tlm;
+        let rule = rule("[packet_time]\ncode = \"unix\"");
+        // A packet from a real COSMOS log: 0x52D02E78 seconds, 0x000B3F34
+        // microseconds, which is 2014-01-10T17:31:36.737076Z.
+        let packet = [
+            0x00, 0x02, 0xC0, 0x01, 0x00, 0x09, 0x52, 0xD0, 0x2E, 0x78, 0x00, 0x0B, 0x3F, 0x34,
+            0x00, 0x01,
+        ];
+        let t = 1_389_375_096_737_076_000;
+        assert_eq!(packet_time_ns(&rule, &packet), Some(t));
+        assert_eq!(
+            crate::pure::time::format_iso(t),
+            "2014-01-10T17:31:36.737076000Z"
+        );
+        assert_eq!(packet, *cosmos_tlm(2, 1, t, 1, &[]));
+        assert_eq!(packet_time_ns(&rule, &packet[..13]), None);
+        // A million microseconds is not a time.
+        let mut bad = packet;
+        bad[10..14].copy_from_slice(&1_000_000u32.to_be_bytes());
+        assert_eq!(packet_time_ns(&rule, &bad), None);
+        bad[10..14].copy_from_slice(&999_999u32.to_be_bytes());
+        assert_eq!(packet_time_ns(&rule, &bad), Some(1_389_375_096_999_999_000));
     }
 
     #[test]

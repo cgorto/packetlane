@@ -200,7 +200,7 @@ Three clocks are in play and they do not agree:
 
 | Clock | Comes from | Catch |
 |---|---|---|
-| Packet time | the packet's secondary header | format and epoch are mission defined; independent of wall time |
+| Packet time | the packet, usually its secondary header | format and epoch are mission defined; independent of wall time |
 | Receive time | the log container | each host's clock is skewed differently |
 | Log time | text log lines | timezone often unstated; sometimes no year |
 

@@ -887,12 +887,21 @@ same across missions.
   (both supported in `[packet_time]` in `src/pure/config.rs`) are an
   unsegmented count (**CUC**: seconds plus a binary fraction) and a
   day-segmented one (**CDS**: days since an epoch plus milliseconds of day).
+  A third, `unix`, is whole seconds followed by microseconds as a 32-bit
+  number, counted from 1970 unless configured otherwise.
   Take the format from configuration; never hard-code it in a decoder.
+- **The secondary header flag is not always honest.** By default a time is
+  read only from packets that set it. COSMOS's example telemetry carries a
+  time and leaves the flag clear, so `require_secondary_header = false`
+  reads the time regardless. With the flag out of the picture nothing says
+  which packets have a time at all, so that setting applies to telemetry
+  only unless `applies_to` says otherwise: commands from the same
+  definitions have arguments where the time would be.
 
 ### Time and the three clocks
 
-Keep three clocks apart (see `README.md`): **packet time** (from the packet's
-secondary header), **receive time** (from the log container), and **text log
+Keep three clocks apart (see `README.md`): **packet time** (from the packet,
+usually its secondary header), **receive time** (from the log container), and **text log
 time** (from text log lines).
 
 - Store every time as integer nanoseconds (`i64`) plus which clock it belongs
@@ -983,7 +992,16 @@ definitions copied from it are common:
 
 - Telemetry packets do not set the secondary header flag, though bytes 6 to 13
   hold a time: seconds, then microseconds, since 1970. A 16-bit packet id
-  follows. Sequence counts start at 1.
+  follows. Sequence counts start at 1. To read that time:
+
+  ```toml
+  [packet_time]
+  code = "unix"
+  require_secondary_header = false
+  ```
+
+  In a real telemetry log this puts packet time a millisecond or two before
+  the time COSMOS logged the packet, as it should be.
 - Every command is on one APID, told apart by a 16-bit packet id at byte 6.
   The sequence count is always 0: COSMOS does not count commands. The length
   field holds the definition's default. That is the packet's real length in

@@ -126,3 +126,54 @@ fn cosmos5_writer_reproduces_a_real_file() {
         recs.len()
     );
 }
+
+/// The packet time in real telemetry, read as seconds and microseconds,
+/// must sit close to the time COSMOS logged the packet at. A wrong offset,
+/// unit or epoch would not.
+#[test]
+fn packet_time_in_real_telemetry_is_close_to_receive_time() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::ingest::packet_row;
+
+    let rule = Config::parse("[packet_time]\ncode = \"unix\"\nrequire_secondary_header = false")
+        .unwrap()
+        .resolved_time()
+        .unwrap();
+    let files = [
+        ("REAL4", "tlm.bin", true),
+        ("REAL4", "cmd.bin", false),
+        ("REAL5", "raw.bin", true),
+    ];
+    for (var, name, telemetry) in files {
+        let Ok(dir) = std::env::var(var) else {
+            continue;
+        };
+        let real = fs::read(format!("{dir}/{name}")).unwrap();
+        let mut packets = 0;
+        // Receive time minus packet time, for each packet that has one.
+        let mut lags: Vec<i64> = Vec::new();
+        for (i, r) in records(&real).iter().enumerate() {
+            let row = packet_row(i as u64, r, Some(&rule), 0);
+            packets += usize::from(row.header.is_some());
+            lags.extend(row.packet_ns.map(|t| row.receive_ns.unwrap() - t));
+        }
+        assert!(packets > 0, "{name}");
+        // Every telemetry packet has a time; no command does.
+        assert_eq!(lags.len(), if telemetry { packets } else { 0 }, "{name}");
+        if lags.is_empty() {
+            println!("{name}: {packets} packets, none with a time");
+            continue;
+        }
+        lags.sort_unstable();
+        let ms = |at: usize| lags[at.min(lags.len() - 1)] as f64 / 1e6;
+        println!(
+            "{name}: {packets} packets, all with a time; receive time is later by {:.1} ms at least, {:.1} ms in the middle, {:.1} ms at most",
+            ms(0),
+            ms(lags.len() / 2),
+            ms(lags.len())
+        );
+        assert!(lags[0] > -1_000_000_000, "{name}");
+        assert!(lags[lags.len() / 2].abs() < 1_000_000_000, "{name}");
+        assert!(lags[lags.len() - 1] < 10_000_000_000, "{name}");
+    }
+}

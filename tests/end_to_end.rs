@@ -1412,8 +1412,8 @@ fn logs_shaped_like_cosmos_4s_own() {
         run.join("packetlane.toml"),
         r#"
 [packet_time]
-code = "cuc"
-epoch = "1970-01-01T00:00:00Z"
+code = "unix"
+require_secondary_header = false
 
 [[packet]]
 apid = 999
@@ -1505,10 +1505,25 @@ name = "INST COLLECT"
         1
     );
 
-    // Limit: the time in these packets is not read. It is seconds and
-    // microseconds with no secondary header flag, and packet time is only
-    // read as CUC or CDS from packets that set the flag.
-    assert_eq!(count(&store, "SELECT COUNT(packet_ns) FROM packets"), 0);
+    // Their time is seconds and microseconds with no secondary header flag,
+    // which the configuration above says how to read. Here each was logged
+    // at the moment it was stamped. Commands carry no time and get none.
+    assert_eq!(
+        in_file("packet_view", "tlm.bin", "AND packet_ns = receive_ns"),
+        44
+    );
+    assert_eq!(count(&store, "SELECT COUNT(packet_ns) FROM packets"), 44);
+    assert_eq!(
+        store
+            .query_user(
+                "SELECT packet_time FROM packet_view WHERE apid = 3 ORDER BY idx LIMIT 1",
+                1
+            )
+            .unwrap()
+            .rows[0][0]
+            .text(),
+        Some("2014-01-10T16:14:47.100")
+    );
 
     // Commands are packets on APID 999 in both files. COSMOS never counts
     // them, so the one count on all of them is noted once and is not a

@@ -154,7 +154,7 @@ pub fn packet_row(
     let found = logged_header(&record.payload, record.label.is_some());
     let header = found.map(|(h, _)| h);
     let packet_ns = match (&header, time) {
-        (Some(h), Some(rule)) if h.has_secondary_header => packet_time_ns(rule, &record.payload),
+        (Some(h), Some(rule)) if rule.applies(h) => packet_time_ns(rule, &record.payload),
         _ => None,
     };
     PacketRow {
@@ -398,6 +398,24 @@ mod tests {
         assert_eq!(row.packet_ns, Some(9_000_000_000));
         // The host clock correction does not touch the packet's own time.
         assert_eq!(row.receive_ns, Some(1_005));
+
+        // Unless the rule says the flag is not to be trusted, which then
+        // holds for telemetry only.
+        let rule =
+            Config::parse("[packet_time]\ncode = \"unix\"\nrequire_secondary_header = false")
+                .unwrap()
+                .resolved_time()
+                .unwrap();
+        let mut plain = packet(0x1A3, 0, &[0, 0, 0, 9, 0, 0, 0, 5]);
+        assert_eq!(
+            packet_row(0, &record(plain.clone()), Some(&rule), 0).packet_ns,
+            Some(9_000_005_000)
+        );
+        plain[0] |= 0x10;
+        assert_eq!(
+            packet_row(0, &record(plain), Some(&rule), 0).packet_ns,
+            None
+        );
     }
 
     #[test]
