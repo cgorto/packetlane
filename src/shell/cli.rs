@@ -125,10 +125,23 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     for finding in &report.findings {
         println!("  Problem: {finding}");
     }
+    let notices = records.notices();
+    for notice in &notices.list {
+        let what = if notice.is_problem() {
+            "Problem"
+        } else {
+            "Note"
+        };
+        println!("  {what}: {notice}");
+    }
+    if notices.more > 0 {
+        println!("  Problem: {} more losses are not listed", notices.more);
+    }
     if let Some(e) = &read_problem {
         println!("  Problem: {e}");
     }
-    Ok(!report.findings.is_empty() || read_problem.is_some())
+    let lost = notices.more > 0 || notices.list.iter().any(|n| n.is_problem());
+    Ok(!report.findings.is_empty() || read_problem.is_some() || lost)
 }
 
 type CliResult = Result<ExitCode, Box<dyn std::error::Error + Send + Sync>>;

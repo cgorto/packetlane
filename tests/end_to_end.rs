@@ -889,3 +889,47 @@ fn packets_inside_cadus_can_be_read_back() {
         assert_eq!(body["hex"], hex(shown));
     }
 }
+
+/// Damage a CADU decoder reads past is stored as findings, not swallowed.
+#[test]
+fn frames_lost_from_a_cadu_file_become_findings() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let toml = "[frames]\ncrc = true\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let mut src = Source::new(0x1A3, 0, 40);
+    let packets: Vec<u8> = (0..60).flat_map(|_| src.emit()).collect();
+    let mut file = demo_cadus(&Config::parse(toml).unwrap().frame_params(128), &packets);
+    file.drain(5 * 128..7 * 128); // two frames gone
+    file[10 * 128 + 50] ^= 1; // one fails its CRC
+    fs::write(run.join("station/pass.cadu"), file).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let found = store
+        .query_user(
+            "SELECT kind, severity, message FROM findings ORDER BY id",
+            50,
+        )
+        .unwrap();
+    let kinds: Vec<&str> = found.rows.iter().map(|r| r[0].text().unwrap()).collect();
+    assert!(kinds.contains(&"frame_gap"), "{kinds:?}");
+    assert!(kinds.contains(&"bad_frame"), "{kinds:?}");
+    // The packets that were in those frames also show as sequence gaps.
+    assert!(kinds.contains(&"gap"), "{kinds:?}");
+    let gap = found
+        .rows
+        .iter()
+        .find(|r| r[0].text() == Some("frame_gap"))
+        .unwrap();
+    assert_eq!(gap[1].text(), Some("problem"));
+    assert!(
+        gap[2].text().unwrap().contains("2 frames missing"),
+        "{:?}",
+        gap[2]
+    );
+}

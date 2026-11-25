@@ -9,7 +9,8 @@ use crate::pure::checksum::{FNV_OFFSET, fnv1a_update};
 use crate::pure::config::Config;
 use crate::pure::decode::cadu::MAX_CADU_LEN;
 use crate::pure::decode::{
-    DecodeEnd, DecodeError, Decoder, Format, MAX_ENTRY, Record, SNIFF_LEN, Step, decoder_for, sniff,
+    DecodeEnd, DecodeError, Decoder, Format, MAX_ENTRY, Notices, Record, SNIFF_LEN, Step,
+    decoder_for, sniff,
 };
 use crate::pure::frame::SYNC;
 
@@ -164,6 +165,7 @@ pub struct Records<R> {
     base: u64,
     eof: bool,
     done: bool,
+    notices: Notices,
 }
 
 impl<R: Read> Records<R> {
@@ -182,7 +184,13 @@ impl<R: Read> Records<R> {
             base,
             eof: false,
             done: false,
+            notices: Notices::default(),
         }
+    }
+
+    /// What the decoder gave up on so far to keep reading.
+    pub fn notices(&self) -> &Notices {
+        &self.notices
     }
 
     /// What the decoder learned about the file. Ask once reading is done.
@@ -231,6 +239,13 @@ impl<R: Read> Iterator for Records<R> {
                         return self.implausible("invalid decoder step");
                     }
                     self.start += consumed;
+                }
+                Step::Lost { consumed, notice } => {
+                    if consumed == 0 || consumed > pending.len() {
+                        return self.implausible("invalid decoder step");
+                    }
+                    self.start += consumed;
+                    self.notices.push(notice);
                 }
                 Step::Fatal(e) => return self.fail(ReadError::Decode(DecodeEnd::Error(e))),
                 Step::NeedMore => {

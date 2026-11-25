@@ -484,7 +484,12 @@ fn ingest_packets(
         count += 1;
     }
 
-    let findings: Vec<FindingRow> = file_findings(&checker.finish(), end.as_ref(), non_packets);
+    let findings: Vec<FindingRow> = file_findings(
+        &checker.finish(),
+        records.notices(),
+        end.as_ref(),
+        non_packets,
+    );
     let mut insert_finding = conn.prepare_cached(sql::INSERT_FINDING)?;
     for finding in &findings {
         let lane_id = match finding.lane {

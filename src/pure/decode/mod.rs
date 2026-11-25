@@ -48,6 +48,115 @@ impl fmt::Display for DecodeError {
     }
 }
 
+/// What a decoder had to give up on to keep going. Formats with a sync
+/// marker can carry on past damage; this is how they say what it cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Loss {
+    /// Bytes that belong to no frame, passed over to reach a sync marker.
+    Junk { bytes: u64 },
+    /// A sync marker followed by something that is not a usable frame.
+    BadFrame { reason: &'static str },
+    /// A virtual channel's frame count did not follow on from the last one.
+    /// The packet that was in progress on the channel is dropped.
+    FrameGap {
+        scid: u16,
+        vcid: u8,
+        expected: u32,
+        got: u32,
+        /// How many frames are missing, or `None` if the count went back.
+        missing: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// Where in the file it happened.
+    pub offset: u64,
+    pub loss: Loss,
+}
+
+impl Notice {
+    /// The finding kind this is stored as.
+    pub fn kind(&self) -> &'static str {
+        match self.loss {
+            Loss::Junk { .. } => "junk",
+            Loss::BadFrame { .. } => "bad_frame",
+            Loss::FrameGap { .. } => "frame_gap",
+        }
+    }
+
+    /// False for what is normal in a healthy capture: one that starts
+    /// partway through a frame has bytes before its first sync marker.
+    pub fn is_problem(&self) -> bool {
+        !(self.offset == 0 && matches!(self.loss, Loss::Junk { .. }))
+    }
+}
+
+impl fmt::Display for Notice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let at = self.offset;
+        match &self.loss {
+            Loss::Junk { bytes } => {
+                let unit = if *bytes == 1 { "byte" } else { "bytes" };
+                write!(
+                    f,
+                    "{bytes} {unit} outside any frame skipped at byte {at:#x}"
+                )
+            }
+            Loss::BadFrame { reason } => write!(f, "Frame at byte {at:#x} dropped: {reason}"),
+            Loss::FrameGap {
+                scid,
+                vcid,
+                expected,
+                got,
+                missing,
+            } => {
+                let channel = format!("Spacecraft {scid} virtual channel {vcid}");
+                match missing {
+                    Some(n) => {
+                        let unit = if *n == 1 { "frame" } else { "frames" };
+                        write!(
+                            f,
+                            "{channel}: {n} {unit} missing before byte {at:#x} (expected frame count {expected}, got {got})"
+                        )
+                    }
+                    None => write!(
+                        f,
+                        "{channel}: frame count went back at byte {at:#x} (expected {expected}, got {got})"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// The most notices kept for one file. Past this they are only counted.
+pub const MAX_NOTICES: usize = 500;
+
+/// Notices in file order. Runs of skipped bytes arrive in pieces, one per
+/// step, and are joined here into one notice per run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Notices {
+    pub list: Vec<Notice>,
+    /// How many more there were after [`MAX_NOTICES`].
+    pub more: u64,
+}
+
+impl Notices {
+    pub fn push(&mut self, notice: Notice) {
+        if let (Some(last), Loss::Junk { bytes: add }) = (self.list.last_mut(), &notice.loss)
+            && let Loss::Junk { bytes } = &mut last.loss
+            && last.offset + *bytes == notice.offset
+        {
+            *bytes += add;
+        } else if self.list.len() < MAX_NOTICES {
+            self.list.push(notice);
+        } else {
+            self.more += 1;
+        }
+    }
+}
+
 /// The result of offering a decoder some bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
@@ -56,6 +165,9 @@ pub enum Step {
     /// `consumed` bytes of structure (a file header, a declaration) that
     /// produced no record. Drop them and call again.
     Skip { consumed: usize },
+    /// `consumed` bytes that could not be turned into records, and what
+    /// that cost. Drop them and call again.
+    Lost { consumed: usize, notice: Notice },
     /// The next entry is not complete in the bytes offered. Call again with
     /// the same bytes plus more. At end of file this means a truncated tail.
     NeedMore,
@@ -217,6 +329,16 @@ pub fn decoder_for(format: Format, config: &Config) -> Option<Box<dyn Decoder>> 
 /// the error that stopped it, if one did. For tests and small inputs; the
 /// shell streams instead.
 pub fn decode_all(decoder: &mut dyn Decoder, data: &[u8]) -> (Vec<Record>, Option<DecodeEnd>) {
+    let (records, _, end) = decode_all_noting(decoder, data);
+    (records, end)
+}
+
+/// [`decode_all`], also returning what the decoder gave up on.
+pub fn decode_all_noting(
+    decoder: &mut dyn Decoder,
+    data: &[u8],
+) -> (Vec<Record>, Notices, Option<DecodeEnd>) {
+    let mut notices = Notices::default();
     let mut records = Vec::new();
     let mut pos = 0usize;
     loop {
@@ -226,17 +348,21 @@ pub fn decode_all(decoder: &mut dyn Decoder, data: &[u8]) -> (Vec<Record>, Optio
                 pos += consumed.max(1);
             }
             Step::Skip { consumed } => pos += consumed.max(1),
+            Step::Lost { consumed, notice } => {
+                notices.push(notice);
+                pos += consumed.max(1);
+            }
             Step::NeedMore => {
                 let end = (pos < data.len()).then_some(DecodeEnd::Truncated {
                     offset: pos as u64,
                     available: data.len() - pos,
                 });
-                return (records, end);
+                return (records, notices, end);
             }
-            Step::Fatal(e) => return (records, Some(DecodeEnd::Error(e))),
+            Step::Fatal(e) => return (records, notices, Some(DecodeEnd::Error(e))),
         }
         if pos > data.len() {
-            return (records, None);
+            return (records, notices, None);
         }
     }
 }

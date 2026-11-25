@@ -15,12 +15,12 @@
 //! Lost data is handled per virtual channel: a jump in the frame count, or a
 //! first header pointer that disagrees with the packet in progress, drops
 //! that packet and restarts at the next pointer. Bytes that are not a frame
-//! are skipped up to the next marker. None of this is reported yet: `Step`
-//! has no variant for it, so loss shows up as sequence gaps.
+//! are skipped up to the next marker. Each of these is reported as a
+//! `Step::Lost`, so the cost of carrying on is on record.
 
 use std::collections::BTreeMap;
 
-use super::{DecodeError, Decoder, Record, Step};
+use super::{DecodeError, Decoder, Loss, Notice, Record, Step};
 use crate::pure::ccsds::{IDLE_APID, PRIMARY_HEADER_LEN, PrimaryHeader};
 use crate::pure::frame::{self, FrameParams, Pointer, SYNC};
 
@@ -72,6 +72,9 @@ pub struct CaduDecoder {
     channels: BTreeMap<(u16, u8), Channel>,
     good_frames: u64,
     bad_frames: u32,
+    /// True from a frame that failed to parse until the next sync marker:
+    /// the bytes passed over in between are that frame, not junk.
+    in_bad_frame: bool,
 }
 
 impl CaduDecoder {
@@ -86,6 +89,7 @@ impl CaduDecoder {
                 channels: BTreeMap::new(),
                 good_frames: 0,
                 bad_frames: 0,
+                in_bad_frame: false,
             })
     }
 
@@ -97,8 +101,18 @@ impl CaduDecoder {
         if !buf.starts_with(&SYNC) {
             // Keep the last three bytes: a marker may be split across reads.
             let consumed = find_sync(&buf[1..]).map_or(buf.len() - 3, |i| i + 1);
-            return Step::Skip { consumed };
+            if self.in_bad_frame {
+                return Step::Skip { consumed };
+            }
+            let loss = Loss::Junk {
+                bytes: consumed as u64,
+            };
+            return Step::Lost {
+                consumed,
+                notice: Notice { offset, loss },
+            };
         }
+        self.in_bad_frame = false;
         let Some(raw) = buf.get(..self.params.cadu_len) else {
             return Step::NeedMore;
         };
@@ -116,8 +130,13 @@ impl CaduDecoder {
                 }
                 // A corrupt frame or a chance marker. Step past the marker
                 // only, so a real one just behind it is not jumped over.
-                return Step::Skip {
+                self.in_bad_frame = true;
+                return Step::Lost {
                     consumed: SYNC.len(),
+                    notice: Notice {
+                        offset,
+                        loss: Loss::BadFrame { reason },
+                    },
                 };
             }
         };
@@ -126,6 +145,20 @@ impl CaduDecoder {
         let key = (frame.scid, frame.vcid);
         let channel = self.channels.entry(key).or_default();
         let contiguous = channel.next_count == Some(frame.count);
+        // The first frame seen on a channel has nothing to follow on from.
+        let gap = match channel.next_count {
+            Some(expected) if expected != frame.count => {
+                let missing = (frame.count + frame.count_modulus - expected) % frame.count_modulus;
+                Some(Loss::FrameGap {
+                    scid: frame.scid,
+                    vcid: frame.vcid,
+                    expected,
+                    got: frame.count,
+                    missing: (missing <= frame.count_modulus / 2).then_some(missing),
+                })
+            }
+            _ => None,
+        };
         channel.next_count = Some((frame.count + 1) % frame.count_modulus);
         if !contiguous {
             // Frames were lost: whatever was in progress cannot be finished.
@@ -153,7 +186,7 @@ impl CaduDecoder {
                 }
             }
         };
-        match begin {
+        let consumed = match begin {
             Some(skip) => {
                 let pos = frame.data.start + skip;
                 self.open = Some(Open {
@@ -161,11 +194,16 @@ impl CaduDecoder {
                     pos,
                     zone_end: frame.data.end,
                 });
-                Step::Skip { consumed: pos }
+                pos
             }
-            None => Step::Skip {
-                consumed: self.params.cadu_len,
+            None => self.params.cadu_len,
+        };
+        match gap {
+            Some(loss) => Step::Lost {
+                consumed,
+                notice: Notice { offset, loss },
             },
+            None => Step::Skip { consumed },
         }
     }
 
@@ -450,7 +488,7 @@ mod tests {
                     got.push(record);
                     pos += consumed;
                 }
-                Step::Skip { consumed } => pos += consumed,
+                Step::Skip { consumed } | Step::Lost { consumed, .. } => pos += consumed,
                 Step::NeedMore => end += 1,
                 Step::Fatal(e) => panic!("{e}"),
             }
@@ -527,5 +565,108 @@ mod tests {
         assert_eq!(sniff_cadu_len(&data[..2 * p.cadu_len]), None);
         assert_eq!(sniff_cadu_len(&SYNC.repeat(50)), None);
         assert_eq!(sniff_cadu_len(&[]), None);
+    }
+
+    fn losses(p: &FrameParams, data: &[u8]) -> Vec<Notice> {
+        let mut decoder = CaduDecoder::new(*p).unwrap();
+        crate::pure::decode::decode_all_noting(&mut decoder, data)
+            .1
+            .list
+    }
+
+    #[test]
+    fn what_is_given_up_is_reported() {
+        let p = params(FrameKind::Tm);
+        let cadus = pack(&p, &packets());
+        let len = p.cadu_len as u64;
+        // Frame k carries count (250 + k) mod 256, on spacecraft 0x155 channel 2.
+        let gap = |at: u64, expected: u32, got: u32, missing: Option<u32>| Notice {
+            offset: at,
+            loss: Loss::FrameGap {
+                scid: 0x155,
+                vcid: 2,
+                expected,
+                got,
+                missing,
+            },
+        };
+
+        assert_eq!(losses(&p, &cadus.concat()), []);
+
+        let mut dropped = cadus.clone();
+        dropped.drain(10..12);
+        assert_eq!(
+            losses(&p, &dropped.concat()),
+            [gap(10 * len, 4, 6, Some(2))]
+        );
+
+        // A frame that fails its CRC is one notice, not one for the frame
+        // and another for its bytes; the count then shows it missing.
+        let mut corrupt = cadus.clone();
+        corrupt[10][20] ^= 0x10;
+        let bad = Notice {
+            offset: 10 * len,
+            loss: Loss::BadFrame {
+                reason: "frame CRC mismatch",
+            },
+        };
+        assert_eq!(
+            losses(&p, &corrupt.concat()),
+            [bad, gap(11 * len, 4, 5, Some(1))]
+        );
+
+        // An old frame turning up again is a count going back, then forward.
+        let mut replay = cadus.clone();
+        replay.insert(30, cadus[5].clone());
+        assert_eq!(
+            losses(&p, &replay.concat()),
+            [gap(30 * len, 24, 255, None), gap(31 * len, 0, 24, Some(24))]
+        );
+
+        // Bytes before the first marker are normal for a capture; bytes
+        // between frames are not. Each run is one notice however it was read.
+        let mut junk = vec![0x55; 37];
+        junk.extend(cadus[..3].concat());
+        junk.extend([0x1A, 0xCF, 0xFC, 0x55, 0x1A, 0xCF]);
+        junk.extend(cadus[3..6].concat());
+        junk.extend([0xEE; 9]);
+        let got = losses(&p, &junk);
+        let run = |offset: u64, bytes: u64| Notice {
+            offset,
+            loss: Loss::Junk { bytes },
+        };
+        // The last three bytes of the file are left as a truncated tail.
+        assert_eq!(
+            got,
+            [run(0, 37), run(37 + 3 * len, 6), run(43 + 6 * len, 6)]
+        );
+        assert!(!got[0].is_problem());
+        assert!(got[1].is_problem());
+        assert_eq!(
+            got[1].to_string(),
+            format!(
+                "6 bytes outside any frame skipped at byte {:#x}",
+                37 + 3 * len
+            )
+        );
+        assert_eq!(
+            gap(0x40, 4, 6, Some(2)).to_string(),
+            "Spacecraft 341 virtual channel 2: 2 frames missing before byte 0x40 (expected frame count 4, got 6)"
+        );
+    }
+
+    #[test]
+    fn a_flood_of_losses_is_counted_not_kept() {
+        let p = params(FrameKind::Tm);
+        let cadus = pack(&p, &packets());
+        // Every other frame missing, many times over.
+        let data: Vec<u8> = (0..1500)
+            .map(|i| cadus[(i * 2) % cadus.len()].clone())
+            .collect::<Vec<_>>()
+            .concat();
+        let mut decoder = CaduDecoder::new(p).unwrap();
+        let notices = crate::pure::decode::decode_all_noting(&mut decoder, &data).1;
+        assert_eq!(notices.list.len(), crate::pure::decode::MAX_NOTICES);
+        assert_eq!(notices.list.len() as u64 + notices.more, 1499);
     }
 }

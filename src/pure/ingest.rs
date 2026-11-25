@@ -4,7 +4,7 @@ use crate::pure::ccsds::{PacketType, PrimaryHeader};
 use crate::pure::checksum::fnv1a;
 use crate::pure::config::ResolvedTime;
 use crate::pure::continuity::{Finding, FindingKind, Report, StreamKey};
-use crate::pure::decode::{DecodeEnd, Record};
+use crate::pure::decode::{DecodeEnd, Notices, Record};
 use crate::pure::format::packet_time_ns;
 
 /// What kind of thing a timeline lane holds.
@@ -175,14 +175,36 @@ pub fn non_packet_message(count: u64) -> String {
     }
 }
 
-/// The findings for one packet file: the continuity report, how the read
-/// ended, and how many logged items were not space packets.
+/// The findings for one packet file: the continuity report, what the
+/// decoder gave up on, how the read ended, and how many logged items were
+/// not space packets.
 pub fn file_findings(
     report: &Report,
+    notices: &Notices,
     end: Option<&DecodeEnd>,
     non_packets: u64,
 ) -> Vec<FindingRow> {
     let mut rows: Vec<FindingRow> = report.findings.iter().map(finding_row).collect();
+    rows.extend(notices.list.iter().map(|notice| FindingRow {
+        lane: None,
+        packet_index: None,
+        severity: if notice.is_problem() {
+            SEVERITY_PROBLEM
+        } else {
+            SEVERITY_INFO
+        },
+        kind: notice.kind(),
+        message: notice.to_string(),
+    }));
+    if notices.more > 0 {
+        rows.push(FindingRow {
+            lane: None,
+            packet_index: None,
+            severity: SEVERITY_INFO,
+            kind: "suppressed",
+            message: format!("{} more losses in this file are not listed", notices.more),
+        });
+    }
     if let Some(end) = end {
         rows.push(FindingRow {
             lane: None,
@@ -289,7 +311,7 @@ mod tests {
             offset: 99,
             reason: "test",
         });
-        let rows = file_findings(&checker.finish(), Some(&end), 3);
+        let rows = file_findings(&checker.finish(), &Notices::default(), Some(&end), 3);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].kind, "gap");
         assert_eq!(rows[0].packet_index, Some(6));
