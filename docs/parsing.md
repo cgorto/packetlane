@@ -969,9 +969,11 @@ numbers start. A target used for both commands and telemetry is declared
 twice. The file ends with an offset marker. A separate `.idx` file (it starts
 `COSIDX5_`) maps entries to byte offsets and is not needed for a forward read.
 
-These details, and the COSMOS 4 ones below, were checked against real log
-files from the COSMOS repository; `tests/real_cosmos_files.rs` repeats the
-check on any you point it at.
+The COSMOS 5 raw log layout, the `COSMOS2_` layout and the example target's
+packets described below were checked against real log files from the COSMOS
+repository; `tests/real_cosmos_files.rs` repeats the check on those files.
+The `COSMOS4_` flags byte and the `SYSTEM META` packet come from reading
+COSMOS's source only: no real file with either was to hand.
 
 What COSMOS 4's own example target puts in such logs is worth knowing, since
 definitions copied from it are common:
@@ -980,10 +982,13 @@ definitions copied from it are common:
   hold a time: seconds, then microseconds, since 1970. A 16-bit packet id
   follows. Sequence counts start at 1.
 - Every command is on one APID, told apart by a 16-bit packet id at byte 6.
-  The sequence count is always 0, and the length field holds the definition's
-  default, which need not be the packet's length. This tool does not take such
-  a command for a space packet; it is kept, under the name COSMOS logged it
-  with, as a non-packet entry.
+  The sequence count is always 0: COSMOS does not count commands. The length
+  field holds the definition's default. Where that is the packet's real
+  length, as in the 4.2.4 example definitions, the commands are space packets
+  and this tool reports every one after the first as a repeated sequence
+  count. Where it is not, as in a real command log from older definitions
+  whose default was 0, this tool does not take the commands for space packets
+  and keeps them as non-packet entries under the name COSMOS logged.
 
 In both COSMOS formats, do not assume the stored bytes are space packets: these
 systems log whatever their interfaces deliver. Check the header and report

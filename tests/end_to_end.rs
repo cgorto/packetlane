@@ -1398,7 +1398,7 @@ fn segment_order_and_packet_time_are_checked() {
 
 /// Logs shaped like the ones COSMOS 4 writes for its own example target,
 /// checked against real files from the COSMOS repository: what this tool
-/// makes of them today. Two of these are limits, written down as such.
+/// makes of them today. Three of these are limits, written down as such.
 #[test]
 fn logs_shaped_like_cosmos_4s_own() {
     use packetlane::pure::synth::{
@@ -1427,7 +1427,7 @@ name = "INST COLLECT"
 "#,
     )
     .unwrap();
-    let config = "d82d7059e8372580a928fd5c0b995685";
+    let config = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
     let t0 = 1_389_370_487_000_000_000;
 
     // Telemetry: one APID per packet, counts that start at 1, no secondary
@@ -1463,44 +1463,46 @@ name = "INST COLLECT"
         "UNKNOWN",
         &[0xAB; 10],
     ));
-    fs::write(run.join("logs/2014_01_10_16_14_47_tlm.bin"), tlm).unwrap();
+    fs::write(run.join("logs/tlm.bin"), tlm).unwrap();
 
-    // Commands: all on APID 999, every count 0, and a length field that is
-    // the definition's default, not the packet's length.
-    let mut cmd = cosmos2_header(false, config, "GSE-PC");
-    for i in 0..6i64 {
-        let t = t0 + i * 1_000_000_000;
-        cmd.extend(cosmos2_entry(
-            t,
-            "INST",
-            "ABORT",
-            &cosmos_cmd(999, 0, 2, &[]),
-        ));
-        let collect = cosmos_cmd(999, 0, 1, &[0x00, 0x07, 0x3F, 0x80, 0, 0, 0xAB, 0, 0, 0, 0]);
-        cmd.extend(cosmos2_entry(t, "INST", "COLLECT", &collect));
+    // Commands: all on APID 999 and every count 0. The length field is
+    // whatever default the definition gives it. In one file the defaults
+    // are right (12 and 1, as in COSMOS 4.2.4's example definitions); in
+    // the other they are 0, as in a real command log from older ones.
+    let collect_body = [0x00, 0x07, 0x3F, 0x80, 0, 0, 0xAB, 0, 0, 0, 0];
+    for (name, collect_len, abort_len) in [("right", 12, 1), ("wrong", 0, 0)] {
+        let mut cmd = cosmos2_header(false, config, "GSE-PC");
+        for i in 0..6i64 {
+            let t = t0 + i * 1_000_000_000;
+            let abort = cosmos_cmd(999, abort_len, 2, &[]);
+            cmd.extend(cosmos2_entry(t, "INST", "ABORT", &abort));
+            let collect = cosmos_cmd(999, collect_len, 1, &collect_body);
+            cmd.extend(cosmos2_entry(t, "INST", "COLLECT", &collect));
+        }
+        fs::write(run.join(format!("logs/{name}_cmd.bin")), cmd).unwrap();
     }
-    fs::write(run.join("logs/2014_01_10_16_14_47_cmd.bin"), cmd).unwrap();
 
     let db = scratch.0.join("store.db");
     let mut store = Store::open(&db).unwrap();
     let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let in_file = |what: &str, file: &str, and: &str| {
+        count(
+            &store,
+            &format!("SELECT COUNT(*) FROM {what} WHERE file = 'logs/{file}' {and}"),
+        )
+    };
+
     // Telemetry reads cleanly: nothing to report but the two entries that
     // are not space packets, the metadata and the unidentified one.
-    assert_eq!(summary.problems, 0);
     assert_eq!(
-        count(&store, "SELECT COUNT(*) FROM packet_view WHERE apid = 2"),
-        40
+        in_file("finding_view", "tlm.bin", "AND severity = 'problem'"),
+        0
     );
+    assert_eq!(in_file("packet_view", "tlm.bin", "AND apid = 2"), 40);
+    assert_eq!(in_file("packet_view", "tlm.bin", "AND apid IS NULL"), 2);
     assert_eq!(
         count(&store, "SELECT MIN(seq) FROM packet_view WHERE apid = 3"),
         1
-    );
-    assert_eq!(
-        count(
-            &store,
-            "SELECT COUNT(*) FROM packet_view WHERE file LIKE '%tlm.bin' AND apid IS NULL"
-        ),
-        2
     );
 
     // Limit: the time in these packets is not read. It is seconds and
@@ -1508,37 +1510,49 @@ name = "INST COLLECT"
     // read as CUC or CDS from packets that set the flag.
     assert_eq!(count(&store, "SELECT COUNT(packet_ns) FROM packets"), 0);
 
-    // Limit: no command is taken for a space packet, because its length
-    // field does not match its length. So commands get no APID lane and no
-    // sequence check (which every count being 0 would fail anyway).
+    // Limit: where the length fields are right, the commands are packets on
+    // APID 999, and every one after the first is reported as a repeated
+    // sequence count, because COSMOS never counts them.
     assert_eq!(
-        count(
-            &store,
-            "SELECT COUNT(*) FROM packet_view WHERE file LIKE '%cmd.bin'"
-        ),
+        in_file("packet_view", "right_cmd.bin", "AND apid = 999"),
         12
     );
     assert_eq!(
-        count(
-            &store,
-            "SELECT COUNT(*) FROM packet_view WHERE file LIKE '%cmd.bin' AND apid IS NOT NULL"
-        ),
+        in_file("finding_view", "right_cmd.bin", "AND kind = 'duplicate'"),
+        11
+    );
+    assert_eq!(
+        in_file("finding_view", "right_cmd.bin", "AND severity = 'problem'"),
+        11
+    );
+    assert_eq!(summary.problems, 11);
+
+    // Limit: where they are not, no command is taken for a space packet.
+    // They get no APID lane and no sequence check, and nothing is reported.
+    assert_eq!(
+        in_file("packet_view", "wrong_cmd.bin", "AND apid IS NULL"),
+        12
+    );
+    assert_eq!(
+        in_file("finding_view", "wrong_cmd.bin", "AND severity = 'problem'"),
         0
     );
-    // They are still told apart by the name COSMOS logged them under, and
-    // a definition labelled with that name decodes them.
-    let id = store
+
+    // Either way they are told apart by the name COSMOS logged them under,
+    // and a definition labelled with that name decodes them.
+    let ids = store
         .query_user(
-            "SELECT id FROM packet_view WHERE label = 'INST COLLECT' LIMIT 1",
-            1,
+            "SELECT id FROM packet_view WHERE label = 'INST COLLECT' ORDER BY file, idx",
+            20,
         )
-        .unwrap()
-        .rows[0][0]
-        .int()
         .unwrap();
+    let (right, wrong) = (ids.rows[0][0].int().unwrap(), ids.rows[6][0].int().unwrap());
     drop(store);
-    let body = serve(db, run)(&format!("/api/packet?id={id}"));
-    assert_eq!(body["name"], "INST COLLECT");
-    assert_eq!(body["fields"][0]["value"], 7);
-    assert_eq!(body["header"], serde_json::Value::Null);
+    let get = serve(db, run);
+    for (id, is_packet) in [(right, true), (wrong, false)] {
+        let body = get(&format!("/api/packet?id={id}"));
+        assert_eq!(body["name"], "INST COLLECT");
+        assert_eq!(body["fields"][0]["value"], 7);
+        assert_eq!(body["header"].is_object(), is_packet);
+    }
 }
