@@ -5,7 +5,8 @@
 //! - Repeated entries, each a 4-byte length (counting what follows it), a
 //!   2-byte flags field, and a body determined by `flags & 0xF000`:
 //!   - `0x1000` target declaration: target name; optional trailing 32-byte id if `0x0200`
-//!   - `0x2000` packet declaration: 2-byte target index, packet name; optional trailing 32-byte id if `0x0200`
+//!   - `0x2000` packet declaration: 2-byte target index, packet name; optional trailing 32-byte id if `0x0200`.
+//!     Target indexes do not start at 0 in every file: see the comment where they are read.
 //!   - `0x3000` raw packet: 2-byte packet index, 8-byte time in ns since Unix epoch, payload bytes
 //!   - `0x4000` JSON packet: 2-byte packet index, 8-byte time, JSON text (skipped)
 //!   - `0x5000` offset marker: string (skipped)
@@ -27,6 +28,9 @@ const RAW_PACKET_HEADER_LEN: u64 = 4 + 2 + 2 + 8;
 pub struct Cosmos5Decoder {
     magic_seen: bool,
     targets: Vec<String>,
+    /// The number the writer gave the first target declared in this file.
+    /// Known once a packet declaration refers to it.
+    target_base: Option<u16>,
     packets: Vec<String>,
 }
 
@@ -153,7 +157,19 @@ impl Decoder for Cosmos5Decoder {
                         reason: "COSMOS 5 packet declaration too short",
                     });
                 };
-                let Some(target_name) = self.targets.get(usize::from(target_idx)) else {
+                // The COSMOS 5 writer numbers packets from 0 in each file but
+                // targets across every file it has written, so the first
+                // target declared here may have any number. A target is
+                // declared just before the first packet that refers to it,
+                // which fixes what the numbers in this file start from.
+                let declared = u16::try_from(self.targets.len()).unwrap_or(u16::MAX);
+                let base = *self
+                    .target_base
+                    .get_or_insert(target_idx.saturating_sub(declared.saturating_sub(1)));
+                let known = target_idx
+                    .checked_sub(base)
+                    .and_then(|i| self.targets.get(usize::from(i)));
+                let Some(target_name) = known else {
                     return Step::Fatal(DecodeError::Implausible {
                         offset,
                         reason: "COSMOS 5 packet declaration names unknown target",
@@ -452,6 +468,25 @@ mod tests {
             end,
             Some(DecodeEnd::Error(DecodeError::Implausible { offset: 8, .. }))
         ));
+
+        // 2b. A target numbered from 15, as in a file that is not the
+        // writer's first, and then a packet declaration outside what
+        // has been declared.
+        let mut later = Cosmos5Writer::magic();
+        later.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x10, 0x00, b'I', b'N', b'S', b'T']);
+        later.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x20, 0x00, 0x00, 0x0F, b'H', b'K']);
+        let ok_len = later.len() as u64;
+        later.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x20, 0x00, 0x00, 0x11, b'X', b'Y']);
+        let (_, end) = decode_all(&mut Cosmos5Decoder::new(), &later);
+        assert!(matches!(
+            end,
+            Some(DecodeEnd::Error(DecodeError::Implausible { offset, .. })) if offset == ok_len
+        ));
+        // Nor one below where the file's numbers start.
+        let mut below = later[..ok_len as usize].to_vec();
+        below.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x20, 0x00, 0x00, 0x0E, b'X', b'Y']);
+        let (_, end) = decode_all(&mut Cosmos5Decoder::new(), &below);
+        assert!(matches!(end, Some(DecodeEnd::Error(_))));
 
         // 3. Raw packet referencing undeclared packet index.
         let mut bad_packet = Cosmos5Writer::magic();
