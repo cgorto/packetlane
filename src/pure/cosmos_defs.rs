@@ -419,6 +419,7 @@ impl Importer<'_> {
             count,
             poly: Vec::new(),
             limits: None,
+            keep: false,
         };
         field.validate()?;
         if id && kind == FieldKind::Uint && offset == 5 && size == 11 {

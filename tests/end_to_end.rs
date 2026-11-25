@@ -1191,3 +1191,144 @@ name = "Same APID, another layout"
     assert_eq!(field["limit"], "red high");
     assert_eq!(field["unit"], "C");
 }
+
+/// Fields marked `keep` have their value stored for every packet, where
+/// SQL can find it, and the rows follow the file when it is read again.
+#[test]
+fn kept_field_values_can_be_searched() {
+    use packetlane::pure::synth::{cosmos2_entry, cosmos2_header, packet};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("gse")).unwrap();
+    let config = |keep_mode: bool| {
+        format!(
+            r#"
+[[packet]]
+apid = 100
+label = "SIM HK"
+name = "Housekeeping"
+  [[packet.field]]
+  name = "MODE"
+  bit_offset = 48
+  bit_length = 8
+  labels = {{ "0" = "IDLE", "2" = "SAFE" }}
+  keep = {keep_mode}
+  [[packet.field]]
+  name = "TEMP"
+  bit_offset = 56
+  bit_length = 16
+  poly = [-100.0, 0.5]
+  keep = true
+  [[packet.field]]
+  name = "TAG"
+  bit_offset = 72
+  bit_length = 16
+  kind = "ascii"
+  keep = true
+  [[packet.field]]
+  name = "PAIR"
+  bit_offset = 88
+  bit_length = 8
+  count = 2
+  keep = true
+  [[packet.field]]
+  name = "NOT_KEPT"
+  bit_offset = 48
+  bit_length = 8
+"#
+        )
+    };
+    fs::write(run.join("packetlane.toml"), config(true)).unwrap();
+    let mut data = cosmos2_header(true, "CFG", "gse");
+    for i in 0..6u16 {
+        let mode = if i == 3 { 2 } else { 0 };
+        let raw = 240 + i * 2; // 20, 21, 22 ... degrees
+        let mut body = vec![mode];
+        body.extend(raw.to_be_bytes());
+        body.extend(*b"ok");
+        body.extend([i as u8, 9]);
+        let t = 1_700_000_000_000_000_000 + i64::from(i) * 1_000_000_000;
+        data.extend(cosmos2_entry(t, "SIM", "HK", &packet(100, i, &body)));
+    }
+    // The last packet is too short to hold anything past MODE.
+    data.extend(cosmos2_entry(
+        1_700_000_009_000_000_000,
+        "SIM",
+        "HK",
+        &packet(100, 6, &[0]),
+    ));
+    fs::write(run.join("gse/tlm.bin"), &data).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let targets = std::slice::from_ref(&run);
+    ingest_targets(&mut store, targets, None, None, None).unwrap();
+
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM value_view WHERE field = 'NOT_KEPT'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM value_view WHERE field = 'MODE'"
+        ),
+        7
+    );
+    // Six whole packets and one that only reaches MODE.
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM value_view"), 7 + 3 * 6);
+    // The question the feature is for: where was MODE SAFE?
+    assert_eq!(
+        count(
+            &store,
+            "SELECT idx FROM value_view WHERE field = 'MODE' AND text = 'SAFE'"
+        ),
+        3
+    );
+    // Numbers are the engineering value, so they compare as such.
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM value_view WHERE field = 'TEMP' AND value >= 23"
+        ),
+        3
+    );
+    let row = store
+        .query_user(
+            "SELECT packet, text, value, apid, file FROM value_view
+             WHERE field IN ('TAG', 'PAIR') AND idx = 4 ORDER BY field",
+            5,
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][1].text(), Some("4, 9"));
+    assert_eq!(row.rows[1][0].text(), Some("Housekeeping"));
+    assert_eq!(row.rows[1][1].text(), Some("ok"));
+    assert_eq!(row.rows[1][3].int(), Some(100));
+    assert_eq!(row.rows[1][4].text(), Some("gse/tlm.bin"));
+
+    // A changed configuration reads the run again: no rows are left behind.
+    fs::write(run.join("packetlane.toml"), config(false)).unwrap();
+    ingest_targets(&mut store, targets, None, None, None).unwrap();
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM field_values WHERE field = 'MODE'"
+        ),
+        0
+    );
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM field_values"), 3 * 6);
+    // So does a file that has changed.
+    fs::write(run.join("gse/tlm.bin"), &data[..data.len() - 20]).unwrap();
+    ingest_targets(&mut store, targets, None, None, None).unwrap();
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM field_values"), 3 * 6);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM field_values WHERE packet_id NOT IN (SELECT id FROM packets)"
+        ),
+        0
+    );
+}

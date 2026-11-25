@@ -195,6 +195,41 @@ fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String
     }
 }
 
+/// The values of a packet's fields that are marked `keep`, as (field name,
+/// number, text). The number is the engineering value; the text is the
+/// value's label, a text field's content, or an array's elements. A field
+/// that cannot be read from this packet is left out.
+pub fn kept_values<'a>(
+    def: &'a PacketDef,
+    packet: &[u8],
+) -> Vec<(&'a str, Option<f64>, Option<String>)> {
+    def.fields
+        .iter()
+        .filter(|field| field.keep)
+        .filter_map(|field| {
+            let (value, label) = decode_field(field, packet).ok()?;
+            let text = match value {
+                Value::Text(text) => Some(text),
+                Value::List(items) => Some(
+                    items
+                        .iter()
+                        .map(|v| match v {
+                            Value::UInt(n) => n.to_string(),
+                            Value::Int(n) => n.to_string(),
+                            Value::Float(n) => n.to_string(),
+                            Value::Text(t) => t.clone(),
+                            Value::List(_) => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                _ => label,
+            };
+            Some((field.name.as_str(), engineering(field, packet), text))
+        })
+        .collect()
+}
+
 /// Decodes every field of a definition against one packet. A field that
 /// cannot be read is reported in place; the others are still decoded.
 pub fn decode_fields(def: &PacketDef, packet: &[u8]) -> Vec<Decoded> {

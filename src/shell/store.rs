@@ -17,6 +17,7 @@ use crate::pure::config::{Config, ResolvedTime, SourceInfo};
 use crate::pure::continuity::Checker;
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
+use crate::pure::format::kept_values;
 use crate::pure::ingest::{
     FindingRow, LaneKey, SEVERITY_INFO, SEVERITY_PROBLEM, file_findings, packet_row, ptype_code,
 };
@@ -477,6 +478,7 @@ fn ingest_packets(
 ) -> Result<(u64, String)> {
     let base_id: i64 = conn.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
+    let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut checker = Checker::new();
     let mut limits = LimitChecker::default();
     let mut count = 0u64;
@@ -494,9 +496,9 @@ fn ingest_packets(
             }
         };
         let row = packet_row(count, &record, time_rule, source.clock_offset_ns);
-        if let Some(def) = config.packet_for(record.label.as_deref(), row.header.as_ref())
-            && def.fields.iter().any(|f| f.limits.is_some())
-        {
+        let packet_id = base_id + row.idx;
+        let def = config.packet_for(record.label.as_deref(), row.header.as_ref());
+        if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.limits.is_some())) {
             // The definition's address tells it apart from the others.
             let id = std::ptr::from_ref(def) as usize;
             limits.observe(count, id, def, &record.payload, &row.lane());
@@ -521,6 +523,12 @@ fn ingest_packets(
             row.sum,
             row.label,
         ])?;
+        // After the packet's own row, which these rows point at.
+        if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.keep)) {
+            for (field, num, text) in kept_values(def, &record.payload) {
+                insert_value.execute(params![packet_id, file_id, def.name, field, num, text])?;
+            }
+        }
         count += 1;
     }
 

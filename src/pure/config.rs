@@ -54,6 +54,7 @@
 //!   poly = [-100.0, 0.00305] # engineering value = c0 + c1 x + c2 x^2 ...; unit applies to it
 //!   limits = { red_low = -80, yellow_low = -70, yellow_high = 60, red_high = 80, persistence = 1 }
 //!                            # leaving the yellow or red range is a finding
+//!   keep = false             # true: store the value of every packet, for searching
 //!   unit = ""
 //!   labels = { "0" = "IDLE", "1" = "OBSERVE" }
 //! ```
@@ -240,6 +241,10 @@ pub struct FieldDef {
     /// The range the engineering value should stay in.
     #[serde(default)]
     pub limits: Option<Limits>,
+    /// Store this field's value for every packet, so that it can be
+    /// searched and sorted. Off by default: it is a row per packet.
+    #[serde(default)]
+    pub keep: bool,
 }
 
 /// Limits on a field's value, in the sense COSMOS gives them: outside the

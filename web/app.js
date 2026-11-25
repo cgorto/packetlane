@@ -859,6 +859,7 @@ async function runSql() {
 
 const TABLES = {
   Packets: { view: "packet_view", cols: ["source", "file", "apid", "type", "seq", "length", "receive_time", "packet_time", "label", "idx", "offset"] },
+  Values: { view: "value_view", cols: ["source", "file", "apid", "packet", "field", "value", "text", "receive_time", "packet_time", "idx"] },
   Logs: { view: "log_view", cols: ["source", "file", "log_time", "text"] },
   Problems: { view: "finding_view", cols: ["severity", "kind", "source", "apid", "file", "message"] },
   Files: { view: "file_view", cols: ["source", "file", "format", "size", "packets", "entries", "note"] },
