@@ -487,6 +487,13 @@ fn ingest_packets(
     let mut non_packets = 0u64;
     let mut end = None;
 
+    // Most runs have no definition with limits or kept fields; then there
+    // is no need to look one up for every packet.
+    let watched = config
+        .packets
+        .iter()
+        .any(|d| d.fields.iter().any(|f| f.limits.is_some() || f.keep));
+
     let mut records = Records::new(BufReader::new(file), decoder);
     for item in &mut records {
         let record = match item {
@@ -499,7 +506,10 @@ fn ingest_packets(
         };
         let row = packet_row(count, &record, time_rule, source.clock_offset_ns);
         let packet_id = base_id + row.idx;
-        let def = config.packet_for(record.label.as_deref(), row.header.as_ref());
+        let def = match watched {
+            true => config.packet_for(record.label.as_deref(), row.header.as_ref()),
+            false => None,
+        };
         if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.limits.is_some())) {
             // The definition's address tells it apart from the others.
             let id = std::ptr::from_ref(def) as usize;

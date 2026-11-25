@@ -33,7 +33,7 @@ const NO_START: u16 = 0x7FF;
 /// Pointer value: the data zone holds only fill.
 const IDLE_ONLY: u16 = 0x7FE;
 /// AOS virtual channel reserved for fill frames.
-const AOS_IDLE_VCID: u8 = 63;
+pub const AOS_IDLE_VCID: u8 = 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]

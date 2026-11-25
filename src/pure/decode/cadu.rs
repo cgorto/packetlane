@@ -141,6 +141,13 @@ impl CaduDecoder {
             }
         };
         self.good_frames += 1;
+        if self.params.kind == FrameKind::Aos && frame.vcid == frame::AOS_IDLE_VCID {
+            // Fill frames carry no packets, and whether their count runs
+            // on is not something to hold a link to.
+            return Step::Skip {
+                consumed: self.params.cadu_len,
+            };
+        }
 
         let key = (frame.scid, frame.vcid);
         let channel = self.channels.entry(key).or_default();
@@ -744,5 +751,25 @@ mod tests {
             sniff_layout(&cadus.concat()),
             Some(Layout::of_len(p.cadu_len))
         );
+    }
+
+    /// AOS fill frames on channel 63 are passed over whatever their count
+    /// does; they are not reported as frames missing.
+    #[test]
+    fn aos_fill_frames_are_not_held_to_a_count() {
+        let p = params(FrameKind::Aos);
+        let packets = packets();
+        let real = pack(&p, &packets);
+        let fill = cadus(&p, 63, &vec![(0x7FE, vec![0xFF; ZONE]); 3]);
+        // The same fill frame, count and all, between every pair of frames.
+        let data: Vec<u8> = real
+            .iter()
+            .flat_map(|c| [c.clone(), fill[1].clone()].concat())
+            .collect();
+        let mut decoder = CaduDecoder::new(p).unwrap();
+        let (records, notices, end) = crate::pure::decode::decode_all_noting(&mut decoder, &data);
+        assert_eq!(end, None);
+        assert_eq!(notices.list, []);
+        assert_eq!(payloads(&records), packets);
     }
 }

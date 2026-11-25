@@ -217,7 +217,10 @@ impl Importer<'_> {
             }
             "POLY_READ_CONVERSION" => {
                 let poly: Option<Vec<f64>> = params.iter().map(|p| p.parse().ok()).collect();
-                self.change_field(number, |field| field.poly = poly.unwrap_or_default());
+                match poly {
+                    Some(poly) => self.change_field(number, |field| field.poly = poly),
+                    None => self.warn(number, "conversion skipped, a coefficient is not a number"),
+                }
             }
             "LIMITS" => {
                 let numbers: Vec<f64> = params
@@ -722,6 +725,34 @@ COMMAND INST COLLECT BIG_ENDIAN "Start a collect"
         );
         let config = Config::parse(&to_toml(&got.packets)).unwrap();
         assert_eq!(config.packets, got.packets);
+    }
+
+    #[test]
+    fn a_conversion_or_limit_it_cannot_use_is_reported() {
+        let got = run("TELEMETRY T P BIG_ENDIAN
+ ITEM A 0 16 UINT
+  POLY_READ_CONVERSION 1.0 two
+ ITEM B 16 16 UINT
+  LIMITS DEFAULT 1 ENABLED 5 4 3 2
+ ITEM C 32 16 UINT
+  LIMITS DEFAULT 3 DISABLED 1 2 3 4
+  LIMITS TVAC 1 ENABLED 1 2 3 4
+ ITEM D 48 16 UINT
+  LIMITS DEFAULT 3 ENABLED 1 2 3 4 2.2 2.8
+");
+        let fields = &got.packets[0].fields;
+        assert!(fields[0].poly.is_empty());
+        assert!(fields[1].limits.is_none());
+        // Switched off, or not the default set: left out without comment.
+        assert!(fields[2].limits.is_none());
+        assert_eq!(fields[3].limits.unwrap().persistence, 3);
+        assert_eq!(
+            got.warnings,
+            [
+                "t.txt:3: conversion skipped, a coefficient is not a number",
+                "t.txt:5: T P B: conversion or limits skipped, limits must run red_low <= yellow_low < yellow_high <= red_high, persistence at least 1",
+            ]
+        );
     }
 
     #[test]
