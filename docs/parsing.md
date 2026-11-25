@@ -877,7 +877,10 @@ same across missions.
 - Telemetry and commands with the same APID number are separate streams with
   separate sequence counters.
 - Commands may carry a name-based or always-zero count instead of a running
-  counter. Check before reporting command gaps.
+  counter. Check before reporting command gaps. `continuity` does: a stream
+  of three or more packets that all carry one count gets a single note
+  (`constant_count`) and no repeat findings. One packet with a different
+  count anywhere and the stream is treated as counting.
 - The **secondary header is mission defined**. It usually starts with a
   timestamp, but its width, **epoch** (the zero point a clock counts from), and
   encoding come from the mission's interface documents. Two common encodings
@@ -983,16 +986,22 @@ definitions copied from it are common:
   follows. Sequence counts start at 1.
 - Every command is on one APID, told apart by a 16-bit packet id at byte 6.
   The sequence count is always 0: COSMOS does not count commands. The length
-  field holds the definition's default. Where that is the packet's real
-  length, as in the 4.2.4 example definitions, the commands are space packets
-  and this tool reports every one after the first as a repeated sequence
-  count. Where it is not, as in a real command log from older definitions
-  whose default was 0, this tool does not take the commands for space packets
-  and keeps them as non-packet entries under the name COSMOS logged.
+  field holds the definition's default. That is the packet's real length in
+  the 4.2.4 example definitions, and 0 in a real command log from older ones.
 
 In both COSMOS formats, do not assume the stored bytes are space packets: these
 systems log whatever their interfaces deliver. Check the header and report
 anything that is not.
+
+The one exception made is for those commands (`logged_header` in
+`src/pure/ingest.rs`). The log records each item's size, so the length field
+is not needed to find the end. An item is taken as a packet despite its
+length field only if all of these hold: the log gives it a name, the header
+is version 0, the type is command, the sequence flags say unsegmented, and
+the length field claims fewer bytes than are there. The file gets one
+`length_field` note per stream. Keep the test that narrow: one arbitrary
+item in eight starts with three zero bits, and COSMOS's `SYSTEM META` and
+`UNKNOWN UNKNOWN` entries must stay out of the packet lanes.
 
 ### Text logs
 

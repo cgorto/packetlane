@@ -2,7 +2,7 @@
 //! what the statements are, and what their results mean, is decided in
 //! `pure::sql`, `pure::ingest` and `pure::cross`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -14,7 +14,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::Serialize;
 
 use crate::pure::config::{Config, ResolvedTime, SourceInfo};
-use crate::pure::continuity::Checker;
+use crate::pure::continuity::{Checker, StreamKey};
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
 use crate::pure::format::kept_values;
@@ -485,6 +485,7 @@ fn ingest_packets(
     let mut order = OrderChecker::new();
     let mut count = 0u64;
     let mut non_packets = 0u64;
+    let mut wrong_length: BTreeMap<StreamKey, u64> = BTreeMap::new();
     let mut end = None;
 
     // Most runs have no definition with limits or kept fields; then there
@@ -520,6 +521,13 @@ fn ingest_packets(
             Some(header) => {
                 checker.observe_at(count, header, record.offset);
                 order.observe(count, header, row.packet_ns);
+                if !row.length_ok {
+                    let key = StreamKey {
+                        apid: header.apid,
+                        packet_type: header.packet_type,
+                    };
+                    *wrong_length.entry(key).or_default() += 1;
+                }
             }
             None => non_packets += 1,
         }
@@ -551,6 +559,7 @@ fn ingest_packets(
         &checker.finish(),
         records.notices(),
         end.as_ref(),
+        &wrong_length.into_iter().collect::<Vec<_>>(),
         non_packets,
     );
     findings.extend(order.finish().into_iter().map(|f| FindingRow {

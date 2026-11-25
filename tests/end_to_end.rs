@@ -1510,33 +1510,25 @@ name = "INST COLLECT"
     // read as CUC or CDS from packets that set the flag.
     assert_eq!(count(&store, "SELECT COUNT(packet_ns) FROM packets"), 0);
 
-    // Limit: where the length fields are right, the commands are packets on
-    // APID 999, and every one after the first is reported as a repeated
-    // sequence count, because COSMOS never counts them.
-    assert_eq!(
-        in_file("packet_view", "right_cmd.bin", "AND apid = 999"),
-        12
-    );
-    assert_eq!(
-        in_file("finding_view", "right_cmd.bin", "AND kind = 'duplicate'"),
-        11
-    );
-    assert_eq!(
-        in_file("finding_view", "right_cmd.bin", "AND severity = 'problem'"),
-        11
-    );
-    assert_eq!(summary.problems, 11);
-
-    // Limit: where they are not, no command is taken for a space packet.
-    // They get no APID lane and no sequence check, and nothing is reported.
-    assert_eq!(
-        in_file("packet_view", "wrong_cmd.bin", "AND apid IS NULL"),
-        12
-    );
-    assert_eq!(
-        in_file("finding_view", "wrong_cmd.bin", "AND severity = 'problem'"),
-        0
-    );
+    // Commands are packets on APID 999 in both files. COSMOS never counts
+    // them, so the one count on all of them is noted once and is not a
+    // problem. Where the length fields are wrong that is noted too, and the
+    // size the log recorded is used.
+    for (file, wrong) in [("right_cmd.bin", 0), ("wrong_cmd.bin", 1)] {
+        assert_eq!(in_file("packet_view", file, "AND apid = 999"), 12, "{file}");
+        assert_eq!(in_file("packet_view", file, "AND apid IS NULL"), 0);
+        assert_eq!(in_file("finding_view", file, "AND severity = 'problem'"), 0);
+        assert_eq!(
+            in_file("finding_view", file, "AND kind = 'constant_count'"),
+            1
+        );
+        assert_eq!(
+            in_file("finding_view", file, "AND kind = 'length_field'"),
+            wrong
+        );
+        assert_eq!(in_file("finding_view", file, ""), 1 + wrong, "{file}");
+    }
+    assert_eq!(summary.problems, 0);
 
     // Either way they are told apart by the name COSMOS logged them under,
     // and a definition labelled with that name decodes them.
@@ -1549,10 +1541,12 @@ name = "INST COLLECT"
     let (right, wrong) = (ids.rows[0][0].int().unwrap(), ids.rows[6][0].int().unwrap());
     drop(store);
     let get = serve(db, run);
-    for (id, is_packet) in [(right, true), (wrong, false)] {
+    for (id, length_ok) in [(right, true), (wrong, false)] {
         let body = get(&format!("/api/packet?id={id}"));
         assert_eq!(body["name"], "INST COLLECT");
         assert_eq!(body["fields"][0]["value"], 7);
-        assert_eq!(body["header"].is_object(), is_packet);
+        assert_eq!(body["header"]["apid"], 999);
+        assert_eq!(body["length"], 19);
+        assert_eq!(body["length_field_ok"], length_ok);
     }
 }

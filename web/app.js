@@ -570,7 +570,9 @@ async function select(item, keepTab) {
       pane.append(kv([
         ["Receive", short(p.receive)], ["Packet", short(p.packet)],
         ["APID", p.apid !== null ? apidText(p.apid) + (p.command ? " TC" : "") : ""],
-        ["Sequence count", p.count], ["Length", p.length], ["Label", p.label],
+        ["Sequence count", p.count],
+        ["Length", p.length_field_ok === false ? p.length + " (length field says " + (p.header.length + 7) + ")" : p.length],
+        ["Label", p.label],
         ["Source", p.source], ["File", p.file], ["Offset", "0x" + p.offset.toString(16)], ["Index", p.index],
       ]));
       if (p.error) { const e = document.createElement("div"); e.className = "error"; e.textContent = p.error; pane.append(e); }

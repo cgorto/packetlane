@@ -11,7 +11,7 @@ use crate::pure::ccsds::PrimaryHeader;
 use crate::pure::config::Config;
 use crate::pure::format::{decode_fields, hex};
 use crate::pure::http::{Method, Request, Response};
-use crate::pure::ingest::{LANE_LOG, ptype_from_code, whole_packet_header};
+use crate::pure::ingest::{LANE_LOG, logged_header, ptype_from_code};
 use crate::pure::sql::{Cell, Clock, Table};
 use crate::pure::time::format_iso;
 
@@ -478,8 +478,10 @@ pub fn render_packet(detail: &Table, bytes: Result<&[u8], &str>, config_text: &s
         return Response::error(404, "Packet not found");
     };
     let config = Config::parse(config_text).unwrap_or_default();
-    let header = bytes.ok().and_then(whole_packet_header);
-    let def = config.packet_for(cell(r, 9).text(), header.as_ref());
+    let label = cell(r, 9).text();
+    let found = bytes.ok().and_then(|b| logged_header(b, label.is_some()));
+    let header = found.map(|(h, _)| h);
+    let def = config.packet_for(label, header.as_ref());
     let fields = match (def, bytes) {
         (Some(def), Ok(b)) => json!(decode_fields(def, b)),
         _ => json!([]),
@@ -496,6 +498,7 @@ pub fn render_packet(detail: &Table, bytes: Result<&[u8], &str>, config_text: &s
             "name": def.map(|d| d.name.as_str()),
             "description": def.map(|d| d.description.as_str()).filter(|d| !d.is_empty()),
             "header": header.as_ref().map(header_json),
+            "length_field_ok": found.map(|(_, ok)| ok),
             "hex": bytes.ok().map(|b| hex(&b[..b.len().min(MAX_HEX_BYTES)])),
             "fields": fields,
             "error": bytes.err(),

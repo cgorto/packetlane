@@ -77,12 +77,18 @@ when they could not run, so they can gate a script.
 - Truncated files are read as far as they go, then reported, not rejected.
 - Logged items that are not space packets are kept and shown in their own
   lane.
+- A command in a log that names its items (the COSMOS formats) is taken as a
+  packet even when its length field claims fewer bytes than the log recorded,
+  and the file gets a note saying so. COSMOS fills that field from the
+  command's definition, and the definition can be wrong.
 
 ### Checks
 
 Per file, for every APID and packet type:
 
 - lost packets, repeated packets, counter restarts, packets out of order;
+- a stream whose sequence count is the same on every packet (three or more)
+  is noted as not counting, and is not reported as repeats;
 - **two emitters sharing one APID** (interleaved sequence counters);
 - segmented packets whose segments do not come as first, continuation, last;
 - packet time stepping backwards (a note, since replayed data does this);

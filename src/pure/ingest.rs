@@ -1,6 +1,6 @@
 //! Turning decoded records and check results into rows for the store.
 
-use crate::pure::ccsds::{PacketType, PrimaryHeader};
+use crate::pure::ccsds::{PacketType, PrimaryHeader, SeqFlags};
 use crate::pure::checksum::fnv1a;
 use crate::pure::config::ResolvedTime;
 use crate::pure::continuity::{Finding, FindingKind, Report, StreamKey};
@@ -79,8 +79,11 @@ pub struct PacketRow {
     pub length: i64,
     pub receive_ns: Option<i64>,
     pub packet_ns: Option<i64>,
-    /// The parsed header, if the logged item is one whole space packet.
+    /// The parsed header, if the logged item is one space packet.
     pub header: Option<PrimaryHeader>,
+    /// False for a command taken as a packet although its length field
+    /// does not give its size: see [`logged_header`].
+    pub length_ok: bool,
     pub sum: i64,
     pub label: Option<String>,
 }
@@ -103,6 +106,43 @@ pub fn whole_packet_header(payload: &[u8]) -> Option<PrimaryHeader> {
     PrimaryHeader::parse(payload).filter(|h| h.version == 0 && h.total_len() == payload.len())
 }
 
+/// The header of an item a log keeps under a name, and whether the header's
+/// length field gives the item's size.
+///
+/// Such a log records each item's size itself, so the packet's own length
+/// field is not needed to find where it ends, and ground systems send
+/// commands whose length field is wrong: COSMOS writes whatever default the
+/// command's definition gives it, which has been 0. So a command is still
+/// taken as a packet when its length field claims fewer bytes than are
+/// there. That is all that is let through: telemetry, a segmented packet,
+/// a field that claims too much, or an item with no name must match exactly,
+/// since one logged item in eight starts with the three zero bits of a
+/// version 0 header by chance.
+pub fn logged_header(payload: &[u8], named: bool) -> Option<(PrimaryHeader, bool)> {
+    let h = PrimaryHeader::parse(payload).filter(|h| h.version == 0)?;
+    if h.total_len() == payload.len() {
+        return Some((h, true));
+    }
+    let loose = named
+        && h.packet_type == PacketType::Command
+        && h.seq_flags == SeqFlags::Unsegmented
+        && h.total_len() < payload.len();
+    loose.then_some((h, false))
+}
+
+/// Message for commands taken as packets despite their length field.
+pub fn wrong_length_message(count: u64) -> String {
+    let (commands, have, their) = if count == 1 {
+        ("command", "has", "its")
+    } else {
+        ("commands", "have", "their")
+    };
+    format!(
+        "{count} {commands} {have} a length field that does not match {their} size; \
+         the size the log recorded is used"
+    )
+}
+
 /// Builds the row for one record. `clock_offset_ns` is the correction for
 /// the logging host's clock and applies to the receive time only.
 pub fn packet_row(
@@ -111,7 +151,8 @@ pub fn packet_row(
     time: Option<&ResolvedTime>,
     clock_offset_ns: i64,
 ) -> PacketRow {
-    let header = whole_packet_header(&record.payload);
+    let found = logged_header(&record.payload, record.label.is_some());
+    let header = found.map(|(h, _)| h);
     let packet_ns = match (&header, time) {
         (Some(h), Some(rule)) if h.has_secondary_header => packet_time_ns(rule, &record.payload),
         _ => None,
@@ -125,6 +166,7 @@ pub fn packet_row(
             .and_then(|t| t.checked_add(clock_offset_ns)),
         packet_ns,
         header,
+        length_ok: found.is_none_or(|(_, ok)| ok),
         // Stored as the same 64 bits, reinterpreted as signed.
         sum: fnv1a(&record.payload) as i64,
         label: record.label.clone(),
@@ -150,6 +192,7 @@ fn kind_name(kind: &FindingKind) -> &'static str {
         FindingKind::Interleaved { .. } => "interleaved",
         FindingKind::Stray { .. } => "stray",
         FindingKind::Suppressed { .. } => "suppressed",
+        FindingKind::Constant { .. } => "constant_count",
     }
 }
 
@@ -157,9 +200,10 @@ fn finding_row(finding: &Finding) -> FindingRow {
     FindingRow {
         lane: Some(LaneKey::stream(finding.key)),
         packet_index: Some(finding.packet_index),
-        severity: match finding.kind {
-            FindingKind::Suppressed { .. } => SEVERITY_INFO,
-            _ => SEVERITY_PROBLEM,
+        severity: if finding.is_problem() {
+            SEVERITY_PROBLEM
+        } else {
+            SEVERITY_INFO
         },
         kind: kind_name(&finding.kind),
         message: finding.summary(),
@@ -176,12 +220,13 @@ pub fn non_packet_message(count: u64) -> String {
 }
 
 /// The findings for one packet file: the continuity report, what the
-/// decoder gave up on, how the read ended, and how many logged items were
-/// not space packets.
+/// decoder gave up on, how the read ended, how many commands per stream had
+/// a wrong length field, and how many logged items were not space packets.
 pub fn file_findings(
     report: &Report,
     notices: &Notices,
     end: Option<&DecodeEnd>,
+    wrong_length: &[(StreamKey, u64)],
     non_packets: u64,
 ) -> Vec<FindingRow> {
     let mut rows: Vec<FindingRow> = report.findings.iter().map(finding_row).collect();
@@ -217,6 +262,13 @@ pub fn file_findings(
             message: end.to_string(),
         });
     }
+    rows.extend(wrong_length.iter().map(|&(key, count)| FindingRow {
+        lane: Some(LaneKey::stream(key)),
+        packet_index: None,
+        severity: SEVERITY_INFO,
+        kind: "length_field",
+        message: wrong_length_message(count),
+    }));
     if non_packets > 0 {
         rows.push(FindingRow {
             lane: Some(LaneKey::other()),
@@ -281,6 +333,54 @@ mod tests {
     }
 
     #[test]
+    fn a_named_command_may_have_a_short_length_field() {
+        use crate::pure::synth::cosmos_cmd;
+        // As a real COSMOS command log has them: length field 0.
+        let command = cosmos_cmd(999, 0, 1, &[0, 7, 0x3F, 0x80, 0, 0, 0xAB, 0, 0, 0, 0]);
+        let row = packet_row(0, &record(command.clone()), None, 0);
+        assert_eq!(row.header.unwrap().apid, 999);
+        assert!(!row.length_ok);
+        assert_eq!(row.lane().ptype, 1);
+        assert_eq!(row.length, 19);
+
+        let not_packets = [
+            // The same bytes from a log that does not name its items.
+            (command.clone(), false),
+            // Telemetry.
+            (
+                command
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| if i == 0 { b & !0x10 } else { b })
+                    .collect(),
+                true,
+            ),
+            // A length field that claims more than is there.
+            (cosmos_cmd(999, 40, 1, &[0; 11]), true),
+            // Not unsegmented.
+            (
+                command
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &b)| if i == 2 { b & 0x3F } else { b })
+                    .collect(),
+                true,
+            ),
+            // What COSMOS logs when it cannot identify a packet, and the
+            // start of its metadata packet.
+            (vec![0; 10], true),
+            (vec![1, b'0', b'a', b'1', b'b', b'2', b'c', b'3'], true),
+            (vec![0x10, 0x01, 0xC0], true),
+        ];
+        for (payload, named) in not_packets {
+            assert!(logged_header(&payload, named).is_none(), "{payload:02x?}");
+        }
+        // A right length field is right whoever logged it.
+        let exact = cosmos_cmd(999, 12, 1, &[0; 11]);
+        assert_eq!(logged_header(&exact, false).map(|(_, ok)| ok), Some(true));
+    }
+
+    #[test]
     fn packet_time_needs_a_rule_and_a_secondary_header() {
         let rule = Config::parse("[packet_time]\ncode = \"cuc\"\nepoch = \"1970-01-01T00:00:00Z\"")
             .unwrap()
@@ -311,8 +411,27 @@ mod tests {
             offset: 99,
             reason: "test",
         });
-        let rows = file_findings(&checker.finish(), &Notices::default(), Some(&end), 3);
-        assert_eq!(rows.len(), 3);
+        let key = StreamKey {
+            apid: 999,
+            packet_type: PacketType::Command,
+        };
+        let rows = file_findings(
+            &checker.finish(),
+            &Notices::default(),
+            Some(&end),
+            &[(key, 2)],
+            3,
+        );
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[2].kind, "length_field");
+        assert_eq!(rows[2].severity, SEVERITY_INFO);
+        assert_eq!(rows[2].lane.unwrap().apid, 999);
+        assert_eq!(
+            rows[2].message,
+            "2 commands have a length field that does not match their size; \
+             the size the log recorded is used"
+        );
+        let rows = [&rows[0], &rows[1], &rows[3]];
         assert_eq!(rows[0].kind, "gap");
         assert_eq!(rows[0].packet_index, Some(6));
         assert_eq!(rows[0].lane.unwrap().apid, 0x064);
