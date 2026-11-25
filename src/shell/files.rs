@@ -112,6 +112,11 @@ impl<R: Read> Records<R> {
         }
     }
 
+    /// What the decoder learned about the file. Ask once reading is done.
+    pub fn describe(&self) -> Option<String> {
+        self.decoder.describe()
+    }
+
     /// Gives the reader back, for example to finish a checksum.
     pub fn into_inner(self) -> R {
         self.inner

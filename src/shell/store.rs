@@ -336,7 +336,7 @@ impl Store {
         }
 
         let (format, file) = open_sniffed(path)?;
-        let decoder = decoder_for(format);
+        let decoder = decoder_for(format, config);
         if format != Format::Text && decoder.is_none() {
             // Nothing to store. Keep the removal of an earlier version, if any.
             tx.commit()?;
@@ -450,7 +450,8 @@ fn ingest_packets(
     let mut non_packets = 0u64;
     let mut end = None;
 
-    for item in Records::new(BufReader::new(file), decoder) {
+    let mut records = Records::new(BufReader::new(file), decoder);
+    for item in &mut records {
         let record = match item {
             Ok(record) => record,
             Err(ReadError::Io(e)) => return Err(e.into()),
@@ -504,8 +505,13 @@ fn ingest_packets(
             finding.message
         ])?;
     }
-    let note = end.map(|e| e.to_string()).unwrap_or_default();
-    Ok((count, note))
+    // What the file says about itself, then why reading stopped early.
+    let note: Vec<String> = records
+        .describe()
+        .into_iter()
+        .chain(end.map(|e| e.to_string()))
+        .collect();
+    Ok((count, note.join("; ")))
 }
 
 /// Reads one line, newline included, keeping at most `max` bytes of it.

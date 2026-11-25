@@ -6,6 +6,9 @@
 
 use std::fmt;
 
+use crate::pure::config::Config;
+
+pub mod cadu;
 pub mod cosmos4;
 pub mod cosmos5;
 pub mod raw;
@@ -72,14 +75,29 @@ pub enum Step {
 /// - It never panics, whatever the bytes are.
 pub trait Decoder {
     fn step(&mut self, buf: &[u8], offset: u64) -> Step;
+
+    /// What the file says about itself, learned while decoding: for example
+    /// the configuration and host a COSMOS log was written with. Ask after
+    /// the last step. Most formats say nothing.
+    fn describe(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
-    /// Starts with `COSMOS4_`.
+    /// Starts with `COSMOS` and `CMD` or `TLM`: the 42-byte header of COSMOS 1.
+    Cosmos1,
+    /// Starts with `COSMOS2_`: what COSMOS 4 wrote up to version 4.2.
+    Cosmos2,
+    /// Starts with `COSMOS4_`: COSMOS 4.3 on.
     Cosmos4,
     /// Starts with `COSMOS5_`.
     Cosmos5,
+    /// Sync markers at a fixed spacing, each followed by a transfer frame.
+    Cadu {
+        cadu_len: usize,
+    },
     /// Space packets back to back with no container.
     RawCcsds,
     /// Lines of text.
@@ -93,8 +111,11 @@ pub enum Format {
 impl Format {
     pub fn name(self) -> &'static str {
         match self {
+            Format::Cosmos1 => "cosmos1",
+            Format::Cosmos2 => "cosmos2",
             Format::Cosmos4 => "cosmos4",
             Format::Cosmos5 => "cosmos5",
+            Format::Cadu { .. } => "cadu",
             Format::RawCcsds => "raw",
             Format::Text => "text",
             Format::Gzip => "gzip",
@@ -103,11 +124,17 @@ impl Format {
         }
     }
 
-    /// True if the format was recognised by a magic number, not guessed.
+    /// True if the format was recognised by a magic number or by sync markers
+    /// at a fixed spacing, not guessed.
     pub fn is_certain(self) -> bool {
         matches!(
             self,
-            Format::Cosmos4 | Format::Cosmos5 | Format::Gzip | Format::Empty
+            Format::Cosmos2
+                | Format::Cosmos4
+                | Format::Cosmos5
+                | Format::Cadu { .. }
+                | Format::Gzip
+                | Format::Empty
         )
     }
 }
@@ -117,19 +144,27 @@ pub const SNIFF_LEN: usize = 256 * 1024;
 
 /// Guesses the format from the first bytes of a file.
 ///
-/// Magic numbers are certain. `RawCcsds` is a guess: every packet header
+/// Magic numbers are certain, and so are sync markers at a fixed spacing:
+/// that check comes before the packet one because a sync marker also reads
+/// as a version-0 packet header. `RawCcsds` is a guess: every packet header
 /// reachable by following length fields through `prefix` has version 0, and
 /// there are at least three of them or they end exactly where `prefix` does.
 /// `Text` is a guess too: valid UTF-8 with almost no control characters.
 pub fn sniff(prefix: &[u8]) -> Format {
     if prefix.is_empty() {
         Format::Empty
+    } else if prefix.starts_with(b"COSMOS2_") {
+        Format::Cosmos2
     } else if prefix.starts_with(b"COSMOS4_") {
         Format::Cosmos4
     } else if prefix.starts_with(b"COSMOS5_") {
         Format::Cosmos5
+    } else if cosmos4::is_cosmos1(prefix) {
+        Format::Cosmos1
     } else if prefix.starts_with(&[0x1F, 0x8B]) {
         Format::Gzip
+    } else if let Some(cadu_len) = cadu::sniff_cadu_len(prefix) {
+        Format::Cadu { cadu_len }
     } else if raw::chains_as_packets(prefix) {
         Format::RawCcsds
     } else if looks_like_text(prefix) {
@@ -160,11 +195,19 @@ fn looks_like_text(prefix: &[u8]) -> bool {
 }
 
 /// The decoder for a packet format, or `None` if the format holds no packets
-/// or has no decoder.
-pub fn decoder_for(format: Format) -> Option<Box<dyn Decoder>> {
+/// or has no decoder. Only CADU files need anything from `config`: how their
+/// frames are laid out is not written in the file.
+pub fn decoder_for(format: Format, config: &Config) -> Option<Box<dyn Decoder>> {
     match format {
-        Format::Cosmos4 => Some(Box::new(cosmos4::Cosmos4Decoder::new())),
+        // One decoder: it tells the two layouts apart by the file header.
+        Format::Cosmos1 | Format::Cosmos2 | Format::Cosmos4 => {
+            Some(Box::new(cosmos4::Cosmos4Decoder::new()))
+        }
         Format::Cosmos5 => Some(Box::new(cosmos5::Cosmos5Decoder::new())),
+        Format::Cadu { cadu_len } => {
+            let decoder = cadu::CaduDecoder::new(config.frame_params(cadu_len))?;
+            Some(Box::new(decoder))
+        }
         Format::RawCcsds => Some(Box::new(raw::RawDecoder::new())),
         _ => None,
     }
@@ -234,6 +277,9 @@ mod tests {
     fn sniffs_formats() {
         let mut src = Source::new(0x1A3, 0, 5);
         let packets: Vec<u8> = (0..8).flat_map(|_| src.emit()).collect();
+        assert_eq!(sniff(b"COSMOStlm_"), Format::Cosmos1);
+        assert_eq!(sniff(b"COSMOS is a ground system\n"), Format::Text);
+        assert_eq!(sniff(b"COSMOS2_TLM_"), Format::Cosmos2);
         assert_eq!(sniff(b"COSMOS4_TLM_"), Format::Cosmos4);
         assert_eq!(sniff(b"COSMOS5_"), Format::Cosmos5);
         assert_eq!(sniff(&packets), Format::RawCcsds);
@@ -246,7 +292,12 @@ mod tests {
         assert_eq!(sniff(b"abc\xff"), Format::Unknown);
         assert_eq!(sniff(b"a\xff\xff\xff"), Format::Unknown);
         assert_eq!(sniff(&[]), Format::Empty);
-        // Frame sync markers must not pass as packets or text.
+        // A sync marker reads as a version-0 packet header, so CADUs must be
+        // recognised before packets are.
+        let cadus =
+            crate::pure::synth::demo_cadus(&Config::default().frame_params(64), &packets.repeat(4));
+        assert_eq!(sniff(&cadus), Format::Cadu { cadu_len: 64 });
+        // Sync markers alone must not pass as frames, packets or text.
         assert_eq!(sniff(&[0x1A, 0xCF, 0xFC, 0x1D].repeat(50)), Format::Unknown);
     }
 

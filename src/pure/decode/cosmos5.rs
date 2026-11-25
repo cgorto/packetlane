@@ -369,7 +369,7 @@ mod tests {
             data.extend(writer.entry(*time_ns, target, pkt, payload, *command));
         }
 
-        let mut dec = decoder_for(Format::Cosmos5).expect("cosmos5 decoder");
+        let mut dec = decoder_for(Format::Cosmos5, &Default::default()).expect("cosmos5 decoder");
         let (records, end) = decode_all(dec.as_mut(), &data);
         assert_eq!(end, None);
         assert_eq!(records.len(), items.len());

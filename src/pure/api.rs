@@ -479,7 +479,7 @@ pub fn render_packet(detail: &Table, bytes: Result<&[u8], &str>, config_text: &s
     };
     let config = Config::parse(config_text).unwrap_or_default();
     let header = bytes.ok().and_then(whole_packet_header);
-    let def = header.and_then(|h| config.packet_def(h.apid, h.packet_type));
+    let def = config.packet_for(cell(r, 9).text(), header.as_ref());
     let fields = match (def, bytes) {
         (Some(def), Ok(b)) => json!(decode_fields(def, b)),
         _ => json!([]),
@@ -871,5 +871,25 @@ mod tests {
         assert_eq!(body["error"], "file is gone");
         assert_eq!(body["hex"], Value::Null);
         assert_eq!(body["fields"], json!([]));
+
+        // Two definitions on one APID: the name the log gave the packet picks.
+        let config = "[[packet]]\napid = 100\nlabel = \"SIM A\"\nname = \"First\"\n[[packet.field]]\nname = \"X\"\nbit_offset = 48\nbit_length = 8\n[[packet]]\napid = 100\nlabel = \"SIM B\"\nname = \"Second\"\n[[packet.field]]\nname = \"Y\"\nbit_offset = 56\nbit_length = 8";
+        let named = |label: Cell| {
+            let mut row = detail.rows[0].clone();
+            row[9] = label;
+            let body = render_packet(&table(vec![row]), Ok(&bytes), config).body;
+            serde_json::from_slice::<Value>(&body).unwrap()
+        };
+        let body = named(t("SIM B"));
+        assert_eq!(body["name"], "Second");
+        assert_eq!(body["fields"][0]["name"], "Y");
+        assert_eq!(body["fields"][0]["value"], 255);
+        assert_eq!(named(t("SIM A"))["fields"][0]["name"], "X");
+        // Logged under another name, or none: neither layout is assumed.
+        for other in [t("SIM C"), Null] {
+            let body = named(other);
+            assert_eq!(body["name"], Value::Null);
+            assert_eq!(body["fields"], json!([]));
+        }
     }
 }

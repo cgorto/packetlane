@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::pure::api::check_user_sql;
 use crate::pure::args::Args;
 use crate::pure::continuity::Checker;
+use crate::pure::cosmos_defs;
 use crate::pure::decode::decoder_for;
 use crate::pure::ingest::{non_packet_message, whole_packet_header};
 use crate::pure::sql::Cell;
@@ -25,6 +26,7 @@ Usage:
   packetlane query [options] <sql>        Run one read-only SQL statement
   packetlane serve [options] [path]...    Ingest paths and serve the timeline on loopback
   packetlane demo <folder> [--seconds N]  Write a sample run to a new folder
+  packetlane import-cosmos <file>...      Print COSMOS 4 packet definitions as [[packet]] config
 
 Options:
   --db <file>       Store file (default: packetlane.db in your state folder)
@@ -44,6 +46,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some((cmd, rest)) if cmd == "ingest" => report(ingest(rest)),
         Some((cmd, rest)) if cmd == "query" => report(query(rest)),
         Some((cmd, rest)) if cmd == "demo" => report(demo(rest)),
+        Some((cmd, rest)) if cmd == "import-cosmos" => report(import_cosmos(rest)),
         Some((cmd, rest)) if cmd == "serve" => report(serve(rest)),
         _ => {
             eprintln!("{USAGE}");
@@ -75,7 +78,7 @@ fn check(files: &[String]) -> ExitCode {
 
 fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let (format, file) = open_sniffed(Path::new(path))?;
-    let Some(decoder) = decoder_for(format) else {
+    let Some(decoder) = decoder_for(format, &Default::default()) else {
         return Err(format!("Format {} holds no readable packets", format.name()).into());
     };
     let certainty = if format.is_certain() {
@@ -89,7 +92,8 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let mut packets = 0u64;
     let mut other = 0u64;
     let mut read_problem = None;
-    for item in Records::new(BufReader::new(file), decoder) {
+    let mut records = Records::new(BufReader::new(file), decoder);
+    for item in &mut records {
         match item {
             Ok(record) => match whole_packet_header(&record.payload) {
                 Some(header) => {
@@ -102,6 +106,9 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         }
     }
     let report = checker.finish();
+    if let Some(about) = records.describe() {
+        println!("{path}: {about}");
+    }
 
     let streams = report.streams.len() as u64;
     println!(
@@ -222,6 +229,38 @@ fn query(rest: &[String]) -> CliResult {
         eprintln!("packetlane: More rows than shown; add a LIMIT");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Prints the configuration on standard output and what was left out on
+/// standard error, so the output can be redirected straight into a file.
+fn import_cosmos(files: &[String]) -> CliResult {
+    if files.is_empty() {
+        return Err("import-cosmos needs at least one cmd_tlm definition file".into());
+    }
+    let mut sources = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        sources.push((path.clone(), text));
+    }
+    let import = cosmos_defs::import(&sources);
+    for warning in &import.warnings {
+        eprintln!("{warning}");
+    }
+    let fields: usize = import.packets.iter().map(|p| p.fields.len()).sum();
+    eprintln!(
+        "{} {}, {fields} {}, {} {}",
+        import.packets.len(),
+        plural(import.packets.len() as u64, "packet", "packets"),
+        plural(fields as u64, "field", "fields"),
+        import.warnings.len(),
+        plural(import.warnings.len() as u64, "warning", "warnings"),
+    );
+    print!("{}", cosmos_defs::to_toml(&import.packets));
+    Ok(if import.packets.is_empty() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn demo(rest: &[String]) -> CliResult {

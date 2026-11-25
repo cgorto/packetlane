@@ -1,7 +1,8 @@
 //! Synthetic packet generators. All test data comes from here; real logs
 //! never go in this repository.
 
-use crate::pure::ccsds::{PacketType, PrimaryHeader, SEQ_MODULUS, SeqFlags};
+use crate::pure::ccsds::{IDLE_APID, PacketType, PrimaryHeader, SEQ_MODULUS, SeqFlags};
+use crate::pure::frame::{FrameKind, FrameParams, SYNC, crc16, derandomize};
 
 /// Builds one unsegmented telemetry packet with no secondary header.
 /// A space packet carries at least one data byte, so an empty payload is
@@ -104,6 +105,19 @@ pub fn cosmos4_entry(time_ns: i64, target: &str, packet: &str, payload: &[u8]) -
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+/// Builds a 128-byte file header as COSMOS 4.2 and earlier wrote it.
+pub fn cosmos2_header(telemetry: bool, config_name: &str, hostname: &str) -> Vec<u8> {
+    let mut out = cosmos4_header(telemetry, config_name, hostname);
+    out[6] = b'2';
+    out
+}
+
+/// Builds one entry as COSMOS 4.2 and earlier wrote it: a COSMOS 4 entry
+/// without the flags byte.
+pub fn cosmos2_entry(time_ns: i64, target: &str, packet: &str, payload: &[u8]) -> Vec<u8> {
+    cosmos4_entry(time_ns, target, packet, payload).split_off(1)
 }
 
 /// Builds synthetic COSMOS 5 log entries, emitting target and packet
@@ -507,6 +521,92 @@ pub fn demo_run(seconds: u32) -> Vec<DemoFile> {
     ]
 }
 
+/// Cuts a packet stream into transfer frame data zones of `zone_len` bytes,
+/// each with its first header pointer. The last zone is padded with an idle
+/// packet.
+pub fn frame_zones(packets: &[Vec<u8>], zone_len: usize) -> Vec<(u16, Vec<u8>)> {
+    let zone_len = zone_len.max(8);
+    let mut stream = Vec::new();
+    let mut starts = Vec::new();
+    for pk in packets {
+        starts.push(stream.len());
+        stream.extend_from_slice(pk);
+    }
+    let mut pad = (zone_len - stream.len() % zone_len) % zone_len;
+    if pad > 0 {
+        if pad < 7 {
+            pad += zone_len;
+        }
+        starts.push(stream.len());
+        stream.extend(packet(IDLE_APID, 0, &vec![0; pad - 6]));
+    }
+    stream
+        .chunks(zone_len)
+        .enumerate()
+        .map(|(k, zone)| {
+            let lo = k * zone_len;
+            let pointer = starts
+                .iter()
+                .find(|&&s| s >= lo && s < lo + zone_len)
+                .map_or(0x7FF, |&s| (s - lo) as u16);
+            (pointer, zone.to_vec())
+        })
+        .collect()
+}
+
+/// Wraps data zones in CADUs on one virtual channel, with whatever CRC,
+/// check symbols (zeros) and randomising `p` asks for. Frame counts start at
+/// 250 so that the TM count wraps early. No OCF, header check or insert zone.
+pub fn cadus(p: &FrameParams, vcid: u16, zones: &[(u16, Vec<u8>)]) -> Vec<Vec<u8>> {
+    zones
+        .iter()
+        .enumerate()
+        .map(|(k, (pointer, zone))| {
+            let count = 250 + k as u32;
+            let mut cadu = SYNC.to_vec();
+            match p.kind {
+                FrameKind::Tm => {
+                    cadu.extend(((0x155u16 << 4) | ((vcid & 7) << 1)).to_be_bytes());
+                    cadu.extend([count as u8, count as u8]);
+                    cadu.extend((0x1800 | pointer).to_be_bytes());
+                }
+                FrameKind::Aos => {
+                    cadu.extend((0x4000u16 | (0x2A << 6) | (vcid & 0x3F)).to_be_bytes());
+                    cadu.extend(&count.to_be_bytes()[1..]);
+                    cadu.push(0);
+                    cadu.extend(pointer.to_be_bytes());
+                }
+            }
+            cadu.extend_from_slice(zone);
+            if p.has_crc {
+                let crc = crc16(&cadu[SYNC.len()..]);
+                cadu.extend(crc.to_be_bytes());
+            }
+            cadu.resize(cadu.len() + p.rs_parity_len, 0);
+            if p.randomized {
+                derandomize(&mut cadu[SYNC.len()..]);
+            }
+            cadu
+        })
+        .collect()
+}
+
+/// A whole file of CADUs of `p.cadu_len` bytes holding `packets`, which is
+/// whole space packets back to back.
+pub fn demo_cadus(p: &FrameParams, packets: &[u8]) -> Vec<u8> {
+    let header = SYNC.len() + if p.kind == FrameKind::Tm { 6 } else { 8 };
+    let crc = if p.has_crc { 2 } else { 0 };
+    let zone_len = p.cadu_len.saturating_sub(header + crc + p.rs_parity_len);
+    let mut split = Vec::new();
+    let mut rest = packets;
+    while let Some(header) = PrimaryHeader::parse(rest) {
+        let (one, more) = rest.split_at(header.total_len().min(rest.len()));
+        split.push(one.to_vec());
+        rest = more;
+    }
+    cadus(p, 1, &frame_zones(&split, zone_len)).concat()
+}
+
 #[cfg(test)]
 mod demo_tests {
     use super::*;
@@ -531,7 +631,7 @@ mod demo_tests {
             let file = files.iter().find(|f| f.rel == rel).unwrap();
             let format = sniff(&file.bytes);
             assert!(matches!(format, Format::Cosmos4 | Format::Cosmos5), "{rel}");
-            let mut decoder = decoder_for(format).unwrap();
+            let mut decoder = decoder_for(format, &Default::default()).unwrap();
             let (records, end) = decode_all(decoder.as_mut(), &file.bytes);
             assert_eq!(end, None, "{rel}");
             let mut checker = Checker::new();

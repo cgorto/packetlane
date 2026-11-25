@@ -907,25 +907,37 @@ and carry no text logs. Both already have decoders in this codebase
 new readers from format layouts; do not port original source code without
 checking its licence against this project's.
 
-#### COSMOS 4 (`COSMOS4_`)
+#### COSMOS 4 (`COSMOS4_` and `COSMOS2_`)
 
-File header, 128 ASCII bytes: `COSMOS4_`, then `CMD` or `TLM`, `_`, a 32-byte
+COSMOS 4 wrote two layouts. Versions up to 4.2 start the file with `COSMOS2_`
+and have no flags byte and no extra block; versions from 4.3 start it with
+`COSMOS4_` and have both. Everything else is the same, and one decoder reads
+both, choosing by the file header.
+
+File header, 128 ASCII bytes: `COSMOS4_` or `COSMOS2_`, then `CMD` or `TLM`, `_`, a 32-byte
 space-padded configuration name, `_`, an 83-byte space-padded hostname.
 
 Each entry:
 
 | Size | Field |
 |---|---|
-| 1 | flags: `0x80` stored, `0x40` extra |
-| 4 + n | only if extra: length, then that many bytes of JSON |
+| 1 | `COSMOS4_` only. Flags: `0x80` stored, `0x40` extra |
+| 4 + n | `COSMOS4_` only, and only if extra: length, then that many bytes of JSON |
 | 4 | receive time, seconds since the Unix epoch |
 | 4 | receive time, microseconds |
 | 1 + n | target name length, then the name |
 | 1 + n | packet name length, then the name |
 | 4 + n | packet length, then the packet |
 
-No index, no footer. A telemetry log normally begins with one metadata packet
-that is not a space packet.
+No index, no footer. A log normally begins with one metadata packet, `SYSTEM
+META`, that is not a space packet: byte 0 is a packet id, bytes 1 to 32 the
+configuration name, bytes 33 to 62 the COSMOS version. The decoder reports the
+configuration, host and version through `Decoder::describe`, and ingest keeps
+that text in the file's note.
+
+COSMOS 1 logs start with a 42-byte header instead: `COSMOS`, then `CMD` or
+`TLM` in either case, one separator byte, and a 32-byte configuration name.
+Their entries are the same as under `COSMOS2_`.
 
 #### COSMOS 5 (`COSMOS5_`)
 

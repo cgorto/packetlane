@@ -62,7 +62,7 @@ when they could not run, so they can gate a script.
 ### Reading
 
 - **Formats**, detected from the first bytes: bare packet streams, COSMOS 4
-  and COSMOS 5 packet logs, and text logs. Site-specific formats are added as
+  (both the `COSMOS2_` and `COSMOS4_` layouts) and COSMOS 5 packet logs, and text logs. Site-specific formats are added as
   decoders (`docs/parsing.md`).
 - **Text logs**: one configurable pattern per log type picks out the
   timestamp; lines without one stay attached to the entry above.
@@ -236,7 +236,9 @@ been built here.
 - **Problem report export** to attach to a ticket.
 - Decoded field values are shown per packet; they cannot be searched or
   plotted.
-- Importing packet definitions from a spreadsheet or database.
+- Importing packet definitions from a spreadsheet or database. (COSMOS 4
+  definition files can be converted with `packetlane import-cosmos`; it keeps
+  what this tool can show and lists what it left out.)
 - Removing a run from the store (delete the store file to start over).
 - Windows: paths are handled the Unix way only.
 

@@ -727,3 +727,101 @@ fn the_server_serves_nothing_from_outside_its_folders() {
     let missing = get("/api/browse?path=%2Fetc%2Fno-such-file-here").0;
     assert_eq!((present, missing), (403, 403));
 }
+
+/// A file of CADUs is recognised by its sync markers, read with the frame
+/// layout from the configuration, and stored as the packets inside it.
+#[test]
+fn a_file_of_cadus_is_ingested_as_its_packets() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let mut a = Source::new(0x1A3, 0, 5);
+    let mut b = Source::new(0x0B0, 0, 300);
+    let packets: Vec<u8> = (0..40)
+        .flat_map(|_| [a.emit(), b.emit()].concat())
+        .collect();
+    let params = Config::parse(toml).unwrap().frame_params(256);
+    fs::write(run.join("station/pass.cadu"), demo_cadus(&params, &packets)).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let file = summary
+        .files
+        .iter()
+        .find(|f| f.rel == "station/pass.cadu")
+        .unwrap();
+    assert_eq!(file.status, Status::Ingested);
+    assert_eq!(file.packets, 80, "{}", file.note);
+    assert_eq!(file.note, "");
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM files WHERE format = 'cadu'"),
+        1
+    );
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM packets WHERE apid = 419"),
+        40
+    );
+
+    // The wrong layout is reported, not read as an empty file.
+    fs::write(run.join("packetlane.toml"), "[frames]\nkind = \"aos\"\n").unwrap();
+    let summary = ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let file = summary
+        .files
+        .iter()
+        .find(|f| f.rel == "station/pass.cadu")
+        .unwrap();
+    assert_eq!(file.packets, 0);
+    assert!(file.note.contains("AOS frame version"), "{}", file.note);
+}
+
+/// A log as COSMOS 4.2 wrote it is ingested, and what it says about itself
+/// is kept next to why reading stopped.
+#[test]
+fn a_cosmos2_log_is_ingested_and_described() {
+    use packetlane::pure::synth::{Source, cosmos2_entry, cosmos2_header};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("gse")).unwrap();
+    let mut meta = vec![1u8];
+    meta.extend_from_slice(b"FLATSAT_A");
+    meta.resize(33, 0);
+    meta.extend_from_slice(b"4.2.4");
+    meta.resize(123, 0);
+    let mut src = Source::new(0x1A3, 0, 5);
+    let mut data = cosmos2_header(true, "FLATSAT_A", "gse-01");
+    data.extend(cosmos2_entry(
+        1_700_000_000_000_000_000,
+        "SYSTEM",
+        "META",
+        &meta,
+    ));
+    for i in 0..10 {
+        let t = 1_700_000_001_000_000_000 + i * 1_000_000_000;
+        data.extend(cosmos2_entry(t, "SIM", "HK", &src.emit()));
+    }
+    data.truncate(data.len() - 3);
+    fs::write(run.join("gse/2023_11_14_22_13_20_tlm.bin"), data).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let summary = ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let file = &summary.files[0];
+    assert_eq!(file.status, Status::Ingested);
+    assert_eq!(file.format, "cosmos2");
+    assert_eq!(file.packets, 10); // META and nine whole packets
+    assert!(
+        file.note
+            .starts_with("COSMOS config FLATSAT_A on gse-01, version 4.2.4; Truncated"),
+        "{}",
+        file.note
+    );
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM packets WHERE apid = 419"),
+        9
+    );
+}
