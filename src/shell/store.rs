@@ -22,6 +22,7 @@ use crate::pure::ingest::{
     FindingRow, LaneKey, SEVERITY_INFO, SEVERITY_PROBLEM, file_findings, packet_row, ptype_code,
 };
 use crate::pure::limits::LimitChecker;
+use crate::pure::order::OrderChecker;
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
@@ -481,6 +482,7 @@ fn ingest_packets(
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut checker = Checker::new();
     let mut limits = LimitChecker::default();
+    let mut order = OrderChecker::new();
     let mut count = 0u64;
     let mut non_packets = 0u64;
     let mut end = None;
@@ -505,7 +507,10 @@ fn ingest_packets(
         }
         let lane_id = lanes.id(conn, row.lane())?;
         match &row.header {
-            Some(header) => checker.observe_at(count, header, record.offset),
+            Some(header) => {
+                checker.observe_at(count, header, record.offset);
+                order.observe(count, header, row.packet_ns);
+            }
             None => non_packets += 1,
         }
         insert.execute(params![
@@ -538,6 +543,17 @@ fn ingest_packets(
         end.as_ref(),
         non_packets,
     );
+    findings.extend(order.finish().into_iter().map(|f| FindingRow {
+        lane: Some(LaneKey::stream(f.key)),
+        packet_index: f.packet_index,
+        severity: if f.problem {
+            SEVERITY_PROBLEM
+        } else {
+            SEVERITY_INFO
+        },
+        kind: f.kind,
+        message: f.message,
+    }));
     findings.extend(limits.finish().into_iter().map(|f| FindingRow {
         lane: Some(f.lane),
         packet_index: f.packet_index,

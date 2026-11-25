@@ -12,6 +12,7 @@ use crate::pure::continuity::Checker;
 use crate::pure::cosmos_defs;
 use crate::pure::decode::decoder_for;
 use crate::pure::ingest::{non_packet_message, whole_packet_header};
+use crate::pure::order::OrderChecker;
 use crate::pure::sql::Cell;
 use crate::pure::synth::demo_run;
 use crate::shell::files::{Records, open_sniffed};
@@ -90,6 +91,7 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     println!("{path}: format {}{certainty}{wrapped}", format.name());
 
     let mut checker = Checker::new();
+    let mut order = OrderChecker::new();
     let mut packets = 0u64;
     let mut other = 0u64;
     let mut read_problem = None;
@@ -99,6 +101,8 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         match item {
             Ok(record) => match whole_packet_header(&record.payload) {
                 Some(header) => {
+                    // No configuration here, so no packet time to compare.
+                    order.observe(packets, &header, None);
                     packets += 1;
                     checker.observe(&header, record.offset);
                 }
@@ -127,6 +131,16 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     for finding in &report.findings {
         println!("  Problem: {finding}");
     }
+    let order = order.finish();
+    for finding in &order {
+        match finding.packet_index {
+            Some(i) => println!(
+                "  Problem: {}: {} at packet #{i}",
+                finding.key, finding.message
+            ),
+            None => println!("  Problem: {}: {}", finding.key, finding.message),
+        }
+    }
     let notices = records.notices().clone();
     drop(records);
     if let Some(why) = file.fault() {
@@ -148,7 +162,7 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         println!("  Problem: {e}");
     }
     let lost = notices.more > 0 || notices.list.iter().any(|n| n.is_problem());
-    Ok(!report.findings.is_empty() || read_problem.is_some() || lost)
+    Ok(!report.findings.is_empty() || !order.is_empty() || read_problem.is_some() || lost)
 }
 
 type CliResult = Result<ExitCode, Box<dyn std::error::Error + Send + Sync>>;

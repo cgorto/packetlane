@@ -1332,3 +1332,63 @@ name = "Housekeeping"
         0
     );
 }
+
+/// Segments out of order and packet time stepping back are found at ingest.
+#[test]
+fn segment_order_and_packet_time_are_checked() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::format::cuc_bytes;
+    use packetlane::pure::synth::timed_packet;
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("a")).unwrap();
+    let toml = "[packet_time]\ncode = \"cuc\"\nepoch = \"1970-01-01T00:00:00Z\"\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let rule = Config::parse(toml).unwrap().resolved_time().unwrap();
+    // (sequence flags, seconds): a continuation with no first at packet 2,
+    // and time stepping back at packet 4.
+    let script = [(3u8, 100), (3, 101), (0, 102), (2, 103), (3, 90), (3, 91)];
+    let mut data = Vec::new();
+    for (i, (flags, secs)) in script.iter().enumerate() {
+        let time = cuc_bytes(&rule, secs * 1_000_000_000).unwrap();
+        let mut packet = timed_packet(0x1A3, i as u16, &time, &[0]);
+        packet[2] = (packet[2] & 0x3F) | (flags << 6);
+        data.extend(packet);
+    }
+    fs::write(run.join("a/packets.bin"), data).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let found = store
+        .query_user(
+            "SELECT f.kind, f.severity, f.message, p.idx FROM findings f
+             JOIN packets p ON p.id = f.packet_id ORDER BY f.id",
+            10,
+        )
+        .unwrap();
+    let lines: Vec<(&str, &str, &str, i64)> = found
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].text().unwrap(),
+                r[1].text().unwrap(),
+                r[2].text().unwrap(),
+                r[3].int().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "segment",
+                "problem",
+                "Continuation segment with no first segment",
+                2
+            ),
+            ("time_back", "info", "Packet time went back 13.000 s", 4),
+        ]
+    );
+}
