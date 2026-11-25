@@ -14,14 +14,16 @@
 //!   Little-endian numbers must be 16, 32 or 64 bits on a byte boundary;
 //!   arrays must be of numbers. Derived items, sizes of zero or less,
 //!   offsets from the end and little-endian bit fields are skipped.
-//! - `STATE` becomes a label and `UNITS` the unit. Conversions, limits and
-//!   format strings are dropped: values are shown raw.
+//! - `STATE` becomes a label, `UNITS` the unit, `POLY_READ_CONVERSION` the
+//!   field's polynomial and the default, enabled `LIMITS` its limits. Other
+//!   conversions, other limits sets, green limits and format strings are
+//!   dropped.
 //! - ERB (`<% ... %>`) is not run. After one, the position of appended items
 //!   is unknown, so they are skipped.
 
 use std::collections::BTreeMap;
 
-use crate::pure::config::{ByteOrder, FieldDef, FieldKind, Kind, MAX_COUNT, PacketDef};
+use crate::pure::config::{ByteOrder, FieldDef, FieldKind, Kind, Limits, MAX_COUNT, PacketDef};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Import {
@@ -208,9 +210,40 @@ impl Importer<'_> {
                     b.conversions += usize::from(keyword.contains("READ"));
                 }
             }
-            "READ_CONVERSION" | "POLY_READ_CONVERSION" | "SEG_POLY_READ_CONVERSION" => {
+            "READ_CONVERSION" | "SEG_POLY_READ_CONVERSION" => {
                 if let Some(b) = &mut self.building {
                     b.conversions += 1;
+                }
+            }
+            "POLY_READ_CONVERSION" => {
+                let poly: Option<Vec<f64>> = params.iter().map(|p| p.parse().ok()).collect();
+                self.change_field(number, |field| field.poly = poly.unwrap_or_default());
+            }
+            "LIMITS" => {
+                let numbers: Vec<f64> = params
+                    .iter()
+                    .skip(3)
+                    .filter_map(|p| p.parse().ok())
+                    .collect();
+                let (Some(set), Some(persistence), Some(enabled), [rl, yl, yh, rh, ..]) = (
+                    params.first(),
+                    params.get(1).and_then(|p| p.parse().ok()),
+                    params.get(2),
+                    numbers.as_slice(),
+                ) else {
+                    return;
+                };
+                // One set of limits per field here: COSMOS's default set,
+                // unless the definition switches it off.
+                if set.eq_ignore_ascii_case("DEFAULT") && enabled.eq_ignore_ascii_case("ENABLED") {
+                    let limits = Limits {
+                        red_low: *rl,
+                        yellow_low: *yl,
+                        yellow_high: *yh,
+                        red_high: *rh,
+                        persistence,
+                    };
+                    self.change_field(number, |field| field.limits = Some(limits));
                 }
             }
             "STATE" => self.state(number, params),
@@ -229,6 +262,25 @@ impl Importer<'_> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Applies a change to the field the line belongs to, unless the result
+    /// is not a field this tool accepts; then says so and leaves it alone.
+    fn change_field(&mut self, number: usize, change: impl FnOnce(&mut FieldDef)) {
+        let Some(b) = &mut self.building else { return };
+        let Some(i) = b.current else { return };
+        let mut changed = b.def.fields[i].clone();
+        change(&mut changed);
+        match changed.validate() {
+            Ok(()) => b.def.fields[i] = changed,
+            Err(reason) => {
+                let what = format!("{} {}", b.def.name, changed.name);
+                self.warn(
+                    number,
+                    format!("{what}: conversion or limits skipped, {reason}"),
+                );
+            }
         }
     }
 
@@ -365,6 +417,8 @@ impl Importer<'_> {
             labels: BTreeMap::new(),
             byte_order,
             count,
+            poly: Vec::new(),
+            limits: None,
         };
         field.validate()?;
         if id && kind == FieldKind::Uint && offset == 5 && size == 11 {
@@ -477,6 +531,16 @@ pub fn to_toml(packets: &[PacketDef]) -> String {
             if !f.unit.is_empty() {
                 out.push_str(&format!("  unit = {}\n", quoted(&f.unit)));
             }
+            if !f.poly.is_empty() {
+                let poly: Vec<String> = f.poly.iter().map(|c| format!("{c:?}")).collect();
+                out.push_str(&format!("  poly = [{}]\n", poly.join(", ")));
+            }
+            if let Some(l) = &f.limits {
+                out.push_str(&format!(
+                    "  limits = {{ red_low = {:?}, yellow_low = {:?}, yellow_high = {:?}, red_high = {:?}, persistence = {} }}\n",
+                    l.red_low, l.yellow_low, l.yellow_high, l.red_high, l.persistence
+                ));
+            }
             if !f.labels.is_empty() {
                 let labels: Vec<String> = f
                     .labels
@@ -546,6 +610,18 @@ TELEMETRY inst HEALTH_STATUS BIG_ENDIAN "Health and status"
         // Appended items start where the explicit ones end: bit 48.
         assert_eq!(at("TEMP1"), Some((48, 16, FieldKind::Uint)));
         assert_eq!(field("TEMP1").unwrap().unit, "C");
+        assert_eq!(field("TEMP1").unwrap().poly, [-100.0, 0.00305]);
+        let limits = field("TEMP1").unwrap().limits.unwrap();
+        assert_eq!(
+            (
+                limits.red_low,
+                limits.yellow_low,
+                limits.yellow_high,
+                limits.red_high,
+                limits.persistence
+            ),
+            (-80.0, -70.0, 60.0, 80.0, 1)
+        );
         assert_eq!(at("TEMP2"), Some((64, 32, FieldKind::Float)));
         // An array of ten bytes.
         assert_eq!(at("ARY"), Some((96, 8, FieldKind::Uint)));
@@ -569,11 +645,10 @@ TELEMETRY inst HEALTH_STATUS BIG_ENDIAN "Health and status"
             "CALC: skipped, derived items have no bits to show",
             "REST: skipped, its size is not fixed",
             "AFTER: skipped, its position is unknown",
-            "t.txt:3: INST HEALTH_STATUS: 1 conversions dropped",
         ] {
             assert!(all.contains(needle), "missing {needle:?} in:\n{all}");
         }
-        assert_eq!(got.warnings.len(), 4, "{all}");
+        assert_eq!(got.warnings.len(), 3, "{all}");
     }
 
     #[test]

@@ -51,6 +51,9 @@
 //!   kind = "uint"            # uint (default), int, float, hex, ascii
 //!   byte_order = "big"       # "big" (default) or "little": whole bytes on a byte boundary
 //!   count = 1                # more than 1: an array of that many numbers
+//!   poly = [-100.0, 0.00305] # engineering value = c0 + c1 x + c2 x^2 ...; unit applies to it
+//!   limits = { red_low = -80, yellow_low = -70, yellow_high = 60, red_high = 80, persistence = 1 }
+//!                            # leaving the yellow or red range is a finding
 //!   unit = ""
 //!   labels = { "0" = "IDLE", "1" = "OBSERVE" }
 //! ```
@@ -230,6 +233,74 @@ pub struct FieldDef {
     /// one makes the field an array.
     #[serde(default = "one")]
     pub count: u32,
+    /// Coefficients turning the raw number into an engineering value:
+    /// c0 + c1 x + c2 x^2 and so on. Empty means the raw number is the value.
+    #[serde(default)]
+    pub poly: Vec<f64>,
+    /// The range the engineering value should stay in.
+    #[serde(default)]
+    pub limits: Option<Limits>,
+}
+
+/// Limits on a field's value, in the sense COSMOS gives them: outside the
+/// yellow pair is a warning, outside the red pair a problem.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    pub red_low: f64,
+    pub yellow_low: f64,
+    pub yellow_high: f64,
+    pub red_high: f64,
+    /// How many packets in a row must disagree with the current state
+    /// before it changes, so that one odd sample is not reported.
+    #[serde(default = "one")]
+    pub persistence: u32,
+}
+
+/// Where a value stands against its limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LimitState {
+    Green,
+    YellowLow,
+    YellowHigh,
+    RedLow,
+    RedHigh,
+}
+
+impl LimitState {
+    pub fn name(self) -> &'static str {
+        match self {
+            LimitState::Green => "green",
+            LimitState::YellowLow => "yellow low",
+            LimitState::YellowHigh => "yellow high",
+            LimitState::RedLow => "red low",
+            LimitState::RedHigh => "red high",
+        }
+    }
+
+    pub fn is_red(self) -> bool {
+        matches!(self, LimitState::RedLow | LimitState::RedHigh)
+    }
+}
+
+impl Limits {
+    /// The comparisons are COSMOS's: a value equal to a yellow limit is
+    /// yellow, and one equal to a red limit is red.
+    pub fn state(&self, value: f64) -> LimitState {
+        if value > self.yellow_low {
+            if value < self.yellow_high {
+                LimitState::Green
+            } else if value < self.red_high {
+                LimitState::YellowHigh
+            } else {
+                LimitState::RedHigh
+            }
+        } else if value > self.red_low {
+            LimitState::YellowLow
+        } else {
+            LimitState::RedLow
+        }
+    }
 }
 
 fn one() -> u32 {
@@ -580,6 +651,24 @@ impl FieldDef {
         }
         if self.count > 1 && !self.labels.is_empty() {
             return Err("an array field cannot have labels".to_string());
+        }
+        if (!self.poly.is_empty() || self.limits.is_some()) && (!number || self.count > 1) {
+            return Err("poly and limits need a single number".to_string());
+        }
+        if self.poly.len() > 16 || self.poly.iter().any(|c| !c.is_finite()) {
+            return Err("poly takes up to 16 finite coefficients".to_string());
+        }
+        if let Some(l) = &self.limits {
+            let all = [l.red_low, l.yellow_low, l.yellow_high, l.red_high];
+            let ordered = l.red_low <= l.yellow_low
+                && l.yellow_low < l.yellow_high
+                && l.yellow_high <= l.red_high;
+            if !ordered || all.iter().any(|v| !v.is_finite()) || l.persistence == 0 {
+                return Err(
+                    "limits must run red_low <= yellow_low < yellow_high <= red_high, persistence at least 1"
+                        .to_string(),
+                );
+            }
         }
         if let Some(key) = self.labels.keys().find(|k| k.parse::<i128>().is_err()) {
             return Err(format!("labels key {key:?} must be a whole number"));

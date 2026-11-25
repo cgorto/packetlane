@@ -557,7 +557,16 @@ async function select(item, keepTab) {
       const h = document.createElement("h2");
       h.textContent = p.name || (p.apid !== null ? apidText(p.apid) : p.label || "Other");
       pane.append(h);
-      if (p.fields.length) pane.append(kv(p.fields.map((f) => [f.name, f.error ? f.error : f.label ? [String(f.value), f.label] : (Array.isArray(f.value) ? f.value.join(", ") : String(f.value)) + (f.unit ? " " + f.unit : ""), f.error ? "error" : ""])));
+      if (p.fields.length) pane.append(kv(p.fields.map((f) => {
+        if (f.error) return [f.name, f.error, "error"];
+        if (f.label) return [f.name, [String(f.value), f.label], ""];
+        const unit = f.unit ? " " + f.unit : "";
+        // With a conversion the unit belongs to the converted value; the raw one follows.
+        let text = f.converted != null ? f.converted + unit + " (raw " + f.value + ")"
+          : (Array.isArray(f.value) ? f.value.join(", ") : String(f.value)) + unit;
+        if (f.limit) text += " \u2014 " + f.limit;
+        return [f.name, text, f.limit && f.limit.startsWith("red") ? "error" : ""];
+      })));
       pane.append(kv([
         ["Receive", short(p.receive)], ["Packet", short(p.packet)],
         ["APID", p.apid !== null ? apidText(p.apid) + (p.command ? " TC" : "") : ""],

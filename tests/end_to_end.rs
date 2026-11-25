@@ -1085,3 +1085,109 @@ fn gzip_files_are_read_as_their_content() {
         assert_eq!(body["hex"], hex(shown));
     }
 }
+
+/// A field leaving its limits is a finding at the packet where it happened,
+/// and the packet view shows the converted value and where it stands.
+#[test]
+fn a_value_leaving_its_limits_is_a_finding() {
+    use packetlane::pure::synth::{cosmos2_entry, cosmos2_header, packet};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("gse")).unwrap();
+    fs::write(
+        run.join("packetlane.toml"),
+        r#"
+[[packet]]
+apid = 100
+label = "SIM HK"
+name = "Housekeeping"
+  [[packet.field]]
+  name = "TEMP"
+  bit_offset = 48
+  bit_length = 16
+  byte_order = "little"
+  unit = "C"
+  poly = [-100.0, 0.5]
+  limits = { red_low = -80, yellow_low = -70, yellow_high = 60, red_high = 80 }
+
+[[packet]]
+apid = 100
+label = "SIM OTHER"
+name = "Same APID, another layout"
+"#,
+    )
+    .unwrap();
+    // Engineering temperature t is sent as (t + 100) * 2, little-endian.
+    let temps = [20.0, 21.0, 65.0, 66.0, 90.0, 91.0, 20.0];
+    let mut data = cosmos2_header(true, "CFG", "gse");
+    for (i, t) in temps.iter().enumerate() {
+        let raw = ((t + 100.0) * 2.0) as u16;
+        let t_ns = 1_700_000_000_000_000_000 + i as i64 * 1_000_000_000;
+        data.extend(cosmos2_entry(
+            t_ns,
+            "SIM",
+            "HK",
+            &packet(100, i as u16, &raw.to_le_bytes()),
+        ));
+        // The same APID under another name must not be judged by HK's limits.
+        data.extend(cosmos2_entry(
+            t_ns,
+            "SIM",
+            "OTHER",
+            &packet(100, i as u16, &[0xFF, 0xFF]),
+        ));
+    }
+    fs::write(run.join("gse/tlm.bin"), data).unwrap();
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let found = store
+        .query_user(
+            "SELECT f.severity, f.message, p.idx FROM findings f
+             LEFT JOIN packets p ON p.id = f.packet_id WHERE f.kind = 'limit' ORDER BY f.id",
+            10,
+        )
+        .unwrap();
+    let lines: Vec<(&str, &str, i64)> = found
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].text().unwrap(),
+                r[1].text().unwrap(),
+                r[2].int().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "info",
+                "Housekeeping TEMP went yellow high: 65 C (limit 60)",
+                4
+            ),
+            (
+                "problem",
+                "Housekeeping TEMP went red high: 90 C (limit 80)",
+                8
+            ),
+        ]
+    );
+    let id = store
+        .query_user("SELECT id FROM packets WHERE idx = 8", 1)
+        .unwrap()
+        .rows[0][0]
+        .int()
+        .unwrap();
+    drop(store);
+
+    let body = serve(db, run)(&format!("/api/packet?id={id}"));
+    let field = &body["fields"][0];
+    assert_eq!(field["value"], 380);
+    assert_eq!(field["converted"], 90.0);
+    assert_eq!(field["limit"], "red high");
+    assert_eq!(field["unit"], "C");
+}

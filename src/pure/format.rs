@@ -3,7 +3,9 @@
 
 use serde::Serialize;
 
-use crate::pure::config::{ByteOrder, FieldDef, FieldKind, PacketDef, ResolvedTime, TimeCode};
+use crate::pure::config::{
+    ByteOrder, FieldDef, FieldKind, LimitState, PacketDef, ResolvedTime, TimeCode,
+};
 
 /// Reads up to 64 bits starting `bit_offset` bits into `bytes`, most
 /// significant bit first. `None` if the range runs past the end.
@@ -76,6 +78,36 @@ pub struct Decoded {
     pub label: Option<String>,
     pub unit: String,
     pub error: Option<&'static str>,
+    /// The engineering value, where the field has a conversion.
+    pub converted: Option<f64>,
+    /// Where the value stands against the field's limits, unless it is
+    /// inside them: "yellow low", "red high" and so on.
+    pub limit: Option<&'static str>,
+}
+
+/// A field's value as a number in engineering units: the raw number put
+/// through the field's polynomial, if it has one. `None` for text, arrays
+/// and anything unreadable.
+pub fn engineering(field: &FieldDef, packet: &[u8]) -> Option<f64> {
+    if field.count != 1 {
+        return None;
+    }
+    let raw = match number(field, packet, u64::from(field.bit_offset)).ok()? {
+        Value::UInt(v) => v as f64,
+        Value::Int(v) => v as f64,
+        Value::Float(v) => v,
+        _ => return None,
+    };
+    if field.poly.is_empty() {
+        return Some(raw);
+    }
+    let mut power = 1.0;
+    let mut sum = 0.0;
+    for c in &field.poly {
+        sum += c * power;
+        power *= raw;
+    }
+    sum.is_finite().then_some(sum)
 }
 
 const PAST_END: &str = "Past end of packet";
@@ -169,19 +201,30 @@ pub fn decode_fields(def: &PacketDef, packet: &[u8]) -> Vec<Decoded> {
     def.fields
         .iter()
         .map(|field| match decode_field(field, packet) {
-            Ok((value, label)) => Decoded {
-                name: field.name.clone(),
-                value: Some(value),
-                label,
-                unit: field.unit.clone(),
-                error: None,
-            },
+            Ok((value, label)) => {
+                let number = engineering(field, packet);
+                Decoded {
+                    name: field.name.clone(),
+                    value: Some(value),
+                    label,
+                    unit: field.unit.clone(),
+                    error: None,
+                    converted: number.filter(|_| !field.poly.is_empty()),
+                    limit: number
+                        .zip(field.limits)
+                        .map(|(v, limits)| limits.state(v))
+                        .filter(|s| *s != LimitState::Green)
+                        .map(LimitState::name),
+                }
+            }
             Err(error) => Decoded {
                 name: field.name.clone(),
                 value: None,
                 label: None,
                 unit: field.unit.clone(),
                 error: Some(error),
+                converted: None,
+                limit: None,
             },
         })
         .collect()

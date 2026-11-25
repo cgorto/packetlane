@@ -18,8 +18,9 @@ use crate::pure::continuity::Checker;
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
 use crate::pure::ingest::{
-    FindingRow, LaneKey, SEVERITY_PROBLEM, file_findings, packet_row, ptype_code,
+    FindingRow, LaneKey, SEVERITY_INFO, SEVERITY_PROBLEM, file_findings, packet_row, ptype_code,
 };
+use crate::pure::limits::LimitChecker;
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
@@ -371,7 +372,8 @@ impl Store {
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
                 let (packets, note) = ingest_packets(
-                    &tx, &mut file, decoder, file_id, run_id, &source, time_rule, &mut lanes,
+                    &tx, &mut file, decoder, config, file_id, run_id, &source, time_rule,
+                    &mut lanes,
                 )?;
                 (packets, 0, note)
             }
@@ -466,6 +468,7 @@ fn ingest_packets(
     conn: &Connection,
     file: &mut Source,
     decoder: Box<dyn Decoder>,
+    config: &Config,
     file_id: i64,
     run_id: i64,
     source: &SourceInfo,
@@ -475,6 +478,7 @@ fn ingest_packets(
     let base_id: i64 = conn.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
     let mut checker = Checker::new();
+    let mut limits = LimitChecker::default();
     let mut count = 0u64;
     let mut non_packets = 0u64;
     let mut end = None;
@@ -490,6 +494,13 @@ fn ingest_packets(
             }
         };
         let row = packet_row(count, &record, time_rule, source.clock_offset_ns);
+        if let Some(def) = config.packet_for(record.label.as_deref(), row.header.as_ref())
+            && def.fields.iter().any(|f| f.limits.is_some())
+        {
+            // The definition's address tells it apart from the others.
+            let id = std::ptr::from_ref(def) as usize;
+            limits.observe(count, id, def, &record.payload, &row.lane());
+        }
         let lane_id = lanes.id(conn, row.lane())?;
         match &row.header {
             Some(header) => checker.observe_at(count, header, record.offset),
@@ -513,12 +524,23 @@ fn ingest_packets(
         count += 1;
     }
 
-    let findings: Vec<FindingRow> = file_findings(
+    let mut findings: Vec<FindingRow> = file_findings(
         &checker.finish(),
         records.notices(),
         end.as_ref(),
         non_packets,
     );
+    findings.extend(limits.finish().into_iter().map(|f| FindingRow {
+        lane: Some(f.lane),
+        packet_index: f.packet_index,
+        severity: if f.red {
+            SEVERITY_PROBLEM
+        } else {
+            SEVERITY_INFO
+        },
+        kind: "limit",
+        message: f.message,
+    }));
     let mut insert_finding = conn.prepare_cached(sql::INSERT_FINDING)?;
     for finding in &findings {
         let lane_id = match finding.lane {

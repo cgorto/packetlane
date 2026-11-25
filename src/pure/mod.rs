@@ -14,6 +14,7 @@ pub mod format;
 pub mod frame;
 pub mod http;
 pub mod ingest;
+pub mod limits;
 pub mod paths;
 pub mod sql;
 pub mod synth;
