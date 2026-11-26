@@ -113,6 +113,9 @@ fn collect(stmt: &mut rusqlite::Statement<'_>, params: &[Param], limit: usize) -
     })
 }
 
+/// See where it is set, in [`Store::open`].
+const WRITE_CACHE_KIB: i64 = 32 * 1024;
+
 fn run_query(conn: &Connection, q: &Query, limit: usize) -> Result<Table> {
     let mut stmt = conn.prepare_cached(&q.sql)?;
     collect(&mut stmt, &q.params, limit)
@@ -124,6 +127,11 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Pages of the store held in memory while writing, in KiB (negative
+        // means a size, not a page count). SQLite's own 2 MB is less than
+        // one index of a large run, and a run with many lanes writes all
+        // over its lane-first indexes.
+        conn.pragma_update(None, "cache_size", -WRITE_CACHE_KIB)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 0 && version != sql::SCHEMA_VERSION {
             return Err(format!(

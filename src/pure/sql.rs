@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS packets (
 CREATE INDEX IF NOT EXISTS packets_receive ON packets (receive_ns, lane_id);
 CREATE INDEX IF NOT EXISTS packets_packet ON packets (packet_ns, lane_id);
 CREATE INDEX IF NOT EXISTS packets_sum ON packets (sum, lane_id);
+CREATE INDEX IF NOT EXISTS packets_lane_receive ON packets (lane_id, receive_ns, packet_ns);
+CREATE INDEX IF NOT EXISTS packets_lane_packet ON packets (lane_id, packet_ns, receive_ns);
 CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -310,6 +312,33 @@ impl Clock {
             Clock::Order => None,
         }
     }
+
+    /// What to write after `packets` and any alias in a query that reads a
+    /// window of every lane of a run: the index that finds packets by this clock, so
+    /// that the cost follows the width of the window.
+    ///
+    /// The index is named because SQLite, left to choose, takes a lane-first
+    /// index and visits the lanes one at a time, sorting afterwards.
+    fn all_lanes(self) -> &'static str {
+        match self {
+            Clock::Receive => "INDEXED BY packets_receive",
+            Clock::Packet => "INDEXED BY packets_packet",
+            // By id, which is the table's own order and needs no index.
+            Clock::Order => "NOT INDEXED",
+        }
+    }
+
+    /// What to write after `packets` and any alias in a query that reads a
+    /// window of one lane: the index that finds a lane's packets by this clock, so that
+    /// the cost follows that lane's packets and not everything else logged
+    /// at the same time.
+    fn one_lane(self) -> &'static str {
+        match self {
+            Clock::Receive => "INDEXED BY packets_lane_receive",
+            Clock::Packet => "INDEXED BY packets_lane_packet",
+            Clock::Order => "",
+        }
+    }
 }
 
 const RUN_LANES: &str = "(SELECT id FROM lanes WHERE run_id = ?)";
@@ -378,9 +407,10 @@ pub fn bucket_width(from: i64, to: i64, buckets: i64) -> i64 {
 /// Packet counts per lane and bucket. Columns: lane, bucket, count.
 pub fn packet_density(run: i64, clock: Clock, from: i64, to: i64, buckets: i64) -> Query {
     let c = clock.packet_column();
+    let index = clock.all_lanes();
     Query::new(
         format!(
-            "SELECT lane_id, ({c} - ?) / ? AS b, COUNT(*) FROM packets
+            "SELECT lane_id, ({c} - ?) / ? AS b, COUNT(*) FROM packets {index}
              WHERE {c} BETWEEN ? AND ? AND lane_id IN {RUN_LANES}
              GROUP BY lane_id, b"
         ),
@@ -448,10 +478,11 @@ pub fn value_series(
     buckets: i64,
 ) -> Query {
     let c = clock.packet_column();
+    let index = clock.one_lane();
     Query::new(
         format!(
             "SELECT (p.{c} - ?) / ? AS b, MIN(v.num), MAX(v.num), COUNT(*)
-             FROM packets p CROSS JOIN field_values v ON v.packet_id = p.id
+             FROM packets p {index} CROSS JOIN field_values v ON v.packet_id = p.id
              WHERE p.lane_id = ? AND p.lane_id IN {RUN_LANES} AND p.{c} BETWEEN ? AND ?
                AND v.packet = ? AND v.field = ? AND v.num IS NOT NULL
              GROUP BY b ORDER BY b"
@@ -473,11 +504,12 @@ pub fn value_series(
 /// milliseconds, by bucket. Columns: bucket, min, max, count.
 pub fn lag_series(run: i64, clock: Clock, lane: i64, from: i64, to: i64, buckets: i64) -> Query {
     let c = clock.packet_column();
+    let index = clock.one_lane();
     Query::new(
         format!(
             "SELECT ({c} - ?) / ? AS b, MIN(receive_ns - packet_ns) / 1000000.0,
                     MAX(receive_ns - packet_ns) / 1000000.0, COUNT(*)
-             FROM packets
+             FROM packets {index}
              WHERE lane_id = ? AND lane_id IN {RUN_LANES} AND {c} BETWEEN ? AND ?
                AND receive_ns IS NOT NULL AND packet_ns IS NOT NULL
              GROUP BY b ORDER BY b"
@@ -496,9 +528,10 @@ pub fn lag_series(run: i64, clock: Clock, lane: i64, from: i64, to: i64, buckets
 /// Individual packets in a window. Columns: id, lane, time, seq, length.
 pub fn packet_items(run: i64, clock: Clock, from: i64, to: i64, limit: i64) -> Query {
     let c = clock.packet_column();
+    let index = clock.all_lanes();
     Query::new(
         format!(
-            "SELECT id, lane_id, {c}, seq, length FROM packets
+            "SELECT id, lane_id, {c}, seq, length FROM packets {index}
              WHERE {c} BETWEEN ? AND ? AND lane_id IN {RUN_LANES}
              ORDER BY {c} LIMIT ?"
         ),
@@ -874,7 +907,7 @@ pub fn density(
     let width = bucket_width(from, to, buckets);
     let direct = |lo: i64, hi: i64| -> Vec<Query> {
         let mut out = vec![range_density(
-            "packets",
+            &format!("packets {}", clock.all_lanes()),
             clock.packet_column(),
             run,
             lo,

@@ -21,8 +21,8 @@
 //! - `LOAD_BUDGET_MS`: fail if the median answer to any request the page
 //!   makes while panning or zooming takes longer. Default: no limit, the
 //!   times are only printed, because they depend on the machine.
-//! - `LOAD_MAX_RSS_MB`: fail if ingest uses more memory. Default 96, which
-//!   is several times what it uses at any size and far less than a run.
+//! - `LOAD_MAX_RSS_MB`: fail if ingest uses more memory. Default 128: what
+//!   it uses is set by the store's page cache, not by the size of the run.
 //!
 //! To try a change, keep it short: `LOAD_PACKETS=300000` takes under a
 //! minute for both runs and shows the same shape. Take the final numbers at
@@ -334,7 +334,7 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
     let (took, peak_mb, out) = run(&["ingest", "--db", db_text, run_text]);
     println!("\n== {name} ==");
     println!("  {}", out.lines().last().unwrap_or(""));
-    let max_rss = setting("LOAD_MAX_RSS_MB").unwrap_or(96);
+    let max_rss = setting("LOAD_MAX_RSS_MB").unwrap_or(128);
     assert!(
         peak_mb <= max_rss,
         "ingest held {peak_mb} MB, more than {max_rss} MB"

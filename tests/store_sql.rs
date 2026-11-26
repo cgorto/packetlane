@@ -123,10 +123,10 @@ fn step<'a>(plan: &'a [String], table: &str) -> &'a str {
 
 // ---- plans ------------------------------------------------------------------
 
-/// Each view of the timeline must find its packets by time, so that what it
+/// A view of every lane must find its packets by time, so that what it
 /// costs follows the width of the view and not the size of the run.
 #[test]
-fn views_of_the_timeline_find_their_packets_by_time() {
+fn views_of_every_lane_find_their_packets_by_time() {
     let store = demo();
     let (from, to) = (1_767_225_600_000_000_000, 1_767_225_700_000_000_000);
     for (clock, index) in [
@@ -141,52 +141,69 @@ fn views_of_the_timeline_find_their_packets_by_time() {
         (Clock::Order, "INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
     ] {
         let mut queries = vec![
-            (
-                "items",
-                "packets",
-                sql::packet_items(1, clock, from, to, 2000),
-            ),
-            (
-                "value plot",
-                "p",
-                sql::value_series(1, clock, 2, "SIM_HK", "BUS_VOLTS", from, to, 1200),
-            ),
-            (
-                "delay plot",
-                "packets",
-                sql::lag_series(1, clock, 2, from, to, 1200),
-            ),
-            (
-                "density",
-                "packets",
-                sql::packet_density(1, clock, from, to, 400),
-            ),
+            ("items", sql::packet_items(1, clock, from, to, 2000)),
+            ("density", sql::packet_density(1, clock, from, to, 400)),
         ];
         // With pre-counted buckets, the two ends of the window are still
         // counted from the packets.
         let before = queries.len();
         for q in sql::density(1, clock, from + 7, to + 7, 400, Some((from, 1_000_000_000))) {
             if q.sql.contains("FROM packets") {
-                queries.push(("density, ends", "packets", q));
+                queries.push(("density, ends", q));
             }
         }
         assert!(queries.len() > before, "no end of the window was counted");
-        for (name, table, q) in &queries {
+        for (name, q) in &queries {
             let plan = plan(&store.conn, q);
-            let step = step(&plan, table);
+            let step = step(&plan, "packets");
             assert!(
                 step.starts_with("SEARCH") && step.ends_with(index),
                 "{name}: {step}"
             );
+            // In time order as found: nothing is sorted afterwards.
+            assert!(
+                !plan.iter().any(|s| s.contains("ORDER BY")),
+                "{name}: {plan:#?}"
+            );
         }
     }
-    // And a plot looks its values up by packet, not by field.
-    let q = sql::value_series(1, Clock::Receive, 2, "SIM_HK", "BUS_VOLTS", from, to, 1200);
-    let plan = plan(&store.conn, &q);
-    assert_eq!(
-        step(&plan, "v"),
-        "SEARCH v USING INDEX field_values_packet (packet_id=?)"
-    );
+}
+
+/// A plot of one lane must find that lane's packets by time, so that what
+/// it costs follows that lane and not everything logged alongside it.
+#[test]
+fn plots_find_one_lanes_packets_by_time() {
+    let store = demo();
+    let (from, to) = (1_767_225_600_000_000_000, 1_767_225_700_000_000_000);
+    for (clock, index) in [
+        (
+            Clock::Receive,
+            "packets_lane_receive (lane_id=? AND receive_ns>? AND receive_ns<?)",
+        ),
+        (
+            Clock::Packet,
+            "packets_lane_packet (lane_id=? AND packet_ns>? AND packet_ns<?)",
+        ),
+    ] {
+        // Arrival delay is answered from the index alone.
+        let plan_of = plan(&store.conn, &sql::lag_series(1, clock, 2, from, to, 1200));
+        assert_eq!(
+            step(&plan_of, "packets"),
+            format!("SEARCH packets USING COVERING INDEX {index}")
+        );
+        // A value plot finds the packets that way, then looks each one's
+        // values up by packet, not by field.
+        let q = sql::value_series(1, clock, 2, "SIM_HK", "BUS_VOLTS", from, to, 1200);
+        let plan_of = plan(&store.conn, &q);
+        assert_eq!(
+            step(&plan_of, "p"),
+            format!("SEARCH p USING COVERING INDEX {index}")
+        );
+        assert_eq!(
+            step(&plan_of, "v"),
+            "SEARCH v USING INDEX field_values_packet (packet_id=?)"
+        );
+    }
 }
 
 /// The comparison of sources reads the packets twice, whatever the number
