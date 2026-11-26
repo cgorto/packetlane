@@ -298,7 +298,8 @@ been built here.
 src/pure/     functional core: decoders, checks, config, SQL text, HTTP and API as values
 src/shell/    imperative shell: files, SQLite, sockets, command line
 web/          the page: structure, style, script (embedded at build time)
-tests/        end-to-end tests, and the test that keeps I/O out of src/pure
+tests/        end-to-end tests, decoders against damaged input, and the test
+              that keeps I/O out of src/pure
 docs/         architecture.md, parsing.md
 container/    development container stub and editor settings
 ```
