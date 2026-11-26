@@ -55,6 +55,14 @@ pub enum Command {
         window: Window,
         limit: i64,
     },
+    /// One line to plot for one lane: a kept field, named by its packet
+    /// and field, or with no name how late the lane's packets arrived.
+    Series {
+        window: Window,
+        buckets: i64,
+        lane: i64,
+        field: Option<(String, String)>,
+    },
     Packet {
         id: i64,
     },
@@ -200,6 +208,25 @@ pub fn route(guard: &Guard, req: &Request) -> Result<Command, Response> {
             window: window(req)?,
             limit: int(req, "limit")?.clamp(1, 5000),
         }),
+        (Method::Get, "/api/series") => {
+            let name = |key: &str| req.param(key).filter(|v| !v.is_empty() && v.len() <= 200);
+            let field = match (name("packet"), name("field")) {
+                (Some(packet), Some(field)) => Some((packet.to_string(), field.to_string())),
+                (None, None) => None,
+                _ => {
+                    return Err(Response::error(
+                        400,
+                        "Give both packet and field, or neither",
+                    ));
+                }
+            };
+            Ok(Command::Series {
+                window: window(req)?,
+                buckets: int(req, "buckets")?.clamp(1, 4000),
+                lane: int(req, "lane")?,
+                field,
+            })
+        }
         (Method::Get, "/api/packet") => Ok(Command::Packet {
             id: int(req, "id")?,
         }),
@@ -246,8 +273,9 @@ pub fn route(guard: &Guard, req: &Request) -> Result<Command, Response> {
         }
         (
             _,
-            "/api/runs" | "/api/run" | "/api/density" | "/api/items" | "/api/packet" | "/api/log"
-            | "/api/search" | "/api/browse" | "/api/query" | "/api/ingest",
+            "/api/runs" | "/api/run" | "/api/density" | "/api/items" | "/api/series"
+            | "/api/packet" | "/api/log" | "/api/search" | "/api/browse" | "/api/query"
+            | "/api/ingest",
         ) => Err(Response::error(405, "Method not allowed")),
         _ => Err(Response::error(404, "Not found")),
     }
@@ -314,8 +342,16 @@ impl Extent {
     }
 }
 
-/// Everything the page needs to draw a run: clocks, lanes, files, findings.
-pub fn render_run(run: &Table, lanes: &Table, files: &Table, findings: &Table) -> Response {
+/// Everything the page needs to draw a run: clocks, lanes, files, findings,
+/// and what there is to plot. `series` has columns lane, packet, field,
+/// count: the kept fields with numbers stored.
+pub fn render_run(
+    run: &Table,
+    lanes: &Table,
+    files: &Table,
+    findings: &Table,
+    series: &Table,
+) -> Response {
     let Some(run_row) = run.rows.first() else {
         return Response::error(404, "Run not found");
     };
@@ -361,6 +397,31 @@ pub fn render_run(run: &Table, lanes: &Table, files: &Table, findings: &Table) -
         })
         .collect();
 
+    // A lane whose packets have both a receive time and a time of their
+    // own can show how far apart the two are.
+    let mut series_list: Vec<Value> = lanes
+        .rows
+        .iter()
+        .filter(|r| text(r, 2) != LANE_LOG)
+        .filter(|r| opt_int(r, 9).unwrap_or(0) > 0 && opt_int(r, 12).unwrap_or(0) > 0)
+        .map(|r| json!({ "lane": cell(r, 0), "kind": "lag", "unit": "ms" }))
+        .collect();
+    series_list.extend(series.rows.iter().map(|r| {
+        let def = config
+            .packets
+            .iter()
+            .filter(|d| d.name == text(r, 1))
+            .find_map(|d| d.fields.iter().find(|f| f.name == text(r, 2)));
+        json!({
+            "lane": cell(r, 0), "kind": "value",
+            "packet": cell(r, 1), "field": cell(r, 2), "count": cell(r, 3),
+            "unit": def.map_or("", |f| f.unit.as_str()),
+            "limits": def.and_then(|f| f.limits).map(|l| {
+                json!([l.red_low, l.yellow_low, l.yellow_high, l.red_high])
+            }),
+        })
+    }));
+
     let file_list: Vec<Value> = files
         .rows
         .iter()
@@ -392,6 +453,7 @@ pub fn render_run(run: &Table, lanes: &Table, files: &Table, findings: &Table) -
             "id": cell(run_row, 0), "root": cell(run_row, 1),
             "clocks": { "receive": receive.json(), "packet": packet.json(), "order": order.json() },
             "lanes": lane_list, "files": file_list, "findings": finding_list,
+            "series": series_list,
         }),
     )
 }
@@ -415,6 +477,37 @@ pub fn render_density(window: &Window, width: i64, tables: &[&Table]) -> Respons
         &json!({
             "from": window.from.saturating_sub(window.origin),
             "width": width, "total": total, "lanes": lanes,
+        }),
+    )
+}
+
+/// One line to plot: for each bucket that has values, its number, the
+/// lowest and highest value in it, and how many there were. Buckets are
+/// `width` wide and counted from `from`, which is relative to the window's
+/// origin. A value that is not a finite number is left out.
+pub fn render_series(window: &Window, width: i64, buckets: &Table) -> Response {
+    let real = |c: &Cell| match c {
+        Cell::Real(v) if v.is_finite() => Some(*v),
+        Cell::Int(v) => Some(*v as f64),
+        _ => None,
+    };
+    let points: Vec<Value> = buckets
+        .rows
+        .iter()
+        .filter_map(|r| {
+            Some(json!([
+                opt_int(r, 0)?,
+                real(cell(r, 1))?,
+                real(cell(r, 2))?,
+                opt_int(r, 3)?
+            ]))
+        })
+        .collect();
+    Response::json(
+        200,
+        &json!({
+            "from": window.from.saturating_sub(window.origin),
+            "width": width, "points": points,
         }),
     )
 }
@@ -747,9 +840,19 @@ mod tests {
         let run = table(vec![vec![
             Int(1),
             t("/r"),
-            t("[[packet]]\napid = 100\nname = \"HK\""),
+            t(
+                "[[packet]]\napid = 100\nname = \"HK\"\n[[packet.field]]\nname = \"TEMP\"\n\
+               bit_offset = 48\nbit_length = 8\nunit = \"C\"\nkeep = true\n\
+               limits = { red_low = -10, yellow_low = 0, yellow_high = 40, red_high = 50 }",
+            ),
             Int(0),
         ]]);
+        // TEMP is still in the configuration; GONE was kept at ingest and
+        // has since been taken out of it.
+        let series = table(vec![
+            vec![Int(5), t("HK"), t("TEMP"), Int(4)],
+            vec![Int(5), t("HK"), t("GONE"), Int(2)],
+        ]);
         let lanes = table(vec![
             vec![
                 Int(5),
@@ -800,9 +903,22 @@ mod tests {
             Null,
             t("a/t.bin"),
         ]]);
-        let body: Value =
-            serde_json::from_slice(&render_run(&run, &lanes, &table(vec![]), &findings).body)
-                .unwrap();
+        let body: Value = serde_json::from_slice(
+            &render_run(&run, &lanes, &table(vec![]), &findings, &series).body,
+        )
+        .unwrap();
+        // No lane here has both a receive time and a time of its own, so
+        // there is no lag to plot; the kept fields bring their unit and
+        // limits from the configuration, where it still has them.
+        assert_eq!(
+            body["series"],
+            json!([
+                {"lane": 5, "kind": "value", "packet": "HK", "field": "TEMP", "count": 4,
+                 "unit": "C", "limits": [-10.0, 0.0, 40.0, 50.0]},
+                {"lane": 5, "kind": "value", "packet": "HK", "field": "GONE", "count": 2,
+                 "unit": "", "limits": null},
+            ])
+        );
         assert_eq!(
             body["clocks"]["receive"],
             json!({"origin": "900", "span": 1100, "count": 14})
@@ -825,8 +941,59 @@ mod tests {
         assert_eq!(body["findings"][0]["packetTime"], Value::Null);
         assert_eq!(body["findings"][0]["order"], 4);
         assert_eq!(
-            render_run(&table(vec![]), &lanes, &table(vec![]), &findings).status,
+            render_run(&table(vec![]), &lanes, &table(vec![]), &findings, &series).status,
             404
+        );
+    }
+
+    #[test]
+    fn series_requests_and_responses() {
+        let cmd = get(
+            "/api/series?run=2&clock=packet&origin=1000&from=0&to=500&buckets=50&lane=7&packet=HK&field=TEMP",
+            TOKEN,
+        );
+        let window = Window {
+            run: 2,
+            clock: Clock::Packet,
+            origin: 1000,
+            from: 1000,
+            to: 1500,
+        };
+        assert_eq!(
+            cmd,
+            Ok(Command::Series {
+                window,
+                buckets: 50,
+                lane: 7,
+                field: Some(("HK".to_string(), "TEMP".to_string())),
+            })
+        );
+        let base = "/api/series?run=2&clock=packet&origin=1000&from=0&to=500&buckets=50";
+        assert_eq!(
+            get(&format!("{base}&lane=7"), TOKEN),
+            Ok(Command::Series {
+                window,
+                buckets: 50,
+                lane: 7,
+                field: None,
+            })
+        );
+        assert_eq!(get(&format!("{base}&lane=7&field=TEMP"), TOKEN), Err(400));
+        assert_eq!(get(base, TOKEN), Err(400));
+
+        // Buckets come back as they are, less any whose values are not
+        // finite numbers, which a plot cannot place.
+        use Cell::{Int, Null, Real};
+        let rows = table(vec![
+            vec![Int(0), Real(1.5), Real(2.5), Int(3)],
+            vec![Int(4), Int(7), Int(7), Int(1)],
+            vec![Int(5), Real(f64::INFINITY), Real(f64::INFINITY), Int(1)],
+            vec![Int(6), Null, Null, Int(1)],
+        ]);
+        let body: Value = serde_json::from_slice(&render_series(&window, 10, &rows).body).unwrap();
+        assert_eq!(
+            body,
+            json!({"from": 0, "width": 10, "points": [[0, 1.5, 2.5, 3], [4, 7.0, 7.0, 1]]})
         );
     }
 

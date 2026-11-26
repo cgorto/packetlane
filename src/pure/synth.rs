@@ -323,12 +323,14 @@ description = "Unit housekeeping, once a second"
   name = "CYCLE"
   bit_offset = 104
   bit_length = 16
+  keep = true                 # stored for every packet: searchable and plottable
   [[packet.field]]
   name = "BUS_VOLTS"
   bit_offset = 120
   bit_length = 32
   kind = "float"
   unit = "V"
+  keep = true
   [[packet.field]]
   name = "FLAGS"
   bit_offset = 152

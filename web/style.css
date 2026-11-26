@@ -91,3 +91,15 @@ dialog::backdrop { background: #0009; }
 .qb-filter input { width: 150px; }
 #qb-limit { width: 72px; }
 #qb-desc.on { background: #2f3643; border-color: var(--dim); }
+#add-plot { max-width: 200px; }
+#plots { flex: none; max-height: 55%; overflow-y: auto; overflow-x: hidden; border-top: 1px solid var(--line); }
+#plots:empty { display: none; }
+.plot { display: flex; height: 96px; border-bottom: 1px solid var(--line); }
+.plot:last-child { border-bottom: 0; }
+.plot-label { width: var(--labels); flex: none; min-width: 0; padding: 4px 26px 4px 14px; display: flex; flex-direction: column; position: relative; }
+.plot-label div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plot-label .name { font-weight: 600; }
+.plot-label .sub { color: var(--dim); font-size: 11px; }
+.plot-label .now { margin-top: auto; font-size: 12px; font-variant-numeric: tabular-nums; }
+.plot-label button { position: absolute; right: 4px; top: 3px; padding: 0 5px; line-height: 16px; border: 0; background: none; color: var(--dim); }
+.plot canvas { flex: 1; min-width: 0; height: 100%; display: block; cursor: grab; }

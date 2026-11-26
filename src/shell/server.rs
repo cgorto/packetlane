@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::pure::api::{
     self, Command, Guard, packet_location, render_density, render_items, render_log, render_packet,
-    render_query, render_run, render_runs, render_search,
+    render_query, render_run, render_runs, render_search, render_series,
 };
 use crate::pure::checksum::fnv1a;
 use crate::pure::config::Config;
@@ -235,6 +235,7 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
                 &store.query(&sql::run_lanes(run), 100_000)?,
                 &store.query(&sql::run_files(run), 100_000)?,
                 &store.query(&sql::run_findings(run), 10_000)?,
+                &store.query(&sql::run_series(run), 10_000)?,
             )
         }
         Command::Density { window, buckets } => {
@@ -265,6 +266,22 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
                 None => None,
             };
             render_items(w, &packets, logs.as_ref())
+        }
+        Command::Series {
+            window,
+            buckets,
+            lane,
+            field,
+        } => {
+            let w = &window;
+            let query = match &field {
+                Some((packet, field)) => {
+                    sql::value_series(w.run, w.clock, lane, packet, field, w.from, w.to, buckets)
+                }
+                None => sql::lag_series(w.run, w.clock, lane, w.from, w.to, buckets),
+            };
+            let table = reader()?.query(&query, 4001)?;
+            render_series(w, bucket_width(w.from, w.to, buckets), &table)
         }
         Command::Packet { id } => {
             let store = reader()?;

@@ -136,8 +136,21 @@ Limits of working from counters alone are listed at the top of
 - Three clocks: **Receive** (when each host logged it), **Packet** (the
   packet's own timestamp) and **Order** (order of ingest, for packets with no
   usable time).
-- The view (run, clock, range, lanes, selection, search) is kept in the
-  address, so it can be bookmarked while the server is running.
+- **Plots** sit under the lanes on the same time axis. The **Plot…** menu
+  lists what the run can plot:
+  - any field marked `keep = true` in its packet definition, as its
+    engineering value, with the definition's limits shaded behind it;
+  - for any lane whose packets carry a time of their own, **receive − packet
+    time** in milliseconds: how long after the packet was stamped the host
+    logged it. A paused, restarted or stalled simulator shows here without
+    any packet definitions.
+
+  Zoomed out, each pixel column shows the lowest and highest value that
+  fell in it, so a one-packet spike is not averaged away. The lane's
+  findings are drawn as vertical lines, and the pointer marks the same
+  moment on every plot.
+- The view (run, clock, range, lanes, plots, selection, search) is kept in
+  the address, so it can be bookmarked while the server is running.
 
 The UI carries almost no text, so the controls are listed here:
 
@@ -154,6 +167,8 @@ The UI carries almost no text, so the controls are listed here:
 | `n` `p` | next and previous finding |
 | drag in the strip at the bottom | move the view |
 | ○ and ✕ on a lane | pin it to the top; hide it |
+| **Plot…** menu; ✕ on a plot | add a plot; remove it |
+| wheel, drag or double-click on a plot | zoom, pan or fit, as on the lanes |
 | `/` | search |
 | `Esc` | clear the selection |
 
@@ -257,8 +272,9 @@ been built here.
 - **Live tail** of a log that is still being written.
 - **Problem report export** to attach to a ticket.
 - Reed-Solomon error correction of transfer frames, and TC frames.
-- Decoded field values are shown per packet, and those of fields marked
-  `keep` can be searched with SQL; they cannot be plotted.
+- Plots show one series each: no overlaying two fields, no fixed or shared
+  value scale, no markers for commands, no export. Only fields marked `keep`
+  before ingest can be plotted.
 - Packet definitions cover fixed-size numbers, text and arrays, polynomial
   conversions and one set of limits. Not covered: little-endian bit fields,
   items placed from the end of a packet, other conversions, and telling

@@ -1565,3 +1565,108 @@ name = "INST COLLECT"
         assert_eq!(body["length_field_ok"], length_ok);
     }
 }
+
+#[test]
+fn kept_fields_and_arrival_delay_can_be_plotted() {
+    let scratch = Scratch::new();
+    let run = scratch.demo();
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    drop(store);
+    let get = serve(db, run);
+
+    let meta = get("/api/run?run=1");
+    let lane = |source: &str, apid: u64| {
+        meta["lanes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["source"] == source && l["apid"] == apid)
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let (bench_hk, ground_hk, ground_cmd) = (
+        lane("bench-a", 100),
+        lane("ground", 100),
+        lane("ground", 200),
+    );
+    let series = meta["series"].as_array().unwrap();
+    let has = |lane: i64, kind: &str, field: &str| {
+        series.iter().any(|s| {
+            s["lane"] == lane && s["kind"] == kind && (kind == "lag" || s["field"] == field)
+        })
+    };
+    // The demo keeps two housekeeping fields, on each host that logged them.
+    for lane in [bench_hk, ground_hk] {
+        assert!(has(lane, "value", "BUS_VOLTS") && has(lane, "value", "CYCLE"));
+        assert!(has(lane, "lag", ""));
+    }
+    let volts = series
+        .iter()
+        .find(|s| s["lane"] == bench_hk && s["field"] == "BUS_VOLTS")
+        .unwrap();
+    assert_eq!(volts["unit"], "V");
+    assert_eq!(volts["count"], 60);
+    // Commands carry no time of their own, so there is no delay to plot.
+    assert!(!has(ground_cmd, "lag", ""));
+
+    let origin = meta["clocks"]["receive"]["origin"].as_str().unwrap();
+    let window = format!("run=1&clock=receive&origin={origin}&from=0&to=60000000000");
+    let points = |query: &str| -> Vec<(i64, f64, f64, i64)> {
+        get(&format!("/api/series?{window}&{query}"))["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p[0].as_i64().unwrap(),
+                    p[1].as_f64().unwrap(),
+                    p[2].as_f64().unwrap(),
+                    p[3].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    };
+
+    // Six ten-second buckets of a voltage that ramps from 28.0 to 28.3 V
+    // every seven seconds: each holds the whole range.
+    let volts = points(&format!(
+        "buckets=6&lane={bench_hk}&packet=SIM_HK&field=BUS_VOLTS"
+    ));
+    assert_eq!(volts.len(), 6);
+    assert_eq!(volts.iter().map(|p| p.3).sum::<i64>(), 60);
+    for (i, p) in volts.iter().enumerate() {
+        assert_eq!(p.0, i as i64);
+        assert!(
+            (p.1 - 28.0).abs() < 1e-5 && (p.2 - 28.3).abs() < 1e-5,
+            "{p:?}"
+        );
+    }
+    // Fine enough buckets hold one packet each, and so one value.
+    let cycle = points(&format!(
+        "buckets=600&lane={bench_hk}&packet=SIM_HK&field=CYCLE"
+    ));
+    assert_eq!(cycle.len(), 60);
+    assert!(cycle.iter().all(|p| p.1 == p.2 && p.3 == 1));
+    assert!(cycle.windows(2).all(|w| w[1].1 == w[0].1 + 1.0));
+
+    // With no field named, the line is receive time less packet time, in
+    // milliseconds. The bench logs its unit a millisecond after the stamp.
+    let lag = points(&format!("buckets=6&lane={bench_hk}"));
+    assert_eq!(lag.iter().map(|p| p.3).sum::<i64>(), 60);
+    assert!(lag.iter().all(|p| p.1 == 1.0 && p.2 == 1.0), "{lag:?}");
+    // The ground station hears it later, and its clock is corrected first.
+    let lag = points(&format!("buckets=6&lane={ground_hk}"));
+    assert!(lag.iter().all(|p| p.1 == 40.0 && p.2 == 40.0), "{lag:?}");
+
+    // A lane of another run, or a field that was not kept, has no points.
+    assert!(
+        points(&format!(
+            "buckets=6&lane={bench_hk}&packet=SIM_HK&field=MODE"
+        ))
+        .is_empty()
+    );
+    assert!(points("buckets=6&lane=999999").is_empty());
+}

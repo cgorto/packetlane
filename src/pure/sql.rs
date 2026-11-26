@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS field_values (
 );
 CREATE INDEX IF NOT EXISTS field_values_field ON field_values (field, num);
 CREATE INDEX IF NOT EXISTS field_values_file ON field_values (file_id);
+CREATE INDEX IF NOT EXISTS field_values_packet ON field_values (packet_id);
 DROP VIEW IF EXISTS value_view;
 CREATE VIEW value_view AS
   SELECT v.packet_id AS id, r.root AS run, l.source, f.rel AS file, p.apid, v.packet, v.field,
@@ -403,6 +404,78 @@ pub fn log_density(run: i64, clock: Clock, from: i64, to: i64, buckets: i64) -> 
             run.into(),
         ],
     ))
+}
+
+/// What a run has to plot from kept fields: every lane, packet name and
+/// field with numbers stored. Columns: lane, packet, field, count.
+pub fn run_series(run: i64) -> Query {
+    Query::new(
+        "SELECT p.lane_id, v.packet, v.field, COUNT(*)
+         FROM field_values v JOIN packets p ON p.id = v.packet_id
+         WHERE v.num IS NOT NULL AND v.file_id IN (SELECT id FROM files WHERE run_id = ?)
+         GROUP BY p.lane_id, v.packet, v.field
+         ORDER BY p.lane_id, v.packet, v.field",
+        vec![run.into()],
+    )
+}
+
+/// One kept field of one lane over a window, reduced to the lowest and
+/// highest value in each bucket. Columns: bucket, min, max, count.
+#[allow(clippy::too_many_arguments)]
+pub fn value_series(
+    run: i64,
+    clock: Clock,
+    lane: i64,
+    packet: &str,
+    field: &str,
+    from: i64,
+    to: i64,
+    buckets: i64,
+) -> Query {
+    let c = clock.packet_column();
+    Query::new(
+        format!(
+            "SELECT (p.{c} - ?) / ? AS b, MIN(v.num), MAX(v.num), COUNT(*)
+             FROM packets p JOIN field_values v ON v.packet_id = p.id
+             WHERE p.lane_id = ? AND p.lane_id IN {RUN_LANES} AND p.{c} BETWEEN ? AND ?
+               AND v.packet = ? AND v.field = ? AND v.num IS NOT NULL
+             GROUP BY b ORDER BY b"
+        ),
+        vec![
+            from.into(),
+            bucket_width(from, to, buckets).into(),
+            lane.into(),
+            run.into(),
+            from.into(),
+            to.into(),
+            packet.into(),
+            field.into(),
+        ],
+    )
+}
+
+/// How long after its own time each packet of a lane was received, in
+/// milliseconds, by bucket. Columns: bucket, min, max, count.
+pub fn lag_series(run: i64, clock: Clock, lane: i64, from: i64, to: i64, buckets: i64) -> Query {
+    let c = clock.packet_column();
+    Query::new(
+        format!(
+            "SELECT ({c} - ?) / ? AS b, MIN(receive_ns - packet_ns) / 1000000.0,
+                    MAX(receive_ns - packet_ns) / 1000000.0, COUNT(*)
+             FROM packets
+             WHERE lane_id = ? AND lane_id IN {RUN_LANES} AND {c} BETWEEN ? AND ?
+               AND receive_ns IS NOT NULL AND packet_ns IS NOT NULL
+             GROUP BY b ORDER BY b"
+        ),
+        vec![
+            from.into(),
+            bucket_width(from, to, buckets).into(),
+            lane.into(),
+            run.into(),
+            from.into(),
+            to.into(),
+        ],
+    )
 }
 
 /// Individual packets in a window. Columns: id, lane, time, seq, length.

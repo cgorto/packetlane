@@ -6,6 +6,7 @@ const $ = (id) => document.getElementById(id);
 const token = new URLSearchParams(location.search).get("t") || "";
 const ROW = 22;
 const ITEM_LIMIT = 1500;
+const PLOT_COLORS = { lag: "#9ad17a", red: "#ff5d5d", yellow: "#ffd84a" };
 const COLORS = { tm: "#5aa9ff", tc: "#ffb454", log: "#9ad17a", other: "#b48ef0",
   problem: "#ff5d5d", info: "#6fb3ff", hit: "#ffd84a", line: "#2a2f38", dim: "#8a919e", text: "#d7dae0" };
 const TIME_KEY = { receive: "receive", packet: "packetTime", order: "order" };
@@ -15,6 +16,9 @@ const S = {
   dens: null, items: null, over: null, rows: [], hidden: new Set(), pinned: new Set(),
   sel: null, finding: null, hits: [], q: "", tab: "problems", drag: null, measure: null,
   focus: 0, seq: 0, runSeq: 0, askSeq: 0, cwd: null,
+  // Plots under the timeline: { key, series, data, canvas, g, now }. `cursor`
+  // is the time under the pointer, which every plot marks.
+  plots: [], cursor: null,
 };
 
 // ---- server ----------------------------------------------------------------
@@ -169,6 +173,7 @@ function sizeCanvases() {
   G.tl = fitCanvas($("tl"), Math.max(ROW, S.rows.length * ROW));
   G.axis = fitCanvas($("axis"));
   G.over = fitCanvas($("over"));
+  for (const pl of S.plots) if (pl.canvas) pl.g = fitCanvas(pl.canvas);
 }
 
 const X = (t) => (t - S.view[0]) / (S.view[1] - S.view[0]) * G.tl.w;
@@ -181,6 +186,7 @@ function draw() {
   drawAxis();
   drawLanes();
   drawOverview();
+  drawPlots();
 }
 
 function drawAxis() {
@@ -267,6 +273,10 @@ function drawLanes() {
     ctx.strokeRect(x - 4, r.y + 2, 8, ROW - 4);
     ctx.lineWidth = 1;
   }
+  if (S.cursor !== null && S.plots.length) {
+    ctx.fillStyle = "#ffffff30";
+    ctx.fillRect(Math.round(X(S.cursor)), 0, 1, h);
+  }
   const band = S.drag && (S.drag.mode === "zoom" || S.drag.mode === "measure") ? S.drag : S.measure;
   if (band) {
     const a = X(band.t0), b = X(band.t1);
@@ -313,6 +323,252 @@ function drawOverview() {
   ctx.strokeRect(a + 0.5, 0.5, Math.max(2, b - a) - 1, h - 1);
 }
 
+// ---- plots -----------------------------------------------------------------
+// A plot is one series against the timeline's own time axis: a kept field
+// of one lane, or how long after its own time each packet was received.
+
+const seriesKey = (s) => s.lane + "|" + encodeURIComponent(s.packet || "") + "|" + encodeURIComponent(s.field || "");
+const laneById = (id) => S.meta.lanes.find((l) => l.id === id);
+const seriesName = (s) => s.kind === "lag" ? "Receive \u2212 packet time" : s.field;
+function seriesSub(s) {
+  const l = laneById(s.lane);
+  return (s.kind === "lag" ? laneName(l) : s.packet) + " \u00b7 " + l.source;
+}
+function fmtNum(v) {
+  const a = Math.abs(v);
+  return a !== 0 && (a >= 1e7 || a < 1e-4) ? v.toExponential(3) : String(Number(v.toPrecision(6)));
+}
+function niceStep(raw) {
+  const p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
+}
+
+function renderPlotMenu() {
+  const el = $("add-plot");
+  el.textContent = "";
+  // Fields first, then the delays, within each source.
+  const series = S.meta ? S.meta.series.filter((s) => laneById(s.lane)).sort((a, b) => (a.kind === "lag") - (b.kind === "lag")) : [];
+  el.hidden = series.length === 0;
+  option(el, "Plot\u2026").value = "";
+  const groups = new Map();
+  for (const s of series) {
+    const source = laneById(s.lane).source;
+    if (!groups.has(source)) { const g = document.createElement("optgroup"); g.label = source; groups.set(source, g); el.append(g); }
+    const o = document.createElement("option");
+    o.value = seriesKey(s);
+    o.textContent = s.kind === "lag" ? laneName(laneById(s.lane)) + ": receive \u2212 packet time" : s.packet + " " + s.field + (s.unit ? " (" + s.unit + ")" : "");
+    groups.get(source).append(o);
+  }
+}
+
+// Adds the series with this key, if the run has it and it is not shown.
+function addPlot(key, quiet) {
+  const series = S.meta && S.meta.series.find((s) => seriesKey(s) === key && laneById(s.lane));
+  if (!series || S.plots.some((pl) => pl.key === key)) return;
+  S.plots.push({ key, series, data: null });
+  if (quiet) return;
+  renderPlots();
+  loadPlots(S.seq);
+  saveHash();
+}
+
+function renderPlots() {
+  const box = $("plots");
+  box.textContent = "";
+  for (const pl of S.plots) {
+    const s = pl.series;
+    const row = document.createElement("div");
+    row.className = "plot";
+    const label = document.createElement("div");
+    label.className = "plot-label";
+    const line = (cls, text) => { const d = document.createElement("div"); d.className = cls; d.textContent = text; label.append(d); return d; };
+    line("name", seriesName(s));
+    line("sub", seriesSub(s));
+    pl.now = line("now", "");
+    const close = document.createElement("button");
+    close.textContent = "\u2715";
+    close.setAttribute("aria-label", "Remove plot");
+    close.onclick = () => { S.plots = S.plots.filter((p) => p !== pl); renderPlots(); draw(); saveHash(); };
+    label.append(close);
+    pl.canvas = document.createElement("canvas");
+    wirePlot(pl);
+    row.append(label, pl.canvas);
+    box.append(row);
+  }
+  // The plots take their height from the lanes above them.
+  sizeCanvases();
+  draw();
+}
+
+// Fetches every plot for half a view either side of what is showing, so
+// that a pan has something to show before the next answer arrives.
+async function loadPlots(seq) {
+  const info = clockInfo();
+  if (!S.plots.length || !S.meta || !info || info.origin === null) return;
+  const p = windowParams(), half = Math.ceil((p.to - p.from) / 2);
+  const q = { ...p, from: p.from - half, to: p.to + half, buckets: Math.min(4000, Math.max(100, Math.floor(G.tl.w))) };
+  await Promise.all(S.plots.map(async (pl) => {
+    const s = pl.series, ask = { ...q, lane: s.lane };
+    if (s.kind === "value") { ask.packet = s.packet; ask.field = s.field; }
+    try {
+      const data = await api("series", ask);
+      if (seq !== S.seq) return;
+      pl.data = data; pl.error = null;
+    } catch (e) {
+      if (seq !== S.seq) return;
+      pl.error = e.message;
+    }
+    drawPlot(pl);
+  })).catch(() => {});
+}
+
+function drawPlots() { for (const pl of S.plots) drawPlot(pl); }
+
+function drawPlot(pl) {
+  if (!pl.g) return;
+  const { ctx, w, h } = pl.g, s = pl.series, d = pl.data;
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.textBaseline = "middle";
+  pl.pts = [];
+  const note = (text) => { ctx.fillStyle = COLORS.dim; ctx.fillText(text, 8, h / 2); pl.now.textContent = ""; };
+  if (pl.error) return note(pl.error);
+  if (!d) return note("Loading");
+
+  // One point per bucket: x, lowest, highest, how many, bucket number.
+  let lo = Infinity, hi = -Infinity, showing = 0;
+  for (const [b, mn, mx, n] of d.points) {
+    const x = X(d.from + (b + 0.5) * d.width);
+    pl.pts.push([x, mn, mx, n, b]);
+    if (x >= 0 && x <= w) { showing++; if (mn < lo) lo = mn; if (mx > hi) hi = mx; }
+  }
+  if (!showing) return note("No values in view");
+  const pad = (hi - lo) * 0.12 || Math.max(Math.abs(hi) * 0.05, 0.5);
+  const y0 = lo - pad, y1 = hi + pad, top = 3, bot = h - 3;
+  const Y = (v) => bot - (v - y0) / (y1 - y0) * (bot - top);
+  const edge = (v) => v === Infinity ? 0 : v === -Infinity ? h : Math.min(h, Math.max(0, Y(v)));
+
+  if (s.limits) {
+    const [redLow, yellowLow, yellowHigh, redHigh] = s.limits;
+    const band = (from, to, color) => {
+      const a = edge(to), b = edge(from);
+      if (b - a > 0) { ctx.fillStyle = color; ctx.fillRect(0, a, w, b - a); }
+    };
+    band(redHigh, Infinity, PLOT_COLORS.red + "26");
+    band(-Infinity, redLow, PLOT_COLORS.red + "26");
+    band(yellowHigh, redHigh, PLOT_COLORS.yellow + "1c");
+    band(redLow, yellowLow, PLOT_COLORS.yellow + "1c");
+  }
+
+  const step = niceStep((y1 - y0) / 3), ticks = [];
+  for (let v = Math.ceil(y0 / step) * step; v <= y1; v += step) {
+    const y = Math.round(Y(v)) + 0.5;
+    ctx.fillStyle = COLORS.line;
+    ctx.fillRect(0, y, w, 0.5);
+    ticks.push([y, fmtNum(Math.abs(v) < step / 1e6 ? 0 : v)]);
+  }
+
+  // What was found on this lane, where it was found.
+  for (const f of S.meta.findings) {
+    const t = f[TIME_KEY[S.clock]];
+    if (f.lane !== s.lane || t === null || t === undefined) continue;
+    const x = X(t);
+    if (x < 0 || x > w) continue;
+    ctx.fillStyle = (f.severity === "problem" ? COLORS.problem : COLORS.info) + "99";
+    ctx.fillRect(Math.round(x), 0, 1, h);
+  }
+
+  // The line breaks where the values stop for much longer than they are
+  // usually apart, so that a silence does not look like a slope.
+  const gaps = [];
+  for (let i = 1; i < pl.pts.length; i++) gaps.push(pl.pts[i][4] - pl.pts[i - 1][4]);
+  gaps.sort((a, b) => a - b);
+  const apart = Math.max(3, (gaps[gaps.length >> 1] || 1) * 4);
+  const color = s.kind === "lag" ? PLOT_COLORS.lag : laneColor(laneById(s.lane));
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 1.25;
+  ctx.beginPath();
+  let before = null, lastY = null;
+  for (const [x, mn, mx, , b] of pl.pts) {
+    const a = Y(mn), c = Y(mx);
+    // Enter each bucket at whichever end is nearer where the last one left.
+    const first = lastY !== null && Math.abs(lastY - c) < Math.abs(lastY - a) ? c : a, second = first === a ? c : a;
+    if (before === null || b - before > apart) ctx.moveTo(x, first); else ctx.lineTo(x, first);
+    if (second !== first) ctx.lineTo(x, second);
+    lastY = second; before = b;
+  }
+  ctx.stroke();
+  ctx.lineWidth = 1;
+  const dot = showing <= w / 10 ? 2 : 0.75;
+  for (const [x, mn, mx] of pl.pts) {
+    if (x < -3 || x > w + 3) continue;
+    ctx.fillRect(x - dot, Y(mx) - dot, dot * 2, Y(mn) - Y(mx) + dot * 2);
+  }
+
+  // Scale labels go on last, on a patch of background, so that the line
+  // does not run through them. One too near the top edge is left out.
+  for (const [y, text] of ticks) {
+    if (y < 14) continue;
+    ctx.fillStyle = "#14161acc";
+    ctx.fillRect(2, y - 13, ctx.measureText(text).width + 5, 12);
+    ctx.fillStyle = COLORS.dim;
+    ctx.fillText(text, 4, y - 6);
+  }
+
+  if (S.sel && S.sel.t !== null && S.sel.lane === s.lane) {
+    ctx.fillStyle = COLORS.text;
+    ctx.fillRect(Math.round(X(S.sel.t)), 0, 1, h);
+  }
+  const unit = s.unit ? " " + s.unit : "";
+  const near = S.cursor === null ? null : plotPointAt(pl, X(S.cursor));
+  if (S.cursor !== null) {
+    ctx.fillStyle = "#ffffff30";
+    ctx.fillRect(Math.round(X(S.cursor)), 0, 1, h);
+  }
+  if (near) {
+    ctx.fillStyle = COLORS.text;
+    ctx.beginPath(); ctx.arc(near[0], Y((near[1] + near[2]) / 2), 3, 0, 7); ctx.fill();
+  }
+  pl.now.textContent = near ? plotValue(near) + unit : fmtNum(lo) + " to " + fmtNum(hi) + unit;
+}
+
+function plotPointAt(pl, x) {
+  let best = null, dist = 10;
+  for (const p of pl.pts || []) { const d = Math.abs(p[0] - x); if (d < dist) { dist = d; best = p; } }
+  return best;
+}
+const plotValue = (p) => p[1] === p[2] ? fmtNum(p[1]) : fmtNum(p[1]) + " to " + fmtNum(p[2]) + " (" + p[3] + " values)";
+
+function wirePlot(pl) {
+  const el = pl.canvas;
+  let drag = null;
+  el.addEventListener("wheel", (e) => wheelTime(e, el), { passive: false });
+  el.addEventListener("pointerdown", (e) => {
+    el.setPointerCapture(e.pointerId);
+    drag = { x: pos(e, el)[0], view: S.view.slice() };
+  });
+  el.addEventListener("pointermove", (e) => {
+    const [x] = pos(e, el);
+    if (drag) {
+      const dt = (x - drag.x) / G.tl.w * (drag.view[1] - drag.view[0]);
+      S.view = [drag.view[0] - dt, drag.view[1] - dt];
+      S.focus = 0;
+      S.cursor = null;
+      showTip(e, "");
+      viewChanged();
+      return;
+    }
+    S.cursor = T(x);
+    draw();
+    const near = plotPointAt(pl, x), unit = pl.series.unit ? " " + pl.series.unit : "";
+    showTip(e, formatTime(S.cursor, (S.view[1] - S.view[0]) / 400) + (near ? "\n" + plotValue(near) + unit : ""));
+  });
+  el.addEventListener("pointerup", () => { drag = null; });
+  el.addEventListener("pointerleave", (e) => { showTip(e, ""); if (S.cursor !== null) { S.cursor = null; draw(); } });
+  el.addEventListener("dblclick", fit);
+}
+
 // ---- data ------------------------------------------------------------------
 
 let fetchTimer = 0;
@@ -348,6 +604,7 @@ async function loadView() {
   if (!S.meta || !info || info.origin === null) { S.dens = S.items = null; draw(); return; }
   const seq = ++S.seq;
   const p = windowParams();
+  loadPlots(seq);
   try {
     const dens = await api("density", { ...p, buckets: Math.max(50, Math.floor(G.tl.w / 3)) });
     if (seq !== S.seq) return;
@@ -417,6 +674,12 @@ async function loadRun(id, keep) {
   if (mine !== S.runSeq) return;
   S.meta = meta;
   S.sel = null; S.finding = null; S.dens = null; S.items = null; S.measure = null;
+  // Plots stay across a reload of the same run, where it still has them.
+  const had = keep ? S.plots.map((pl) => pl.key) : [];
+  S.plots = [];
+  for (const key of had) addPlot(key, true);
+  renderPlotMenu();
+  renderPlots();
   if (!keep) {
     S.hidden.clear(); S.pinned.clear();
     const c = S.meta.clocks;
@@ -434,6 +697,7 @@ function setClock(clock, keepView) {
     b.disabled = !S.meta || S.meta.clocks[b.dataset.clock].count === 0;
   }
   S.dens = null; S.items = null; S.measure = null;
+  for (const pl of S.plots) pl.data = null;
   layout();
   loadOverview().catch(() => {});
   if (keepView) viewChanged(); else fit();
@@ -661,23 +925,27 @@ function showTip(e, text) {
 
 function pos(e, el) { const b = el.getBoundingClientRect(); return [e.clientX - b.left, e.clientY - b.top]; }
 
+// The wheel over anything drawn against the time axis: sideways pans, up
+// and down zooms about the pointer.
+function wheelTime(e, el) {
+  e.preventDefault();
+  const [x] = pos(e, el);
+  const span = S.view[1] - S.view[0];
+  if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+    const dt = e.deltaX / G.tl.w * span;
+    S.view = [S.view[0] + dt, S.view[1] + dt];
+  } else {
+    const k = Math.exp(e.deltaY * 0.0015), t = T(x);
+    const next = Math.max(span * k, S.clock === "order" ? 4 : 2000);
+    S.view = [t - (t - S.view[0]) * next / span, t + (S.view[1] - t) * next / span];
+  }
+  S.focus = 0;
+  viewChanged();
+}
+
 function wirePointer() {
   const tl = $("tl");
-  tl.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    const [x] = pos(e, tl);
-    const span = S.view[1] - S.view[0];
-    if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
-      const dt = e.deltaX / G.tl.w * span;
-      S.view = [S.view[0] + dt, S.view[1] + dt];
-    } else {
-      const k = Math.exp(e.deltaY * 0.0015), t = T(x);
-      const next = Math.max(span * k, S.clock === "order" ? 4 : 2000);
-      S.view = [t - (t - S.view[0]) * next / span, t + (S.view[1] - t) * next / span];
-    }
-    S.focus = 0;
-    viewChanged();
-  }, { passive: false });
+  tl.addEventListener("wheel", (e) => wheelTime(e, tl), { passive: false });
 
   tl.addEventListener("pointerdown", (e) => {
     const [x, y] = pos(e, tl);
@@ -700,6 +968,7 @@ function wirePointer() {
       showTip(e, "");
       return;
     }
+    if (S.plots.length) { S.cursor = T(x); drawPlots(); }
     const f = findingAt(x, y), it = f ? null : itemAt(x, y), r = rowAt(y);
     tl.style.cursor = f || it ? "pointer" : "grab";
     let text = "";
@@ -728,7 +997,10 @@ function wirePointer() {
       else draw();
     }
   });
-  tl.addEventListener("pointerleave", (e) => showTip(e, ""));
+  tl.addEventListener("pointerleave", (e) => {
+    showTip(e, "");
+    if (S.cursor !== null) { S.cursor = null; drawPlots(); }
+  });
   tl.addEventListener("dblclick", fit);
 
   const over = $("over");
@@ -895,6 +1167,7 @@ function option(select, text) {
   const o = document.createElement("option");
   o.textContent = text;
   select.append(o);
+  return o;
 }
 
 function renderBuilder() {
@@ -969,6 +1242,7 @@ function saveHash() {
     if (S.finding !== null) p.set("finding", S.finding);
     if (S.q) p.set("q", S.q);
     if (S.tab !== "problems") p.set("tab", S.tab);
+    for (const pl of S.plots) p.append("plot", pl.key);
     history.replaceState(null, "", location.pathname + location.search + "#" + p);
   }, 200);
 }
@@ -985,6 +1259,8 @@ async function restore() {
   const from = Number(p.get("from")), to = Number(p.get("to"));
   const hasView = p.has("from") && p.has("to") && Number.isFinite(from) && Number.isFinite(to) && to > from;
   if (hasView) S.view = [from, to];
+  for (const key of p.getAll("plot")) addPlot(key, true);
+  renderPlots();
   setClock(S.clock, hasView);
   if (p.get("q")) { S.q = p.get("q"); $("search").value = S.q; await runSearch(); }
   if (p.has("finding")) { S.finding = Number(p.get("finding")); renderProblems(); }
@@ -1006,6 +1282,7 @@ function start() {
   for (const b of $("clock").children) b.onclick = () => setClock(b.dataset.clock);
   for (const b of $("tabs").children) b.onclick = () => { setTab(b.dataset.tab); saveHash(); };
   $("fit").onclick = fit;
+  $("add-plot").onchange = (e) => { const key = e.target.value; e.target.value = ""; if (key) addPlot(key); };
   $("unhide").onclick = () => { S.hidden.clear(); layout(); draw(); saveHash(); };
   $("search").oninput = (e) => {
     S.q = e.target.value.trim();
