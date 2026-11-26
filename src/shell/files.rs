@@ -15,6 +15,7 @@ use crate::pure::decode::{
     decoder_for, sniff,
 };
 use crate::pure::frame::SYNC;
+use crate::pure::tc;
 
 const CHUNK: usize = 64 * 1024;
 
@@ -106,6 +107,9 @@ pub fn open_sniffed(path: &Path) -> io::Result<(Format, Source)> {
 /// How far past a packet's first byte to keep decoding before giving up on
 /// finding its end: packets of other virtual channels may lie in between.
 const READ_BACK_SPAN: u64 = 4 * 1024 * 1024;
+/// How far before a packet in a CLTU its start sequence can be: a CLTU of
+/// several full-length frames, with room to spare.
+const CLTU_BACK: u64 = 64 * 1024;
 /// How many sync markers before a packet to try starting from. The nearest
 /// is the right one unless the marker's bytes also occur in the data.
 const READ_BACK_TRIES: usize = 8;
@@ -116,8 +120,12 @@ const READ_BACK_TRIES: usize = 8;
 /// file no longer holds them.
 ///
 /// In most formats an item is a plain run of bytes. In a CADU file it is
-/// not: it is spread over frames and may be randomised, so the frames from
-/// the sync marker before it are decoded again.
+/// not: it is spread over frames and may be randomised or corrected, so the
+/// frames from the sync marker before it are decoded again. A packet in a
+/// CLTU has parity bytes through it and may be in segments, so the CLTUs
+/// from the start sequence before it are decoded again. TC frames with
+/// nothing around them have no marker: they are decoded from the start of
+/// the file, which for a command log is not far.
 pub fn read_back(
     path: &Path,
     config: &Config,
@@ -126,28 +134,38 @@ pub fn read_back(
     accept: impl Fn(&[u8]) -> bool,
 ) -> io::Result<Option<Vec<u8>>> {
     let (format, mut source) = open_sniffed(path)?;
-    if !matches!(format, Format::Cadu(_)) {
-        source.skip_to(offset)?;
-        let mut bytes = vec![0u8; length];
-        let got = read_full(&mut source, &mut bytes)?;
-        return Ok((got == length && accept(&bytes)).then_some(bytes));
-    }
+    // What a unit starts with, and how far before a packet's first byte
+    // the start of its unit can be.
+    let (marker, back): (&[u8], u64) = match format {
+        Format::Cadu(_) => (&SYNC, MAX_CADU_LEN as u64),
+        Format::Cltu(_) => (&tc::START, CLTU_BACK),
+        Format::TcFrames(_) => (&[], offset),
+        _ => {
+            source.skip_to(offset)?;
+            let mut bytes = vec![0u8; length];
+            let got = read_full(&mut source, &mut bytes)?;
+            return Ok((got == length && accept(&bytes)).then_some(bytes));
+        }
+    };
 
     // Everything that could matter, in memory: back far enough to hold the
     // marker of the frame the packet starts in, and on to its end.
-    let from = offset.saturating_sub(MAX_CADU_LEN as u64);
+    let from = offset.saturating_sub(back);
     source.skip_to(from)?;
     let before = (offset - from) as usize;
     let mut bytes = Vec::new();
     source
         .take(before as u64 + READ_BACK_SPAN)
         .read_to_end(&mut bytes)?;
-    let markers: Vec<usize> = bytes[..before.min(bytes.len())]
-        .windows(SYNC.len())
-        .enumerate()
-        .filter(|(_, w)| *w == SYNC)
-        .map(|(i, _)| i)
-        .collect();
+    let markers: Vec<usize> = match marker {
+        [] => vec![0],
+        _ => bytes[..before.min(bytes.len())]
+            .windows(marker.len())
+            .enumerate()
+            .filter(|(_, w)| *w == marker)
+            .map(|(i, _)| i)
+            .collect(),
+    };
     for &start in markers.iter().rev().take(READ_BACK_TRIES) {
         let Some(decoder) = decoder_for(format, config) else {
             break;
@@ -267,9 +285,10 @@ impl<R: Read> Records<R> {
         }
     }
 
-    /// What the decoder gave up on so far to keep reading.
-    pub fn notices(&self) -> &Notices {
-        &self.notices
+    /// What the decoder gave up on to keep reading, and its counts over
+    /// the whole file. Ask once reading is done.
+    pub fn notices(&self) -> Notices {
+        self.notices.clone().with_summary(self.decoder.as_ref())
     }
 
     /// What the decoder learned about the file. Ask once reading is done.

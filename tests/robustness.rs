@@ -21,8 +21,8 @@ use packetlane::pure::decode::{
     DecodeEnd, Decoder, Format, MAX_ENTRY, Notices, Record, Step, decoder_for, sniff,
 };
 use packetlane::pure::synth::{
-    Cosmos5Writer, Source, cosmos_cmd, cosmos_tlm, cosmos2_entry, cosmos2_header, cosmos4_entry,
-    cosmos4_header, demo_cadus, demo_run, system_meta,
+    Cosmos5Writer, Source, TcFrame, cltu, cosmos_cmd, cosmos_tlm, cosmos2_entry, cosmos2_header,
+    cosmos4_entry, cosmos4_header, demo_cadus, demo_run, system_meta, tc_packet, tc_segments,
 };
 
 /// A small repeatable random number generator (xorshift64*).
@@ -132,6 +132,47 @@ fn samples() -> Vec<Sample> {
         out.push(Sample::new(name, demo_cadus(&params, &packets(60)), config));
     }
 
+    // Frames with Reed-Solomon check symbols, randomised, with a CRC.
+    let coded = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\nrs_correct = true";
+    let params = Config::parse(coded).unwrap().frame_params(256);
+    out.push(Sample::new(
+        "cadu-rs",
+        demo_cadus(&params, &packets(60)),
+        coded,
+    ));
+
+    // Telecommands: CLTUs plain and randomised, and frames back to back.
+    // Each has control frames, whole commands, and one cut into segments.
+    let commands: Vec<Vec<u8>> = (0..8u16)
+        .map(|i| tc_packet(0x0C8 + i % 2, i / 2, &vec![i as u8; 3 + usize::from(i) * 5]))
+        .collect();
+    let long = tc_packet(0x0CA, 0, &[0xA5; 300]);
+    let mut frames: Vec<Vec<u8>> = vec![
+        TcFrame::bc(0x155, 1).build(&[0x00], true),
+        TcFrame::bc(0x155, 1).build(&[0x82, 0x00, 10], true),
+    ];
+    let mut n = 9u8;
+    let mut data: Vec<Vec<u8>> = Vec::new();
+    for (i, command) in commands.iter().enumerate() {
+        data.push(tc_segments(2, command, 1000).remove(0));
+        if i == 3 {
+            data.extend(tc_segments(7, &long, 80));
+        }
+    }
+    for field in &data {
+        n = n.wrapping_add(1);
+        frames.push(TcFrame::ad(0x155, 1, n).build(field, true));
+    }
+    frames.push(TcFrame::bd(0x155, 1, 0).build(&tc_segments(2, &commands[0], 1000)[0], true));
+    for (name, randomized) in [("cltu", false), ("cltu-random", true)] {
+        let mut file = vec![0x55u8; 16];
+        for frame in &frames {
+            file.extend(cltu(frame, randomized));
+        }
+        out.push(Sample::new(name, file, ""));
+    }
+    out.push(Sample::new("tc-frames", frames.concat(), ""));
+
     // And what `packetlane demo` writes, which is what a new user reads first.
     for file in demo_run(3) {
         if file.rel.ends_with(".bin") {
@@ -222,11 +263,14 @@ fn drive(mut decoder: Box<dyn Decoder>, data: &[u8], chunk: usize) -> Result<Out
 /// Reads one input whole and in pieces of several sizes, and checks that
 /// the answer is the same each time. A panic is reported, not propagated.
 fn read(sample: &Sample, data: &[u8]) -> Result<Outcome, String> {
-    read_in(sample, data, &[1, 7, 61, 1024])
+    read_in(sample, data, &[1, 7, 61, 1024], true)
 }
 
-/// [`read`], with the piece sizes to try.
-fn read_in(sample: &Sample, data: &[u8], chunks: &[usize]) -> Result<Outcome, String> {
+/// [`read`], with the piece sizes to try, and whether to also guess the
+/// format of `data` afresh and read it as that. Working out how a file of
+/// frames is laid out is the slowest thing here by far, so the tests that
+/// read thousands of inputs do it for some of them only.
+fn read_in(sample: &Sample, data: &[u8], chunks: &[usize], guess: bool) -> Result<Outcome, String> {
     catch_unwind(AssertUnwindSafe(|| {
         let whole = drive(sample.decoder(), data, usize::MAX)?;
         for &chunk in chunks {
@@ -256,8 +300,7 @@ fn read_in(sample: &Sample, data: &[u8], chunks: &[usize]) -> Result<Outcome, St
             }
         }
         // Sniffing sees damaged files before any decoder does.
-        let guessed = sniff(data);
-        if let Some(decoder) = decoder_for(guessed, &sample.config) {
+        if guess && let Some(decoder) = decoder_for(sniff(data), &sample.config) {
             drive(decoder, data, usize::MAX)?;
         }
         Ok(whole)
@@ -357,7 +400,7 @@ fn a_cut_file_reads_as_the_start_of_the_whole_one() {
         for cut in cuts {
             // One piece size here: the other tests try the rest, and this
             // one reads each file hundreds of times over.
-            let got = read_in(&sample, &sample.data[..cut], &[61])
+            let got = read_in(&sample, &sample.data[..cut], &[61], cut % 16 == 0)
                 .unwrap_or_else(|e| panic!("{} cut to {cut} bytes: {e}", sample.name));
             assert!(
                 got.records.len() <= whole.len() && got.records == whole[..got.records.len()],
@@ -385,7 +428,8 @@ fn damaged_files_are_read_without_breaking_the_rules() {
     for (i, sample) in samples.iter().enumerate() {
         let other = &samples[(i + 3) % samples.len()].data;
         for case in 0..CASES {
-            if let Err(e) = read(sample, &damage(&sample.data, other, case)) {
+            let data = damage(&sample.data, other, case);
+            if let Err(e) = read_in(sample, &data, &[1, 7, 61, 1024], case % 8 == 0) {
                 failures.push(format!("{} case {case}: {e}", sample.name));
             }
         }

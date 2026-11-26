@@ -557,7 +557,7 @@ fn ingest_packets(
 
     let mut findings: Vec<FindingRow> = file_findings(
         &checker.finish(),
-        records.notices(),
+        &records.notices(),
         end.as_ref(),
         &wrong_length.into_iter().collect::<Vec<_>>(),
         non_packets,

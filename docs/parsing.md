@@ -45,6 +45,11 @@ file container      whatever the logging program wraps around each entry
   that outputs a packet stream; do not mix reassembly into a packet parser.
   Here that layer is `src/pure/frame.rs` (one frame) and
   `src/pure/decode/cadu.rs` (finding frames and reassembling packets).
+  Frames often carry error-correcting check symbols, and a reader that has
+  them can repair damage before it parses anything (`src/pure/rs.rs`).
+- **Telecommand link units**: the uplink has its own framing. Variable-length
+  frames are cut into 8-byte codeblocks behind a two-byte start sequence
+  (`src/pure/tc.rs`, `src/pure/decode/tc.rs`).
 
 A decoder's job ends at: "here is one logged item, the byte offset where its
 payload starts in the file, and the receive time and label if the container
@@ -497,6 +502,9 @@ pub enum Step {
 
 pub trait Decoder {
     fn step(&mut self, buf: &[u8], offset: u64) -> Step;
+    // Two more methods with defaults, asked after the last step:
+    // `describe` (what the file says about itself, for the file's note) and
+    // `summary` (notices that are counts over the whole file).
 }
 ```
 
@@ -786,6 +794,7 @@ can jump straight to the bytes with `xxd -s 0x4f2a10 -l 64 file.bin`.
   `1A CF FC 1D`): scan forward to the next marker and report what was passed
   over with `Step::Lost`. `cadu.rs` does this for bytes outside any frame,
   frames that fail to parse, and jumps in a virtual channel's frame count.
+  `tc.rs` does the same from one CLTU start sequence to the next.
   It does not yet check that a marker found after junk is followed by
   another at the frame spacing, so without a frame CRC a chance marker in
   junk is read as a frame.
@@ -867,7 +876,7 @@ discrepancy before finishing.
 
 ---
 
-## 8. Reference: space packets, time, COSMOS formats, and text logs
+## 8. Reference: space packets, time, COSMOS formats, frames, and text logs
 
 ### Space packet primary header
 
@@ -1033,6 +1042,169 @@ the length field claims fewer bytes than are there. The file gets one
 item in eight starts with three zero bits, and COSMOS's `SYSTEM META` and
 `UNKNOWN UNKNOWN` entries must stay out of the packet lanes.
 
+### Transfer frames in CADUs, and Reed-Solomon
+
+A CADU is the sync marker `1A CF FC 1D`, one transfer frame, and usually
+Reed-Solomon check symbols. The layouts are drawn at the top of
+`src/pure/frame.rs`; `src/pure/decode/cadu.rs` finds the frames and
+reassembles packets; `src/pure/rs.rs` is the code. CCSDS 131.0-B defines the
+coding, 132.0-B the TM frame and 732.0-B the AOS frame.
+
+```text
+on the link:  sync(4) | frame ................ | check symbols
+                        \_______ codeblock: I x (255 - fill) bytes ______/
+                        \_______ randomised (if at all) __________________/
+```
+
+What the file does not say and has to be found or configured: the CADU
+length, TM or AOS, whether the bytes are still randomised, whether the frame
+ends in a CRC, and how many check symbols there are of which code.
+`Layout::detect` reads all of these off the first frames where it can:
+
+| Property | How it shows |
+|---|---|
+| CADU length | Distance between sync markers, three in a row |
+| TM or AOS, randomised or not | The first two bits after the marker are the frame version (0 or 1). The random sequence starts with `FF`, so randomised frames show 3 or 2 |
+| Reed-Solomon code | A frame that is a codeword as it stands, under exactly one code, depth and symbol representation |
+| CRC | Valid over the frame, in front of the check symbols |
+
+**The order of operations is the first trap.** The sender builds the frame,
+adds the CRC, computes the check symbols, and randomises everything after
+the marker, check symbols included. So the reader derandomises first, then
+corrects, then checks the CRC. Correcting before derandomising fails on
+every frame. The marker is in front of the codeblock, not part of it.
+
+**The code.** Symbols are bytes, taken as elements of the field with 256
+elements built on `x^8 + x^7 + x^2 + x + 1` (`0x187`). Writing `a` for the
+element `x`, the generator polynomial is the product of `(x - a^(11 j))` for
+`j` = 112 to 143 (RS(255,223), corrects 16 bytes per codeword) or 120 to 135
+(RS(255,239), corrects 8). Two things are unusual: the roots step by `a^11`
+and not by `a`, and they do not start at `a^1`. A textbook decoder with
+"first root 1, step 1" built in decodes nothing. The second matters in
+Forney's formula for the error values, which gains a factor: see `locate`
+in `rs.rs`.
+
+**Dual basis is the second trap.** By default a byte on the link is not the
+field element whose polynomial coefficients are its bits. It is the element
+written in Berlekamp's dual basis, which is a fixed 8x8 bit matrix applied to
+every symbol, data and check alike. Convert every byte on the way into the
+arithmetic and every corrected byte on the way out. Some links use the plain
+("conventional") representation. The two do not pass for each other: a
+codeword in one has non-zero syndromes in the other. That is what makes the
+representation detectable, and it is also why "the decoder rejects every
+frame" most often means the wrong representation. The matrix is in
+`rs.rs`, with a test that rebuilds it from the definition (bit `i` of the
+dual byte is the trace of the element times `a^(117 i)`).
+
+**Interleaving.** With depth `I` (1, 2, 3, 4, 5 or 8) the codeblock holds `I`
+codewords, and byte `i` belongs to codeword `i mod I`. The check symbols at
+the end are interleaved the same way. A burst of `16 I` wrong bytes is then
+16 in each codeword. The parity length alone does not give the code: 32
+bytes is RS(255,223) at depth 1 or RS(255,239) at depth 2.
+
+**Virtual fill is the third trap.** A frame shorter than `223 I` bytes is
+coded as if zeros stood in front of it, and the zeros are not sent. Nothing
+has to be done about them except to know that the codeword is short: its
+length is the codeblock length over `I`, the missing symbols are the highest
+powers and are zero. If the decoder locates an error among them, the block
+is past correcting. A codeblock whose length does not divide by `I`, or that
+is longer than `255 I`, is not a codeblock of that code at all.
+
+**A decoder can be wrong without knowing it.** With more than 16 errors in a
+codeword Reed-Solomon usually says so, but it can also land on a different
+codeword and report success. If the frame has a CRC, check it after
+correcting and drop the frame on a mismatch. And a frame of mostly zeros in
+front of zero-filled check symbols is within reach of the all-zero codeword:
+a decoder told to correct it will "correct" the frame into zeros. That is
+why detection wants a frame that is a clean codeword before it believes there
+is a code, and why check symbols with nothing known about them are skipped.
+
+**How to check an implementation with no coded file to hand.** An encoder
+and decoder written together agree with each other whatever they got wrong.
+These tests in `rs.rs` do not depend on the encoder: the field tables against
+bit-by-bit multiplication; the generator's palindrome shape and its zeros at
+exactly the roots the standard lists; the dual-basis matrix against its
+definition; the syndromes of a single error against a hand calculation. The
+matrix and the RS(255,223) coefficient list were typed in from memory of the
+standard and agree with what the definitions give, which is two recollections
+agreeing and not a document checked. None of this pins what only a real link
+shows: the order of symbols within a codeword, the order of interleaving.
+Until a recorded file has been decoded, say so.
+
+### Telecommand: CLTUs and TC transfer frames
+
+The uplink is built differently from the downlink: variable-length frames,
+a short block code, and a sequence number the spacecraft acknowledges. The
+layouts are drawn at the top of `src/pure/tc.rs`; `src/pure/decode/tc.rs`
+walks the file. CCSDS 231.0-B defines the coding and 232.0-B the frame.
+
+```text
+CLTU:  EB 90 | codeblock | codeblock | ... | C5 C5 C5 C5 C5 C5 C5 79
+codeblock:  7 bytes of frame | 7 parity bits + 1 filler bit
+```
+
+- **The BCH code** is (63,56) with generator `x^7 + x^6 + x^2 + 1`: divide the
+  56 data bits, followed by seven zeros, by the generator and keep the 7-bit
+  remainder. The parity bits are stored **inverted**, and the eighth bit of
+  that byte is a **filler bit** (zero) that is not covered by anything. Take
+  it for parity, or forget the inversion, and every block fails. One wrong
+  bit in the 63 gives a syndrome that names the bit; two wrong bits give one
+  that names none. Correct one, and treat anything else as a lost frame.
+- **Fill.** The frame is cut into 7-byte pieces and the last codeblock is
+  padded with `55`. (Bytes after the frame that are not `55` are taken for a
+  second frame in the same CLTU, which early issues of the standard allowed.) Only the frame's length field says where the padding
+  starts. Read the first codeblock, take the length from the header, and
+  from that the number of codeblocks.
+- **The tail** is a codeblock built to fail decoding, which is how a
+  receiver finds the end. Do not lean on it when reading a file. Half of all
+  8-byte patterns pass once one wrong bit is allowed for, so damage or a
+  recorder that drops tails leaves something that decodes. The length ends
+  the frame; a tail, if it is there, is passed over, and so is idle fill
+  (`55`) between CLTUs.
+- **Randomising**, where the link uses it, is applied to the frame before
+  BCH coding, with its own sequence (not the TM one), restarted for each
+  CLTU. Correct the codeblocks first, then derandomise. As with TM, the
+  sequence starts with `FF`, so a randomised frame shows its two version
+  bits as 3.
+- **Frame types.** Two header flags give three kinds. AD frames (both
+  clear) are sequence controlled: N(S) counts up per virtual channel and a
+  jump means frames are missing. BD frames (bypass set) are expedited and
+  their N(S) means nothing. BC frames (both set) carry a control command for
+  the receiver (Unlock, Set V(R)) and no packets: do not count them as
+  loss, and do not look for a segment header in them. After Set V(R), the
+  next AD frame should carry that number.
+- **The length field** is the whole frame minus one, header and CRC
+  included.
+- **Segment header.** One optional byte at the start of the data of AD and
+  BD frames: two flag bits and a 6-bit MAP number. The flags are the space
+  packet ones (01 first, 00 continuation, 10 last, 11 whole). Whether the
+  link has segment headers is not written anywhere in the frame. It can
+  often be told from the data: without one the data starts with a packet
+  header (first three bits 000); with one, a whole-packet frame starts with
+  `11`. Reassemble per MAP, and drop what is half built when the frame
+  sequence jumps. Here a run of segments must come to exactly one packet.
+- **Offsets.** A packet's bytes are not together in a CLTU file: every
+  eighth byte is parity, and a segmented packet is in several CLTUs. A
+  record's offset is where its first byte is, and reading it back means
+  decoding again from the start sequence before it (`read_back` in
+  `src/shell/files.rs`).
+- **Frames with no CLTU.** Ground systems often log the frames alone, back
+  to back. There is then no marker: the length field of each frame leads to
+  the next, and a bad header ends the read. Recognising such a file takes
+  more than chained lengths, since a few bytes chain by accident: ask for
+  frames that pass their CRC, or data that reads as whole packets.
+
+The decoder has to hand over several packets from one CLTU, and a step can
+carry one record. It reads the whole CLTU on one step, queues what it found,
+and hands the queue over one item per step, consuming a byte each time and
+the rest of the CLTU with the last. That works because a CLTU is always more
+bytes than it has packets and notices.
+
+Counts over a whole file (errors corrected, control frames seen) do not fit
+in a step either, and one notice per frame would bury the losses. A decoder
+keeps them and returns them from `Decoder::summary`, which is asked once at
+the end.
+
 ### Text logs
 
 Text logs do not use `Decoder`; this codebase parses them with
@@ -1137,6 +1309,8 @@ Text logs do not use `Decoder`; this codebase parses them with
 - **ASCII**: American Standard Code for Information Interchange. A character
   encoding mapping bytes `0x20`–`0x7E` to printable English letters, digits,
   and punctuation.
+- **BCH code**: The short error-correcting code on telecommand codeblocks:
+  7 parity bits on 56 data bits, enough to correct one wrong bit.
 - **Big-endian**: Byte order with the most significant byte stored first. Used
   by CCSDS space packets and both COSMOS container formats.
 - **Bit**: One binary digit (`0` or `1`).
@@ -1151,6 +1325,8 @@ Text logs do not use `Decoder`; this codebase parses them with
   publishes the Space Packet Protocol standard (`CCSDS 133.0-B`).
 - **CDS**: CCSDS Day Segmented Time Code — a secondary-header timestamp format
   storing days since an epoch, milliseconds of day, and optional sub-milliseconds.
+- **CLTU**: Communications Link Transmission Unit. One telecommand frame as
+  sent up the link: a start sequence (`EB 90`), BCH codeblocks, a tail.
 - **Clock skew**: The difference between a host's local clock and true time.
 - **Container**: Whatever file structure a logging program wraps around the
   data it records (file headers, per-entry timestamps, lengths, and names).
@@ -1160,6 +1336,9 @@ Text logs do not use `Decoder`; this codebase parses them with
   raw payload records (`pure::decode::Decoder`).
 - **Decommutation**: Turning packet bytes into named, scaled values using the
   packet definitions.
+- **Dual basis**: The way CCSDS writes a Reed-Solomon symbol as a byte by
+  default: not the bits of the field element, but a fixed bit matrix applied
+  to them.
 - **Epoch**: The zero point that a clock or timestamp counts forward from (for
   example, the **Unix epoch** is `1970-01-01T00:00:00Z`).
 - **Hexadecimal (hex)**: Base-16 notation using digits `0`–`9` and `A`–`F`. Two
@@ -1183,6 +1362,8 @@ Text logs do not use `Decoder`; this codebase parses them with
 - **Push parser (push decoder)**: A parser that does no I/O of its own; the
   caller feeds it buffered bytes and it returns parsed records, bytes consumed,
   "need more", or an error.
+- **Reed-Solomon code**: The error-correcting code on TM and AOS frames. It
+  works on whole bytes: 32 check bytes per 255 correct any 16 wrong ones.
 - **Resynchronisation (resync)**: Finding the next valid entry or frame
   boundary after corrupt bytes so decoding can continue.
 - **Secondary header**: Mission-defined bytes immediately after the 6-byte
@@ -1202,5 +1383,7 @@ Text logs do not use `Decoder`; this codebase parses them with
   common when a logger crashes or a file is copied while still being written.
 - **UTC**: Coordinated Universal Time, the civil time standard used as the
   reference for timestamps in this tool.
+- **Virtual fill**: Zeros a Reed-Solomon encoder imagines in front of a
+  frame too short to fill its codewords. They are not sent.
 - **Virtual channel**: A numbered sub-stream within transfer frames, used to
   separate kinds of traffic on one link.
