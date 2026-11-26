@@ -625,13 +625,17 @@ fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
 
     // Every pair is compared in one query; the findings are then made in
     // the order the pairs are listed, which is the order they are stored in.
-    let compared = run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?;
+    // A run from one source has no pairs, and its packets are not read.
+    let pairs = run_query(conn, &sql::lane_pairs(run_id), usize::MAX)?;
+    let compared = if pairs.rows.is_empty() {
+        Vec::new()
+    } else {
+        run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?.rows
+    };
     let compared: HashMap<(i64, i64), &Vec<Cell>> = compared
-        .rows
         .iter()
         .filter_map(|r| Some(((r[0].int()?, r[1].int()?), r)))
         .collect();
-    let pairs = run_query(conn, &sql::lane_pairs(run_id), usize::MAX)?;
     for row in &pairs.rows {
         let (Some(a), Some(source_a), Some(b), Some(source_b)) =
             (row[0].int(), row[1].text(), row[2].int(), row[3].text())

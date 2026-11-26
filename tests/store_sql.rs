@@ -6,6 +6,11 @@
 //! answer, because SQLite may prefer it. The load tests show that as
 //! seconds lost. Here it shows at once, on a small store: the store never
 //! runs ANALYZE, so SQLite chooses the same plan at any size.
+//!
+//! The plans are compared as SQLite words them. SQLite is built in with
+//! rusqlite, so the wording changes only when that dependency does; if
+//! these tests fail after such a change and the same indexes are still
+//! named, it is the wording, and the expected text here is what to update.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -133,6 +138,7 @@ fn views_of_the_timeline_find_their_packets_by_time() {
             Clock::Packet,
             "packets_packet (packet_ns>? AND packet_ns<?)",
         ),
+        (Clock::Order, "INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
     ] {
         let mut queries = vec![
             (
@@ -158,11 +164,13 @@ fn views_of_the_timeline_find_their_packets_by_time() {
         ];
         // With pre-counted buckets, the two ends of the window are still
         // counted from the packets.
+        let before = queries.len();
         for q in sql::density(1, clock, from + 7, to + 7, 400, Some((from, 1_000_000_000))) {
             if q.sql.contains("FROM packets") {
                 queries.push(("density, ends", "packets", q));
             }
         }
+        assert!(queries.len() > before, "no end of the window was counted");
         for (name, table, q) in &queries {
             let plan = plan(&store.conn, q);
             let step = step(&plan, table);
