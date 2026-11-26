@@ -421,6 +421,10 @@ pub fn run_series(run: i64) -> Query {
 
 /// One kept field of one lane over a window, reduced to the lowest and
 /// highest value in each bucket. Columns: bucket, min, max, count.
+///
+/// `CROSS JOIN` makes SQLite start from the packets in the window and look
+/// their values up, so the cost follows the window. Left to itself it
+/// starts from every stored value of the field, however narrow the view.
 #[allow(clippy::too_many_arguments)]
 pub fn value_series(
     run: i64,
@@ -436,7 +440,7 @@ pub fn value_series(
     Query::new(
         format!(
             "SELECT (p.{c} - ?) / ? AS b, MIN(v.num), MAX(v.num), COUNT(*)
-             FROM packets p JOIN field_values v ON v.packet_id = p.id
+             FROM packets p CROSS JOIN field_values v ON v.packet_id = p.id
              WHERE p.lane_id = ? AND p.lane_id IN {RUN_LANES} AND p.{c} BETWEEN ? AND ?
                AND v.packet = ? AND v.field = ? AND v.num IS NOT NULL
              GROUP BY b ORDER BY b"

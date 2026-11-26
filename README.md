@@ -149,6 +149,12 @@ Limits of working from counters alone are listed at the top of
   fell in it, so a one-packet spike is not averaged away. The lane's
   findings are drawn as vertical lines, and the pointer marks the same
   moment on every plot.
+
+  A plot reads the packets in view each time the view moves; nothing is
+  precomputed for it as it is for the lanes. On a run of 900,000 packets
+  with a million kept values, a whole-run plot takes 0.1 to 0.2 s and a
+  zoomed-in one a few milliseconds, and opening the run takes 0.4 s longer
+  than without kept values. Expect ten times that at ten times the size.
 - The view (run, clock, range, lanes, plots, selection, search) is kept in
   the address, so it can be bookmarked while the server is running.
 

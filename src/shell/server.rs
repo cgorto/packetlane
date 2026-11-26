@@ -230,12 +230,22 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
         Command::Runs => render_runs(&reader()?.query(&sql::runs(), 1000)?),
         Command::Run { run } => {
             let store = reader()?;
+            // Listing the kept fields reads every stored value of the run.
+            // If that cannot be done in time the run still opens, with
+            // only the plots that need no list.
+            let series = store
+                .query(&sql::run_series(run), 10_000)
+                .unwrap_or_else(|_| sql::Table {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    truncated: false,
+                });
             render_run(
                 &store.query(&sql::run_row(run), 1)?,
                 &store.query(&sql::run_lanes(run), 100_000)?,
                 &store.query(&sql::run_files(run), 100_000)?,
                 &store.query(&sql::run_findings(run), 10_000)?,
-                &store.query(&sql::run_series(run), 10_000)?,
+                &series,
             )
         }
         Command::Density { window, buckets } => {
