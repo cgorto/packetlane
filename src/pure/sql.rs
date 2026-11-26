@@ -93,6 +93,17 @@ CREATE TABLE IF NOT EXISTS coarse (
   count INTEGER NOT NULL,
   PRIMARY KEY (lane_id, clock, bucket)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS coarse_series (
+  lane_id INTEGER NOT NULL,
+  clock INTEGER NOT NULL,
+  packet TEXT NOT NULL,
+  field TEXT NOT NULL,
+  bucket INTEGER NOT NULL,
+  lo REAL NOT NULL,
+  hi REAL NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY (lane_id, clock, packet, field, bucket)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS coarse_meta (
   run_id INTEGER NOT NULL,
   clock INTEGER NOT NULL,
@@ -463,9 +474,10 @@ pub fn run_series(run: i64) -> Query {
 /// One kept field of one lane over a window, reduced to the lowest and
 /// highest value in each bucket. Columns: bucket, min, max, count.
 ///
-/// `CROSS JOIN` makes SQLite start from the packets in the window and look
-/// their values up, so the cost follows the window. Left to itself it
-/// starts from every stored value of the field, however narrow the view.
+/// `CROSS JOIN` makes SQLite start from the lane's packets in the window
+/// and look their values up, so the cost follows the window. Left to
+/// itself it starts from every stored value of the field, however narrow
+/// the view.
 #[allow(clippy::too_many_arguments)]
 pub fn value_series(
     run: i64,
@@ -477,36 +489,52 @@ pub fn value_series(
     to: i64,
     buckets: i64,
 ) -> Query {
-    let c = clock.packet_column();
-    let index = clock.one_lane();
-    Query::new(
-        format!(
-            "SELECT (p.{c} - ?) / ? AS b, MIN(v.num), MAX(v.num), COUNT(*)
-             FROM packets p {index} CROSS JOIN field_values v ON v.packet_id = p.id
-             WHERE p.lane_id = ? AND p.lane_id IN {RUN_LANES} AND p.{c} BETWEEN ? AND ?
-               AND v.packet = ? AND v.field = ? AND v.num IS NOT NULL
-             GROUP BY b ORDER BY b"
-        ),
-        vec![
-            from.into(),
-            bucket_width(from, to, buckets).into(),
-            lane.into(),
-            run.into(),
-            from.into(),
-            to.into(),
-            packet.into(),
-            field.into(),
-        ],
-    )
+    let grid = (from, bucket_width(from, to, buckets));
+    series_range(run, clock, lane, Some((packet, field)), grid, from, to)
 }
 
 /// How long after its own time each packet of a lane was received, in
 /// milliseconds, by bucket. Columns: bucket, min, max, count.
 pub fn lag_series(run: i64, clock: Clock, lane: i64, from: i64, to: i64, buckets: i64) -> Query {
+    let grid = (from, bucket_width(from, to, buckets));
+    series_range(run, clock, lane, None, grid, from, to)
+}
+
+/// A series (a kept field, or arrival delay if `field` is `None`) read from
+/// the packets whose time lies in `lo..=hi`, into buckets counted from
+/// `grid.0` and `grid.1` wide.
+fn series_range(
+    run: i64,
+    clock: Clock,
+    lane: i64,
+    field: Option<(&str, &str)>,
+    grid: (i64, i64),
+    lo: i64,
+    hi: i64,
+) -> Query {
     let c = clock.packet_column();
     let index = clock.one_lane();
-    Query::new(
-        format!(
+    let mut params: Vec<Param> = vec![
+        grid.0.into(),
+        grid.1.into(),
+        lane.into(),
+        run.into(),
+        lo.into(),
+        hi.into(),
+    ];
+    let sql = match field {
+        Some((packet, field)) => {
+            params.push(packet.into());
+            params.push(field.into());
+            format!(
+                "SELECT (p.{c} - ?) / ? AS b, MIN(v.num), MAX(v.num), COUNT(*)
+                 FROM packets p {index} CROSS JOIN field_values v ON v.packet_id = p.id
+                 WHERE p.lane_id = ? AND p.lane_id IN {RUN_LANES} AND p.{c} BETWEEN ? AND ?
+                   AND v.packet = ? AND v.field = ? AND v.num IS NOT NULL
+                 GROUP BY b ORDER BY b"
+            )
+        }
+        None => format!(
             "SELECT ({c} - ?) / ? AS b, MIN(receive_ns - packet_ns) / 1000000.0,
                     MAX(receive_ns - packet_ns) / 1000000.0, COUNT(*)
              FROM packets {index}
@@ -514,15 +542,8 @@ pub fn lag_series(run: i64, clock: Clock, lane: i64, from: i64, to: i64, buckets
                AND receive_ns IS NOT NULL AND packet_ns IS NOT NULL
              GROUP BY b ORDER BY b"
         ),
-        vec![
-            from.into(),
-            bucket_width(from, to, buckets).into(),
-            lane.into(),
-            run.into(),
-            from.into(),
-            to.into(),
-        ],
-    )
+    };
+    Query::new(sql, params)
 }
 
 /// Individual packets in a window. Columns: id, lane, time, seq, length.
@@ -607,7 +628,8 @@ pub const RUN_FILE_PATHS: &str = "SELECT path, rel FROM files WHERE run_id = ? O
 /// Statements that empty a run, each taking the run id. Used when its
 /// configuration changes, because names, clocks and time formats are
 /// applied as files are read.
-pub const RESET_RUN: [&str; 9] = [
+pub const RESET_RUN: [&str; 10] = [
+    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
     "DELETE FROM field_values WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM file_series WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM packets WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
@@ -953,6 +975,210 @@ pub fn density(
         out.extend(direct(hi + 1, to));
     }
     out
+}
+
+// ---- stored series buckets ---------------------------------------------------
+//
+// A plot of a whole long run reads every packet of its lane. For lanes with
+// enough packets to make that slow, the store keeps, after an ingest, the
+// lowest and highest value in each of a fixed set of buckets, for every
+// kept field and for arrival delay. A view whose own buckets are at least
+// that wide is drawn from those; a narrower view covers little enough of
+// the lane to read directly.
+
+/// Stored series buckets per pre-counted density bucket: 16,384 a run.
+pub const SERIES_PER_COARSE: i64 = 4;
+
+/// Lanes with fewer packets than this on a clock get no stored buckets:
+/// reading them whole is quick, and buckets for every small lane would
+/// cost more room than the lane's values.
+pub const SERIES_MIN_PACKETS: i64 = 8 * SERIES_PER_COARSE * COARSE_BUCKETS;
+
+/// The width of a stored series bucket, from the width of the run's
+/// pre-counted density buckets on the same clock. They share an origin.
+pub fn series_width(coarse_width: i64) -> i64 {
+    (coarse_width / SERIES_PER_COARSE).max(1)
+}
+
+pub const CLEAR_COARSE_SERIES: &str =
+    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)";
+
+/// The statements that fill the stored series buckets for one clock of a
+/// run, for lanes with at least `min_packets` on that clock. `origin` and
+/// `coarse_width` are the run's, as in `coarse_meta`. None for the order
+/// clock, which has no lane-first index to read a lane by.
+pub fn build_coarse_series(
+    run: i64,
+    clock: Clock,
+    origin: i64,
+    coarse_width: i64,
+    min_packets: i64,
+) -> Vec<Query> {
+    let (c, counted) = match clock {
+        Clock::Receive => ("receive_ns", "receive_count"),
+        Clock::Packet => ("packet_ns", "packet_count"),
+        Clock::Order => return Vec::new(),
+    };
+    let index = clock.one_lane();
+    let lanes =
+        format!("(SELECT id FROM lanes WHERE run_id = ?4 AND kind = 'packet' AND {counted} >= ?5)");
+    let params: Vec<Param> = vec![
+        clock.code().into(),
+        origin.into(),
+        series_width(coarse_width).into(),
+        run.into(),
+        min_packets.into(),
+    ];
+    vec![
+        Query::new(
+            format!(
+                "INSERT INTO coarse_series (lane_id, clock, packet, field, bucket, lo, hi, count)
+                 SELECT lane_id, ?1, '', '', ({c} - ?2) / ?3 AS b,
+                        MIN(receive_ns - packet_ns) / 1000000.0,
+                        MAX(receive_ns - packet_ns) / 1000000.0, COUNT(*)
+                 FROM packets {index}
+                 WHERE lane_id IN {lanes} AND receive_ns IS NOT NULL AND packet_ns IS NOT NULL
+                 GROUP BY lane_id, b"
+            ),
+            params.clone(),
+        ),
+        Query::new(
+            format!(
+                "INSERT INTO coarse_series (lane_id, clock, packet, field, bucket, lo, hi, count)
+                 SELECT p.lane_id, ?1, v.packet, v.field, (p.{c} - ?2) / ?3 AS b,
+                        MIN(v.num), MAX(v.num), COUNT(*)
+                 FROM packets p {index} CROSS JOIN field_values v ON v.packet_id = p.id
+                 WHERE p.lane_id IN {lanes} AND p.{c} IS NOT NULL AND v.num IS NOT NULL
+                 GROUP BY p.lane_id, v.packet, v.field, b"
+            ),
+            params,
+        ),
+    ]
+}
+
+/// The name a series is stored under: a kept field's packet and field, or
+/// two empty names for arrival delay.
+fn series_key<'a>(field: Option<(&'a str, &'a str)>) -> (&'a str, &'a str) {
+    field.unwrap_or(("", ""))
+}
+
+/// Whether a series has stored buckets on a clock: one row if so.
+pub fn has_coarse_series(lane: i64, clock: Clock, field: Option<(&str, &str)>) -> Query {
+    let (packet, field) = series_key(field);
+    Query::new(
+        "SELECT 1 FROM coarse_series
+         WHERE lane_id = ? AND clock = ? AND packet = ? AND field = ? LIMIT 1",
+        vec![
+            lane.into(),
+            clock.code().into(),
+            packet.into(),
+            field.into(),
+        ],
+    )
+}
+
+/// The statements that reduce a series over a window to `buckets` buckets.
+/// Each returns bucket, min, max, count; a bucket may come from more than
+/// one, and [`merge_series`] joins them. Together they take in every packet
+/// in the window exactly once.
+///
+/// `stored` is the origin and width from [`coarse_meta`] if the series has
+/// stored buckets ([`has_coarse_series`]): those are used for the part of
+/// the window they cover whole, and the two ends are read directly. A
+/// stored bucket goes to the requested bucket its start falls in.
+#[allow(clippy::too_many_arguments)]
+pub fn series(
+    run: i64,
+    clock: Clock,
+    lane: i64,
+    field: Option<(&str, &str)>,
+    from: i64,
+    to: i64,
+    buckets: i64,
+    stored: Option<(i64, i64)>,
+) -> Vec<Query> {
+    let width = bucket_width(from, to, buckets);
+    let direct = |lo: i64, hi: i64| series_range(run, clock, lane, field, (from, width), lo, hi);
+    let whole = match stored {
+        Some((origin, coarse_width)) if coarse_width > 0 => {
+            let stored_width = series_width(coarse_width);
+            (width >= stored_width)
+                .then(|| whole_coarse_buckets(from, to, origin, stored_width))
+                .flatten()
+                .map(|found| (found, origin, stored_width))
+        }
+        _ => None,
+    };
+    let Some(((first, last, lo, hi), origin, stored_width)) = whole else {
+        return vec![direct(from, to)];
+    };
+    let (packet, name) = series_key(field);
+    let mut out = vec![Query::new(
+        "SELECT (?1 + bucket * ?2 - ?3) / ?4 AS b, MIN(lo), MAX(hi), SUM(count)
+         FROM coarse_series
+         WHERE lane_id = ?5 AND lane_id IN (SELECT id FROM lanes WHERE run_id = ?6)
+           AND clock = ?7 AND packet = ?8 AND field = ?9 AND bucket BETWEEN ?10 AND ?11
+         GROUP BY b ORDER BY b",
+        vec![
+            origin.into(),
+            stored_width.into(),
+            from.into(),
+            width.into(),
+            lane.into(),
+            run.into(),
+            clock.code().into(),
+            packet.into(),
+            name.into(),
+            first.into(),
+            last.into(),
+        ],
+    )];
+    if from < lo {
+        out.push(direct(from, lo - 1));
+    }
+    if hi < to {
+        out.push(direct(hi + 1, to));
+    }
+    out
+}
+
+/// Joins the answers to the statements from [`series`] into one row a
+/// bucket, in bucket order: the lowest min, the highest max, the counts
+/// added.
+pub fn merge_series(parts: &[&Table]) -> Table {
+    let number = |c: &Cell| match c {
+        Cell::Real(v) => Some(*v),
+        Cell::Int(v) => Some(*v as f64),
+        _ => None,
+    };
+    let mut merged: std::collections::BTreeMap<i64, (f64, f64, i64)> =
+        std::collections::BTreeMap::new();
+    for row in parts.iter().flat_map(|t| &t.rows) {
+        let (Some(bucket), Some(lo), Some(hi), Some(count)) = (
+            row.first().and_then(Cell::int),
+            row.get(1).and_then(number),
+            row.get(2).and_then(number),
+            row.get(3).and_then(Cell::int),
+        ) else {
+            continue;
+        };
+        merged
+            .entry(bucket)
+            .and_modify(|m| *m = (m.0.min(lo), m.1.max(hi), m.2 + count))
+            .or_insert((lo, hi, count));
+    }
+    Table {
+        columns: ["bucket", "min", "max", "count"]
+            .map(str::to_string)
+            .to_vec(),
+        rows: merged
+            .into_iter()
+            .map(|(b, (lo, hi, n))| {
+                vec![Cell::Int(b), Cell::Real(lo), Cell::Real(hi), Cell::Int(n)]
+            })
+            .collect(),
+        truncated: parts.iter().any(|t| t.truncated),
+    }
 }
 
 #[cfg(test)]

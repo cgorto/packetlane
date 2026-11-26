@@ -148,6 +148,10 @@ Limits of working from counters alone are listed at the top of
   file by name and times as text.
 - `packetlane query` and the SQL box in the UI accept one statement that
   reads. The connection they use cannot write.
+- A store made by an earlier build with a different layout is refused, and
+  says so: delete it and ingest again. Nothing in it is not in the logs.
+- Writing uses up to about 80 MB of memory whatever the size of the run,
+  most of it the store's page cache.
 
 ### Timeline
 
@@ -179,11 +183,12 @@ Limits of working from counters alone are listed at the top of
   findings are drawn as vertical lines, and the pointer marks the same
   moment on every plot.
 
-  A plot reads the packets in view each time the view moves; nothing is
-  precomputed for it as it is for the lanes. On a run of 900,000 packets
-  with a million kept values, a whole-run plot takes 0.1 to 0.2 s and a
-  zoomed-in one a few milliseconds, and opening the run takes 0.4 s longer
-  than without kept values. Expect ten times that at ten times the size.
+  A plot reads only its own lane's packets in view. For a lane with more
+  than about 130,000 packets the store also keeps, at ingest, the lowest
+  and highest value in each of 16,384 buckets across the run, and a view
+  wide enough is drawn from those: a whole-run plot takes about 5 ms on a
+  run of ten million packets. A stored bucket is drawn in the plot column
+  its start falls in, so a value can sit one column early.
 - The view (run, clock, range, lanes, plots, selection, search) is kept in
   the address, so it can be bookmarked while the server is running.
 

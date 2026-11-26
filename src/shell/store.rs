@@ -260,6 +260,7 @@ impl Store {
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_META, params![run_id])?;
+            tx.execute(sql::CLEAR_COARSE_SERIES, params![run_id])?;
             let extents = run_query(&tx, &sql::run_extents(run_id), 1)?;
             if let Some(row) = extents.rows.first() {
                 for (i, clock) in sql::Clock::ALL.into_iter().enumerate() {
@@ -268,7 +269,18 @@ impl Store {
                     if let (Some(min), Some(max)) = (row[i * 2].int(), row[i * 2 + 1].int())
                         && max.checked_sub(min).is_some()
                     {
-                        for q in sql::build_coarse(run_id, clock, min, max) {
+                        let width = sql::bucket_width(min, max, sql::COARSE_BUCKETS);
+                        let series = sql::build_coarse_series(
+                            run_id,
+                            clock,
+                            min,
+                            width,
+                            sql::SERIES_MIN_PACKETS,
+                        );
+                        for q in sql::build_coarse(run_id, clock, min, max)
+                            .iter()
+                            .chain(&series)
+                        {
                             tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
                         }
                     }
