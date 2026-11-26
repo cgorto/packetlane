@@ -14,10 +14,9 @@ use std::collections::BTreeMap;
 use crate::pure::config::{Config, PacketDef, ResolvedTime, SourceInfo};
 use crate::pure::continuity::{Checker, Report, StreamKey};
 use crate::pure::decode::{DecodeEnd, Notices, Record};
+use crate::pure::finding::FileFinding;
 use crate::pure::format::kept_values;
-use crate::pure::ingest::{
-    FindingRow, LaneKey, PacketRow, SEVERITY_INFO, SEVERITY_PROBLEM, file_findings, packet_row,
-};
+use crate::pure::ingest::{LaneKey, PacketRow, file_findings, packet_row};
 use crate::pure::limits::{LimitChecker, LimitFinding};
 use crate::pure::order::{OrderChecker, OrderFinding};
 
@@ -156,41 +155,22 @@ impl FileReport {
         self.records - self.packets
     }
 
-    /// Every finding for the file as rows for the store, in the order they
-    /// are stored: sequence counts, what the decoder gave up on (`notices`)
-    /// and how the read ended (`end`), length fields, items that are not
-    /// packets, then segment and time order, then limits.
-    pub fn rows(&self, notices: &Notices, end: Option<&DecodeEnd>) -> Vec<FindingRow> {
-        let mut rows = file_findings(
+    /// Every finding for the file, in the order they are stored: sequence
+    /// counts, what the decoder gave up on (`notices`) and how the read
+    /// ended (`end`), length fields, items that are not packets, then
+    /// segment and time order, then limits.
+    pub fn findings(&self, notices: &Notices, end: Option<&DecodeEnd>) -> Vec<FileFinding> {
+        let mut found = file_findings(
             &self.continuity,
             notices,
             end,
             &self.wrong_length,
             self.non_packets(),
         );
-        rows.extend(self.order.iter().map(|f| FindingRow {
-            lane: Some(LaneKey::stream(f.key)),
-            packet_index: f.packet_index,
-            severity: if f.problem {
-                SEVERITY_PROBLEM
-            } else {
-                SEVERITY_INFO
-            },
-            kind: f.kind,
-            message: f.message.clone(),
-        }));
-        rows.extend(self.limits.iter().map(|f| FindingRow {
-            lane: Some(f.lane),
-            packet_index: f.packet_index,
-            severity: if f.red {
-                SEVERITY_PROBLEM
-            } else {
-                SEVERITY_INFO
-            },
-            kind: "limit",
-            message: f.message.clone(),
-        }));
-        rows
+        let in_stream = |key| Some(LaneKey::stream(key));
+        found.extend(self.order.iter().map(|f| f.clone().map_lane(in_stream)));
+        found.extend(self.limits.iter().map(|f| f.clone().map_lane(Some)));
+        found
     }
 }
 
@@ -281,7 +261,7 @@ name = "ADCS"
         let report = check.finish();
         assert_eq!((report.records, report.packets), (3, 2));
         assert_eq!(report.non_packets(), 1);
-        assert!(report.rows(&Notices::default(), None).len() == 1);
+        assert!(report.findings(&Notices::default(), None).len() == 1);
     }
 
     #[test]
@@ -303,9 +283,9 @@ name = "ADCS"
         assert_eq!(report.wrong_length[0].0.apid, 999);
         assert_eq!(report.wrong_length[0].1, 4);
         let kinds: Vec<&str> = report
-            .rows(&Notices::default(), None)
+            .findings(&Notices::default(), None)
             .iter()
-            .map(|r| r.kind)
+            .map(|r| r.kind.name())
             .collect();
         assert_eq!(kinds, ["gap", "constant_count", "length_field"]);
     }
@@ -334,21 +314,21 @@ name = "ADCS"
             offset: 99,
             reason: "test",
         });
-        let rows = report.rows(&notices, Some(&end));
+        let rows = report.findings(&notices, Some(&end));
         let got: Vec<(&str, &str, Option<u64>)> = rows
             .iter()
-            .map(|r| (r.kind, r.severity, r.packet_index))
+            .map(|r| (r.kind.name(), r.severity.as_str(), r.packet))
             .collect();
         assert_eq!(
             got,
             [
-                ("gap", SEVERITY_PROBLEM, Some(4)),
-                ("junk", SEVERITY_PROBLEM, None),
-                ("unreadable", SEVERITY_PROBLEM, None),
-                ("length_field", SEVERITY_INFO, None),
-                ("non_packet", SEVERITY_INFO, None),
-                ("time_back", SEVERITY_INFO, Some(3)),
-                ("limit", SEVERITY_PROBLEM, Some(3)),
+                ("gap", "problem", Some(4)),
+                ("junk", "problem", None),
+                ("unreadable", "problem", None),
+                ("length_field", "info", None),
+                ("non_packet", "info", None),
+                ("time_back", "info", Some(3)),
+                ("limit", "problem", Some(3)),
             ],
             "{rows:#?}"
         );

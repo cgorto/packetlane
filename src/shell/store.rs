@@ -16,7 +16,8 @@ use serde::Serialize;
 use crate::pure::config::{Config, SourceInfo};
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
-use crate::pure::ingest::{LaneKey, SEVERITY_PROBLEM, ptype_code};
+use crate::pure::finding::{Kind, Severity};
+use crate::pure::ingest::{LaneKey, ptype_code};
 use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
@@ -270,10 +271,10 @@ impl Store {
                     params![
                         run_id,
                         Option::<i64>::None,
-                        finding.lane_id,
-                        finding.packet_id,
-                        finding.severity,
-                        finding.kind,
+                        finding.lane,
+                        finding.packet,
+                        finding.severity.as_str(),
+                        finding.kind.name(),
                         finding.message
                     ],
                 )?;
@@ -398,8 +399,8 @@ impl Store {
                     file_id,
                     None::<i64>,
                     None::<i64>,
-                    SEVERITY_PROBLEM,
-                    "truncated",
+                    Severity::Problem.as_str(),
+                    Kind::Truncated.name(),
                     message
                 ],
             )?;
@@ -511,7 +512,7 @@ fn ingest_packets(
     }
 
     let report = check.finish();
-    let findings = report.rows(&records.notices(), end.as_ref());
+    let findings = report.findings(&records.notices(), end.as_ref());
     let mut insert_finding = conn.prepare_cached(sql::INSERT_FINDING)?;
     for finding in &findings {
         let lane_id = match finding.lane {
@@ -519,7 +520,7 @@ fn ingest_packets(
             None => None,
         };
         let packet_id = finding
-            .packet_index
+            .packet
             .and_then(|i| i64::try_from(i).ok())
             .map(|i| base_id + i);
         insert_finding.execute(params![
@@ -527,8 +528,8 @@ fn ingest_packets(
             file_id,
             lane_id,
             packet_id,
-            finding.severity,
-            finding.kind,
+            finding.severity.as_str(),
+            finding.kind.name(),
             finding.message
         ])?;
     }
@@ -644,7 +645,7 @@ fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
 
     let mixed = run_query(
         conn,
-        &sql::lanes_with_finding(run_id, "interleaved"),
+        &sql::lanes_with_finding(run_id, Kind::Interleaved.name()),
         usize::MAX,
     )?;
     for row in &mixed.rows {

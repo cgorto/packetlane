@@ -9,21 +9,17 @@
 use std::collections::HashMap;
 
 use crate::pure::config::{LimitState, PacketDef};
+use crate::pure::finding::{Finding, Kind, Severity};
 use crate::pure::format::engineering;
 
 /// Changes reported per field before the rest are only counted.
 const MAX_PER_FIELD: u32 = 20;
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct LimitFinding<L> {
-    /// Whatever the caller uses to say where the packet belongs.
-    pub lane: L,
-    /// Position in the file of the packet that settled the new state, or
-    /// `None` for the closing count of changes not listed.
-    pub packet_index: Option<u64>,
-    pub red: bool,
-    pub message: String,
-}
+/// What this check reports, all of kind [`Kind::Limit`]. `lane` is whatever
+/// the caller uses to say where the packet belongs. `packet` is the packet
+/// that settled the new state, or `None` for the closing count of changes
+/// not listed. Red is a problem; yellow is a note.
+pub type LimitFinding<L> = Finding<L>;
 
 struct Watch<L> {
     state: LimitState,
@@ -103,10 +99,11 @@ impl<L: Clone> LimitChecker<L> {
             } else {
                 format!(" {}", field.unit)
             };
-            self.findings.push(LimitFinding {
+            self.findings.push(Finding {
                 lane: lane.clone(),
-                packet_index: Some(packet_index),
-                red: now.is_red(),
+                packet: Some(packet_index),
+                severity: Severity::problem_if(now.is_red()),
+                kind: Kind::Limit,
                 message: format!(
                     "{} went {}: {value}{unit} (limit {limit})",
                     watch.name,
@@ -122,10 +119,11 @@ impl<L: Clone> LimitChecker<L> {
         let mut rest: Vec<&Watch<L>> = self.watches.values().filter(|w| w.unlisted > 0).collect();
         rest.sort_by(|a, b| a.name.cmp(&b.name));
         for watch in rest {
-            self.findings.push(LimitFinding {
+            self.findings.push(Finding {
                 lane: watch.lane.clone(),
-                packet_index: None,
-                red: false,
+                packet: None,
+                severity: Severity::Info,
+                kind: Kind::Limit,
                 message: format!(
                     "{}: {} more limit changes are not listed",
                     watch.name, watch.unlisted
@@ -168,7 +166,7 @@ mod tests {
         );
         let lines: Vec<(Option<u64>, bool, &str)> = got
             .iter()
-            .map(|f| (f.packet_index, f.red, f.message.as_str()))
+            .map(|f| (f.packet, f.is_problem(), f.message.as_str()))
             .collect();
         assert_eq!(
             lines,
@@ -207,7 +205,7 @@ mod tests {
         assert_eq!(run(&def, &[20.0, 90.0, 20.0, 90.0, 90.0, 20.0]).len(), 0);
         let got = run(&def, &[20.0, 90.0, 90.0, 90.0, 90.0]);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].packet_index, Some(3));
+        assert_eq!(got[0].packet, Some(3));
         // And going back to green takes as long, so a dip does not re-arm it.
         assert_eq!(
             run(&def, &[90.0, 90.0, 90.0, 20.0, 90.0, 90.0, 90.0]).len(),
@@ -223,7 +221,7 @@ mod tests {
         let got = run(&def(1), &temps);
         assert_eq!(got.len(), MAX_PER_FIELD as usize + 1);
         let last = got.last().unwrap();
-        assert_eq!(last.packet_index, None);
+        assert_eq!(last.packet, None);
         assert_eq!(
             last.message,
             "HK TEMP: 30 more limit changes are not listed"
