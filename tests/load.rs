@@ -12,12 +12,21 @@
 //! - `LOAD_PACKETS`: packets per run, about. Default 1,000,000.
 //! - `LOAD_DIR`: where to work. Default: a folder in the temporary
 //!   directory, removed afterwards. A folder given here is kept, with its
-//!   stores, so the page can be opened on them (see `tools/ui-load.js`).
+//!   stores, so the page can be opened on them (see `tools/ui-load.js`),
+//!   and with the times as `long/results.json` and `wide/results.json`.
+//! - `LOAD_BASELINE`: the `LOAD_DIR` of an earlier run. Each time is then
+//!   printed with its change from that run, marked `*` where the change is
+//!   more than `LOAD_NOISE_PCT` percent (default 30). Run the same build
+//!   twice first to see how much the times move on their own.
 //! - `LOAD_BUDGET_MS`: fail if the median answer to any request the page
 //!   makes while panning or zooming takes longer. Default: no limit, the
 //!   times are only printed, because they depend on the machine.
 //! - `LOAD_MAX_RSS_MB`: fail if ingest uses more memory. Default 96, which
 //!   is several times what it uses at any size and far less than a run.
+//!
+//! To try a change, keep it short: `LOAD_PACKETS=300000` takes under a
+//! minute for both runs and shows the same shape. Take the final numbers at
+//! full size, on a machine doing nothing else.
 //!
 //! What always fails a test is what does not depend on the machine: packets
 //! not all stored, an answer larger than the page should ever be sent, or
@@ -184,6 +193,7 @@ struct Timing {
     /// Whether the page makes this request on every pan and zoom.
     interactive: bool,
     first: f64,
+    best: f64,
     median: f64,
     worst: f64,
     bytes: usize,
@@ -223,6 +233,7 @@ impl Table {
             name: name.to_string(),
             interactive,
             first,
+            best: times[0],
             median: times[times.len() / 2],
             worst: times[times.len() - 1],
             bytes,
@@ -230,10 +241,22 @@ impl Table {
         });
     }
 
-    fn print(&self) {
+    /// Prints the times, each with its change from the baseline's median
+    /// where there is one.
+    fn print(&self, baseline: &Baseline) {
         println!(
-            "  {:<44} {:>9} {:>9} {:>9} {:>10}",
-            "request", "first ms", "median", "worst", "bytes"
+            "  {:<44} {:>9} {:>9} {:>9} {:>9} {:>10}  {}",
+            "request",
+            "first ms",
+            "best",
+            "median",
+            "worst",
+            "bytes",
+            if baseline.times.is_empty() {
+                ""
+            } else {
+                "median was"
+            }
         );
         for row in &self.rows {
             let note = if row.stopped > 0 {
@@ -242,9 +265,55 @@ impl Table {
                 ""
             };
             println!(
-                "  {:<44} {:>9.1} {:>9.1} {:>9.1} {:>10}{note}",
-                row.name, row.first, row.median, row.worst, row.bytes
+                "  {:<44} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>10}  {}{note}",
+                row.name,
+                row.first,
+                row.best,
+                row.median,
+                row.worst,
+                row.bytes,
+                baseline.change(&row.name, row.median)
             );
+        }
+    }
+}
+
+/// The times of an earlier run, to compare with: name to milliseconds (or,
+/// for ingest, seconds).
+struct Baseline {
+    times: std::collections::BTreeMap<String, f64>,
+    noise_pct: f64,
+}
+
+impl Baseline {
+    /// Reads the results an earlier run left for the test of this name, if
+    /// `LOAD_BASELINE` says where.
+    fn load(test: &str) -> Baseline {
+        let mut times = std::collections::BTreeMap::new();
+        if let Some(base) = std::env::var_os("LOAD_BASELINE").filter(|b| !b.is_empty()) {
+            let path = PathBuf::from(base).join(test).join("results.json");
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("LOAD_BASELINE: {}: {e}", path.display()));
+            let json: Value = serde_json::from_str(&text).unwrap();
+            for (name, value) in json["times"].as_object().unwrap() {
+                times.insert(name.clone(), value.as_f64().unwrap());
+            }
+        }
+        Baseline {
+            times,
+            noise_pct: setting("LOAD_NOISE_PCT").unwrap_or(30) as f64,
+        }
+    }
+
+    /// "was 12.0 (-40%) *", or nothing if the baseline has no such time.
+    fn change(&self, name: &str, now: f64) -> String {
+        match self.times.get(name) {
+            Some(&was) if was > 0.0 => {
+                let pct = (now - was) / was * 100.0;
+                let mark = if pct.abs() > self.noise_pct { " *" } else { "" };
+                format!("{was:.1} ({pct:+.0}%){mark}")
+            }
+            _ => String::new(),
         }
     }
 }
@@ -253,6 +322,7 @@ impl Table {
 /// what was stored. `expect_packets` is how many packets must be stored,
 /// where the test knows.
 fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) {
+    let baseline = Baseline::load(dir.file_name().unwrap().to_str().unwrap());
     if cfg!(debug_assertions) {
         println!("NOTE: this is a debug build; its times mean nothing. Use --release.");
     }
@@ -298,11 +368,12 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
     assert!(stored > 0, "nothing was stored");
     let secs = took.as_secs_f64();
     println!(
-        "  ingest: {:.1} s for {:.0} MB, {:.1} MB/s, {:.0} packets/s, peak memory {peak_mb} MB",
+        "  ingest: {:.1} s for {:.0} MB, {:.1} MB/s, {:.0} packets/s, peak memory {peak_mb} MB  {}",
         secs,
         input as f64 / 1e6,
         input as f64 / 1e6 / secs,
         stored as f64 / secs,
+        baseline.change("ingest, seconds", secs),
     );
     let (again, _, _) = run(&["ingest", "--db", db_text, run_text]);
     let store_bytes = fs::metadata(&db).unwrap().len();
@@ -474,14 +545,39 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
     let (ingest_took, _, _) = writer.join().unwrap();
     during.sort_by(f64::total_cmp);
 
-    table.print();
+    table.print(&baseline);
+    let during_median = during[during.len() / 2];
     println!(
-        "  one view, a tenth, during a {:.1} s ingest of another run: {} asked, median {:.1} ms, worst {:.1} ms",
+        "  one view, a tenth, during a {:.1} s ingest of another run: {} asked, median {:.1} ms, worst {:.1} ms  {}",
         ingest_took.as_secs_f64(),
         during.len(),
-        during[during.len() / 2],
-        during[during.len() - 1]
+        during_median,
+        during[during.len() - 1],
+        baseline.change("one view during another ingest", during_median),
     );
+
+    // Left beside the store for a later run to compare with.
+    let mut times = serde_json::Map::new();
+    times.insert("ingest, seconds".to_string(), secs.into());
+    times.insert(
+        "one view during another ingest".to_string(),
+        during_median.into(),
+    );
+    for row in &table.rows {
+        times.insert(row.name.clone(), row.median.into());
+    }
+    let results = serde_json::json!({
+        "packets": stored,
+        "lanes": lanes,
+        "peak_memory_mb": peak_mb,
+        "store_bytes": store_bytes,
+        "times": times,
+    });
+    fs::write(
+        dir.join("results.json"),
+        serde_json::to_string_pretty(&results).unwrap(),
+    )
+    .unwrap();
 
     let stopped: Vec<&str> = table
         .rows
