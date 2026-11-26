@@ -426,6 +426,28 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
         })
         .collect();
 
+    // A plot of the whole run must take in every stored value of its
+    // field, whether it is read from the packets or from the buckets kept
+    // for long lanes. This is the only place a run is long enough to have
+    // such buckets.
+    for s in series.iter().filter(|s| s["kind"] == "value").take(3) {
+        let target = format!(
+            "/api/series?run={run_id}&clock=receive&origin={origin}&from={}&to={}&buckets=1200&lane={}&packet={}&field={}",
+            -span / 2,
+            span + span / 2,
+            s["lane"],
+            s["packet"].as_str().unwrap(),
+            s["field"].as_str().unwrap()
+        );
+        let plotted: i64 = client.json(&target)["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p[3].as_i64().unwrap())
+            .sum();
+        assert_eq!(Some(plotted), s["count"].as_i64(), "{target}");
+    }
+
     // What the page asks for at one view, as it asks: packet counts and
     // every plot at once, then the packets themselves if few enough.
     let view = |from: i64, to: i64| {

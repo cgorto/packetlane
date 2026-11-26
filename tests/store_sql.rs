@@ -204,6 +204,20 @@ fn plots_find_one_lanes_packets_by_time() {
             "SEARCH v USING INDEX field_values_packet (packet_id=?)"
         );
     }
+    // On the order clock a window is a range of ids, which is the table's
+    // own order. The lane-first indexes do not hold ids in order, and
+    // taking one would read the whole lane for any window.
+    let by_id = "USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)";
+    let plan_of = plan(
+        &store.conn,
+        &sql::lag_series(1, Clock::Order, 2, 10, 500, 100),
+    );
+    assert_eq!(step(&plan_of, "packets"), format!("SEARCH packets {by_id}"));
+    let q = sql::value_series(1, Clock::Order, 2, "SIM_HK", "BUS_VOLTS", 10, 500, 100);
+    assert_eq!(
+        step(&plan(&store.conn, &q), "p"),
+        format!("SEARCH p {by_id}")
+    );
 }
 
 /// The comparison of sources reads the packets twice, whatever the number
@@ -431,6 +445,16 @@ fn check_series(conn: &Connection) -> usize {
         },
     );
     assert_eq!(counted, from_values);
+    // And nothing is left behind from a file that was read again.
+    let left = rows(
+        conn,
+        &Query {
+            sql: "SELECT COUNT(*) FROM file_series WHERE file_id NOT IN (SELECT id FROM files)"
+                .to_string(),
+            params: vec![],
+        },
+    );
+    assert_eq!(left[0][0], "0");
     counted.len()
 }
 
@@ -448,15 +472,29 @@ fn the_list_of_kept_fields_follows_the_stored_values() {
     let whole = check_series(&store.conn);
     assert!(whole >= 2, "the demo keeps two fields");
 
-    // A file read again with less in it.
-    let (rel, bytes) = files
-        .iter()
-        .filter(|(rel, _)| rel.ends_with(".bin"))
-        .max_by_key(|(_, bytes)| bytes.len())
-        .unwrap();
-    std::fs::write(run.join(rel), &bytes[..bytes.len() / 3]).unwrap();
+    // A file that holds kept values, read again with a third of it left.
+    let one = |sql: &str| {
+        rows(
+            &store.conn,
+            &Query {
+                sql: sql.to_string(),
+                params: vec![],
+            },
+        )[0][0]
+            .clone()
+    };
+    let rel = one(
+        "SELECT f.rel FROM file_series s JOIN files f ON f.id = s.file_id
+         ORDER BY s.count DESC LIMIT 1",
+    );
+    let total = "SELECT SUM(count) FROM file_series";
+    let before: i64 = one(total).parse().unwrap();
+    let bytes = &files.iter().find(|(r, _)| *r == rel).unwrap().1;
+    std::fs::write(run.join(&rel), &bytes[..bytes.len() / 3]).unwrap();
     ingest(&db, &run);
     assert!(check_series(&store.conn) > 0);
+    let after: i64 = one(total).parse().unwrap();
+    assert!(after > 0 && after < before, "{after} of {before}");
 
     // The configuration changed, so the whole run is read again: one field
     // is no longer kept.

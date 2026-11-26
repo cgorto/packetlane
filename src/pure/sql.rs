@@ -347,7 +347,9 @@ impl Clock {
         match self {
             Clock::Receive => "INDEXED BY packets_lane_receive",
             Clock::Packet => "INDEXED BY packets_lane_packet",
-            Clock::Order => "",
+            // By id, as for every lane: no index holds a lane's ids in
+            // order, and SQLite would otherwise read the whole lane.
+            Clock::Order => "NOT INDEXED",
         }
     }
 }
