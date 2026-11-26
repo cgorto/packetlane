@@ -25,7 +25,7 @@ RUN dnf install -y gcc gcc-c++ make git tar xz which clang-tools-extra \
 #
 # Without internet access, either point rustup at a mirror with
 # RUSTUP_DIST_SERVER and RUSTUP_UPDATE_ROOT, or replace this step with
-# `dnf install -y rust-toolset` if that provides Rust 1.88 or newer, which
+# `dnf install -y rust-toolset` if that provides Rust 1.89 or newer, which
 # this project needs.
 ENV RUSTUP_HOME=/opt/rust/rustup \
     PATH=/opt/rust/cargo/bin:/usr/local/bin:$PATH

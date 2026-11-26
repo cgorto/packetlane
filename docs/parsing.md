@@ -682,6 +682,18 @@ file plus these lines in `src/pure/decode/mod.rs`.
 - **Convert receive times to Unix nanoseconds.** If the container carries a
   receive timestamp, store it as `Option<i64>` nanoseconds since
   `1970-01-01T00:00:00Z`.
+- **Give the same records however the bytes arrive.** The shell hands a
+  decoder whatever it has read so far, so a `NeedMore` step must change no
+  state, and nothing may be decided from where a read happened to end.
+- **A cut file reads as the start of the whole one**, ending in `NeedMore`,
+  never in `Fatal`.
+
+`tests/robustness.rs` checks the rules that can be checked from outside
+(no panic, sound `consumed` values, no invented bytes, and the last two)
+against every decoder, on sound files, files cut at every length, and
+thousands of damaged ones made from a fixed seed. **Add a sound sample of a
+new format to `samples()` there**; that is all it takes to put the new
+decoder under the same tests.
 
 ---
 

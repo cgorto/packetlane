@@ -335,7 +335,8 @@ been built here.
 
 - **Log grab**: collecting logs for a time window from a list of hosts.
 - **Compare two runs** of the same scenario on a shared time axis.
-- **Live tail** of a log that is still being written.
+- **Live tail** of a log that is still being written, and **live ingest**
+  from a TCP or UDP port a simulator sends telemetry on.
 - **Problem report export** to attach to a ticket.
 - Other channel codes: convolutional, turbo and LDPC (a file must hold hard
   decisions that are already frame-aligned; Reed-Solomon and BCH are the only
@@ -376,7 +377,8 @@ been built here.
 src/pure/     functional core: decoders, frames and codes, checks, config, SQL text, HTTP and API as values
 src/shell/    imperative shell: files, SQLite, sockets, command line
 web/          the page: structure, style, script (embedded at build time)
-tests/        end-to-end tests, and the test that keeps I/O out of src/pure
+tests/        end-to-end tests, decoders against damaged input, and the test
+              that keeps I/O out of src/pure
 docs/         architecture.md, parsing.md
 container/    development container stub and editor settings
 ```

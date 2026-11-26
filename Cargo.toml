@@ -2,7 +2,7 @@
 name = "packetlane"
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Read-only checker and timeline for CCSDS space packet logs gathered from several hosts"
 license = "MIT OR Apache-2.0"
 publish = false
