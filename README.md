@@ -275,7 +275,8 @@ been built here.
 
 - **Log grab**: collecting logs for a time window from a list of hosts.
 - **Compare two runs** of the same scenario on a shared time axis.
-- **Live tail** of a log that is still being written.
+- **Live tail** of a log that is still being written, and **live ingest**
+  from a TCP or UDP port a simulator sends telemetry on.
 - **Problem report export** to attach to a ticket.
 - Reed-Solomon error correction of transfer frames, and TC frames.
 - Plots show one series each: no overlaying two fields, no fixed or shared
