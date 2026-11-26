@@ -92,6 +92,9 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
 
     let mut checker = Checker::new();
     let mut order = OrderChecker::new();
+    // Position in the file, counting every logged item, as the store
+    // numbers them: a finding names the same packet in both.
+    let mut index = 0u64;
     let mut packets = 0u64;
     let mut other = 0u64;
     let mut wrong_length = 0u64;
@@ -100,16 +103,19 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let mut records = Records::new(BufReader::new(&mut file), decoder);
     for item in &mut records {
         match item {
-            Ok(record) => match logged_header(&record.payload, record.label.is_some()) {
-                Some((header, length_ok)) => {
-                    wrong_length += u64::from(!length_ok);
-                    // No configuration here, so no packet time to compare.
-                    order.observe(packets, &header, None);
-                    packets += 1;
-                    checker.observe(&header, record.offset);
+            Ok(record) => {
+                match logged_header(&record.payload, record.label.is_some()) {
+                    Some((header, length_ok)) => {
+                        wrong_length += u64::from(!length_ok);
+                        // No configuration here, so no packet time to compare.
+                        order.observe(index, &header, None);
+                        packets += 1;
+                        checker.observe_at(index, &header, record.offset);
+                    }
+                    None => other += 1,
                 }
-                None => other += 1,
-            },
+                index += 1;
+            }
             Err(e) => read_problem = Some(e.to_string()),
         }
     }
