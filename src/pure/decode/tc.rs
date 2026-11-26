@@ -393,11 +393,19 @@ impl TcDecoder {
             }
             self.open_ended = None;
         }
-        // Not a CLTU: skip to the next thing that might start one. The last
-        // byte is kept, as a start sequence may be split across reads.
-        let consumed = (1..buf.len())
-            .find(|&i| buf[i] == START[0] && buf.get(i + 1).is_none_or(|&b| b == START[1]))
-            .unwrap_or(buf.len());
+        // Not a CLTU: skip to the next byte this function would not take
+        // for junk if it stood first. That is a possible start sequence
+        // (one cut off by the end of the read counts, as the rest may
+        // follow), and also fill and a possible tail. Stopping at those
+        // too is what makes the count of junk the same however the file
+        // is read: stepping over them here would call them junk in a long
+        // read and idle in a short one.
+        let stands_out = |i: usize| {
+            buf[i] == FILL
+                || buf[i] == TAIL[0]
+                || (buf[i] == START[0] && buf.get(i + 1).is_none_or(|&b| b == START[1]))
+        };
+        let consumed = (1..buf.len()).find(|&i| stands_out(i)).unwrap_or(buf.len());
         if self.in_bad_cltu {
             return Step::Skip { consumed };
         }
