@@ -3,17 +3,15 @@
 use crate::pure::ccsds::{PacketType, PrimaryHeader, SeqFlags};
 use crate::pure::checksum::fnv1a;
 use crate::pure::config::ResolvedTime;
-use crate::pure::continuity::{Finding, FindingKind, Report, StreamKey};
+use crate::pure::continuity::{Report, StreamKey};
 use crate::pure::decode::{DecodeEnd, Notices, Record};
+use crate::pure::finding::{FileFinding, Finding, Kind, Severity};
 use crate::pure::format::packet_time_ns;
 
 /// What kind of thing a timeline lane holds.
 pub const LANE_PACKET: &str = "packet";
 pub const LANE_OTHER: &str = "other";
 pub const LANE_LOG: &str = "log";
-
-pub const SEVERITY_PROBLEM: &str = "problem";
-pub const SEVERITY_INFO: &str = "info";
 
 /// Identifies a lane within one run and source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -173,43 +171,6 @@ pub fn packet_row(
     }
 }
 
-/// One row of the `findings` table, minus ids.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FindingRow {
-    pub lane: Option<LaneKey>,
-    /// Position in the file of the packet the finding points at.
-    pub packet_index: Option<u64>,
-    pub severity: &'static str,
-    pub kind: &'static str,
-    pub message: String,
-}
-
-fn kind_name(kind: &FindingKind) -> &'static str {
-    match kind {
-        FindingKind::Gap { .. } => "gap",
-        FindingKind::Duplicate { .. } => "duplicate",
-        FindingKind::Reset { .. } => "reset",
-        FindingKind::Interleaved { .. } => "interleaved",
-        FindingKind::Stray { .. } => "stray",
-        FindingKind::Suppressed { .. } => "suppressed",
-        FindingKind::Constant { .. } => "constant_count",
-    }
-}
-
-fn finding_row(finding: &Finding) -> FindingRow {
-    FindingRow {
-        lane: Some(LaneKey::stream(finding.key)),
-        packet_index: Some(finding.packet_index),
-        severity: if finding.is_problem() {
-            SEVERITY_PROBLEM
-        } else {
-            SEVERITY_INFO
-        },
-        kind: kind_name(&finding.kind),
-        message: finding.summary(),
-    }
-}
-
 /// Message for records in a packet file that are not CCSDS space packets.
 pub fn non_packet_message(count: u64) -> String {
     if count == 1 {
@@ -219,66 +180,56 @@ pub fn non_packet_message(count: u64) -> String {
     }
 }
 
-/// The findings for one packet file: the continuity report, what the
-/// decoder gave up on, how the read ended, how many commands per stream had
-/// a wrong length field, and how many logged items were not space packets.
+/// The findings for one packet file that no check of packets in order
+/// makes: the continuity report, what the decoder gave up on, how the read
+/// ended, how many commands per stream had a wrong length field, and how
+/// many logged items were not space packets. In that order, which is the
+/// order they are stored in.
 pub fn file_findings(
     report: &Report,
     notices: &Notices,
     end: Option<&DecodeEnd>,
     wrong_length: &[(StreamKey, u64)],
     non_packets: u64,
-) -> Vec<FindingRow> {
-    let mut rows: Vec<FindingRow> = report.findings.iter().map(finding_row).collect();
-    rows.extend(notices.list.iter().map(|notice| FindingRow {
-        lane: None,
-        packet_index: None,
-        severity: if notice.is_problem() {
-            SEVERITY_PROBLEM
-        } else {
-            SEVERITY_INFO
-        },
-        kind: notice.kind(),
-        message: notice.to_string(),
-    }));
+) -> Vec<FileFinding> {
+    let in_stream = |key: StreamKey| Some(LaneKey::stream(key));
+    let mut found: Vec<FileFinding> = report
+        .findings
+        .iter()
+        .map(|f| f.finding().map_lane(in_stream))
+        .collect();
+    found.extend(notices.list.iter().map(|notice| notice.finding()));
     if notices.more > 0 {
-        rows.push(FindingRow {
-            lane: None,
-            packet_index: None,
-            severity: SEVERITY_INFO,
-            kind: "suppressed",
-            message: format!("{} more losses in this file are not listed", notices.more),
-        });
+        found.push(Finding::file(
+            Severity::Info,
+            Kind::Suppressed,
+            format!("{} more losses in this file are not listed", notices.more),
+        ));
     }
     if let Some(end) = end {
-        rows.push(FindingRow {
-            lane: None,
-            packet_index: None,
-            severity: SEVERITY_PROBLEM,
-            kind: match end {
-                DecodeEnd::Truncated { .. } => "truncated",
-                DecodeEnd::Error(_) => "unreadable",
-            },
-            message: end.to_string(),
-        });
+        let kind = match end {
+            DecodeEnd::Truncated { .. } => Kind::Truncated,
+            DecodeEnd::Error(_) => Kind::Unreadable,
+        };
+        found.push(Finding::file(Severity::Problem, kind, end.to_string()));
     }
-    rows.extend(wrong_length.iter().map(|&(key, count)| FindingRow {
-        lane: Some(LaneKey::stream(key)),
-        packet_index: None,
-        severity: SEVERITY_INFO,
-        kind: "length_field",
+    found.extend(wrong_length.iter().map(|&(key, count)| Finding {
+        lane: in_stream(key),
+        packet: None,
+        severity: Severity::Info,
+        kind: Kind::LengthField,
         message: wrong_length_message(count),
     }));
     if non_packets > 0 {
-        rows.push(FindingRow {
+        found.push(Finding {
             lane: Some(LaneKey::other()),
-            packet_index: None,
-            severity: SEVERITY_INFO,
-            kind: "non_packet",
+            packet: None,
+            severity: Severity::Info,
+            kind: Kind::NonPacket,
             message: non_packet_message(non_packets),
         });
     }
-    rows
+    found
 }
 
 /// A file's path within its run, with forward slashes, from the two
@@ -441,8 +392,8 @@ mod tests {
             3,
         );
         assert_eq!(rows.len(), 4);
-        assert_eq!(rows[2].kind, "length_field");
-        assert_eq!(rows[2].severity, SEVERITY_INFO);
+        assert_eq!(rows[2].kind, Kind::LengthField);
+        assert_eq!(rows[2].severity, Severity::Info);
         assert_eq!(rows[2].lane.unwrap().apid, 999);
         assert_eq!(
             rows[2].message,
@@ -450,17 +401,17 @@ mod tests {
              the size the log recorded is used"
         );
         let rows = [&rows[0], &rows[1], &rows[3]];
-        assert_eq!(rows[0].kind, "gap");
-        assert_eq!(rows[0].packet_index, Some(6));
+        assert_eq!(rows[0].kind, Kind::Gap);
+        assert_eq!(rows[0].packet, Some(6));
         assert_eq!(rows[0].lane.unwrap().apid, 0x064);
         assert_eq!(
             rows[0].message,
             "3 packets missing (expected sequence count 3, got 6)"
         );
-        assert_eq!(rows[1].kind, "unreadable");
+        assert_eq!(rows[1].kind, Kind::Unreadable);
         assert!(rows[1].lane.is_none());
-        assert_eq!(rows[2].kind, "non_packet");
-        assert_eq!(rows[2].severity, SEVERITY_INFO);
+        assert_eq!(rows[2].kind, Kind::NonPacket);
+        assert_eq!(rows[2].severity, Severity::Info);
     }
 
     #[test]

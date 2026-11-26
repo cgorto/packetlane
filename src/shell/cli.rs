@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::pure::api::check_user_sql;
 use crate::pure::args::Args;
 use crate::pure::config::Config;
-use crate::pure::continuity::FindingKind;
+use crate::pure::continuity::SeqKind;
 use crate::pure::cosmos_defs;
 use crate::pure::decode::decoder_for;
 use crate::pure::ingest::{non_packet_message, wrong_length_message};
@@ -130,19 +130,19 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     }
     for finding in &report.findings {
         let what = match finding.kind {
-            FindingKind::Constant { .. } => "Note",
+            SeqKind::Constant { .. } => "Note",
             _ => "Problem",
         };
         println!("  {what}: {finding}");
     }
     let order = &found.order;
     for finding in order {
-        match finding.packet_index {
+        match finding.packet {
             Some(i) => println!(
                 "  Problem: {}: {} at packet #{i}",
-                finding.key, finding.message
+                finding.lane, finding.message
             ),
-            None => println!("  Problem: {}: {}", finding.key, finding.message),
+            None => println!("  Problem: {}: {}", finding.lane, finding.message),
         }
     }
     let notices = records.notices();
@@ -169,7 +169,7 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let counted = report
         .findings
         .iter()
-        .any(|f| !matches!(f.kind, FindingKind::Constant { .. }));
+        .any(|f| !matches!(f.kind, SeqKind::Constant { .. }));
     Ok(counted || !order.is_empty() || read_problem.is_some() || lost)
 }
 

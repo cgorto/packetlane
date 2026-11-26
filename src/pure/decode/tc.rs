@@ -502,6 +502,7 @@ impl Decoder for TcDecoder {
 mod tests {
     use super::*;
     use crate::pure::decode::{DecodeEnd, Format, decode_all, decode_all_noting, sniff};
+    use crate::pure::finding::Kind;
     use crate::pure::synth::{TcFrame, cltu, tc_packet, tc_segments};
     use crate::pure::tc::{TcLayout, sniff_cltus, sniff_frames};
 
@@ -791,7 +792,7 @@ mod tests {
             };
             assert_eq!(notices, std::slice::from_ref(&want));
             assert!(!want.is_problem());
-            assert_eq!(want.kind(), "control_frame");
+            assert_eq!(want.kind(), Kind::ControlFrame);
 
             // Set V(R) says what the next AD frame is held to.
             let mut skipped = units.clone();

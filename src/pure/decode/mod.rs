@@ -7,6 +7,7 @@
 use std::fmt;
 
 use crate::pure::config::Config;
+use crate::pure::finding::{FileFinding, Finding, Kind, Severity};
 use crate::pure::frame::Layout;
 use crate::pure::tc::TcLayout;
 
@@ -105,14 +106,23 @@ pub struct Notice {
 
 impl Notice {
     /// The finding kind this is stored as.
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> Kind {
         match self.loss {
-            Loss::Junk { .. } => "junk",
-            Loss::BadFrame { .. } => "bad_frame",
-            Loss::FrameGap { .. } => "frame_gap",
-            Loss::Corrected { .. } => "corrected",
-            Loss::ControlFrames { .. } => "control_frame",
+            Loss::Junk { .. } => Kind::Junk,
+            Loss::BadFrame { .. } => Kind::BadFrame,
+            Loss::FrameGap { .. } => Kind::FrameGap,
+            Loss::Corrected { .. } => Kind::Corrected,
+            Loss::ControlFrames { .. } => Kind::ControlFrame,
         }
+    }
+
+    /// As every check reports. A notice is about the file, not a lane.
+    pub fn finding(&self) -> FileFinding {
+        Finding::file(
+            Severity::problem_if(self.is_problem()),
+            self.kind(),
+            self.to_string(),
+        )
     }
 
     /// False for what is normal in a healthy capture: one that starts
