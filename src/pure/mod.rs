@@ -17,6 +17,7 @@ pub mod ingest;
 pub mod limits;
 pub mod order;
 pub mod paths;
+pub mod pipeline;
 pub mod rs;
 pub mod sql;
 pub mod synth;

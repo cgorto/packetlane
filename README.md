@@ -374,7 +374,8 @@ been built here.
 ## Layout
 
 ```
-src/pure/     functional core: decoders, frames and codes, checks, config, SQL text, HTTP and API as values
+src/pure/     functional core: decoders, frames and codes, checks, config, SQL text, HTTP and API as values.
+              pipeline.rs is where a file's records become rows and findings, for the store and for `check` alike
 src/shell/    imperative shell: files, SQLite, sockets, command line
 web/          the page: structure, style, script (embedded at build time)
 tests/        end-to-end tests, decoders against damaged input, and the test

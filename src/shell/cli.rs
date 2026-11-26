@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use crate::pure::api::check_user_sql;
 use crate::pure::args::Args;
-use crate::pure::continuity::{Checker, FindingKind};
+use crate::pure::config::Config;
+use crate::pure::continuity::FindingKind;
 use crate::pure::cosmos_defs;
 use crate::pure::decode::decoder_for;
-use crate::pure::ingest::{logged_header, non_packet_message, wrong_length_message};
-use crate::pure::order::OrderChecker;
+use crate::pure::ingest::{non_packet_message, wrong_length_message};
+use crate::pure::pipeline::FileCheck;
 use crate::pure::sql::Cell;
 use crate::pure::synth::demo_run;
 use crate::shell::files::{Records, open_sniffed};
@@ -90,49 +91,37 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let wrapped = if file.is_gzip() { ", in gzip" } else { "" };
     println!("{path}: format {}{certainty}{wrapped}", format.name());
 
-    let mut checker = Checker::new();
-    let mut order = OrderChecker::new();
-    // Position in the file, counting every logged item, as the store
-    // numbers them: a finding names the same packet in both.
-    let mut index = 0u64;
-    let mut packets = 0u64;
-    let mut other = 0u64;
-    let mut wrong_length = 0u64;
+    // No configuration here: packets go unnamed, and there is no packet
+    // time to compare and no limit to check.
+    let config = Config::default();
+    let mut check = FileCheck::new(&config, &config.source_for(""));
     let mut read_problem = None;
     let mut file = file;
     let mut records = Records::new(BufReader::new(&mut file), decoder);
     for item in &mut records {
         match item {
             Ok(record) => {
-                match logged_header(&record.payload, record.label.is_some()) {
-                    Some((header, length_ok)) => {
-                        wrong_length += u64::from(!length_ok);
-                        // No configuration here, so no packet time to compare.
-                        order.observe(index, &header, None);
-                        packets += 1;
-                        checker.observe_at(index, &header, record.offset);
-                    }
-                    None => other += 1,
-                }
-                index += 1;
+                check.observe(&record);
             }
             Err(e) => read_problem = Some(e.to_string()),
         }
     }
-    let report = checker.finish();
+    let found = check.finish();
+    let report = &found.continuity;
     if let Some(about) = records.describe() {
         println!("{path}: {about}");
     }
 
-    let streams = report.streams.len() as u64;
+    let (packets, streams) = (found.packets, report.streams.len() as u64);
     println!(
         "{path}: {packets} {}, {streams} {}",
         plural(packets, "packet", "packets"),
         plural(streams, "stream", "streams"),
     );
-    if other > 0 {
-        println!("  {}", non_packet_message(other));
+    if found.non_packets() > 0 {
+        println!("  {}", non_packet_message(found.non_packets()));
     }
+    let wrong_length: u64 = found.wrong_length.iter().map(|(_, n)| n).sum();
     if wrong_length > 0 {
         println!("  Note: {}", wrong_length_message(wrong_length));
     }
@@ -146,8 +135,8 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         };
         println!("  {what}: {finding}");
     }
-    let order = order.finish();
-    for finding in &order {
+    let order = &found.order;
+    for finding in order {
         match finding.packet_index {
             Some(i) => println!(
                 "  Problem: {}: {} at packet #{i}",

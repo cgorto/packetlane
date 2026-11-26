@@ -2,7 +2,7 @@
 //! what the statements are, and what their results mean, is decided in
 //! `pure::sql`, `pure::ingest` and `pure::cross`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -13,16 +13,11 @@ use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
 
-use crate::pure::config::{Config, ResolvedTime, SourceInfo};
-use crate::pure::continuity::{Checker, StreamKey};
+use crate::pure::config::{Config, SourceInfo};
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
-use crate::pure::format::kept_values;
-use crate::pure::ingest::{
-    FindingRow, LaneKey, SEVERITY_INFO, SEVERITY_PROBLEM, file_findings, packet_row, ptype_code,
-};
-use crate::pure::limits::LimitChecker;
-use crate::pure::order::OrderChecker;
+use crate::pure::ingest::{LaneKey, SEVERITY_PROBLEM, ptype_code};
+use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
@@ -185,7 +180,6 @@ impl Store {
         now_ns: i64,
     ) -> Result<IngestSummary> {
         let config = Config::parse(config_text).map_err(|e| format!("Config error: {e}"))?;
-        let time_rule = config.resolved_time();
         let root_text = root.to_string_lossy().into_owned();
 
         // Names, clock corrections and time formats are applied while files
@@ -233,7 +227,7 @@ impl Store {
         let mut outcomes = Vec::with_capacity(files.len());
         let mut changed = false;
         for (path, rel) in files {
-            let outcome = match self.ingest_file(run_id, path, rel, &config, time_rule.as_ref()) {
+            let outcome = match self.ingest_file(run_id, path, rel, &config) {
                 Ok(outcome) => outcome,
                 Err(e) => FileOutcome {
                     rel: rel.clone(),
@@ -307,7 +301,6 @@ impl Store {
         path: &Path,
         rel: &str,
         config: &Config,
-        time_rule: Option<&ResolvedTime>,
     ) -> Result<FileOutcome> {
         // Opened read-only, twice: once to identify the content, once to parse it.
         let (checksum, size) = Hashing::new(File::open(path)?).finish()?;
@@ -374,8 +367,7 @@ impl Store {
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
                 let (packets, note) = ingest_packets(
-                    &tx, &mut file, decoder, config, file_id, run_id, &source, time_rule,
-                    &mut lanes,
+                    &tx, &mut file, decoder, config, file_id, run_id, &source, &mut lanes,
                 )?;
                 (packets, 0, note)
             }
@@ -474,26 +466,13 @@ fn ingest_packets(
     file_id: i64,
     run_id: i64,
     source: &SourceInfo,
-    time_rule: Option<&ResolvedTime>,
     lanes: &mut Lanes<'_>,
 ) -> Result<(u64, String)> {
     let base_id: i64 = conn.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
-    let mut checker = Checker::new();
-    let mut limits = LimitChecker::default();
-    let mut order = OrderChecker::new();
-    let mut count = 0u64;
-    let mut non_packets = 0u64;
-    let mut wrong_length: BTreeMap<StreamKey, u64> = BTreeMap::new();
+    let mut check = FileCheck::new(config, source);
     let mut end = None;
-
-    // Most runs have no definition with limits or kept fields; then there
-    // is no need to look one up for every packet.
-    let watched = config
-        .packets
-        .iter()
-        .any(|d| d.fields.iter().any(|f| f.limits.is_some() || f.keep));
 
     let mut records = Records::new(BufReader::new(file), decoder);
     for item in &mut records {
@@ -505,34 +484,11 @@ fn ingest_packets(
                 break;
             }
         };
-        let row = packet_row(count, &record, time_rule, source.clock_offset_ns);
+        let Seen { row, values } = check.observe(&record);
         let packet_id = base_id + row.idx;
-        let def = match watched {
-            true => config.packet_for(record.label.as_deref(), row.header.as_ref()),
-            false => None,
-        };
-        if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.limits.is_some())) {
-            // The definition's address tells it apart from the others.
-            let id = std::ptr::from_ref(def) as usize;
-            limits.observe(count, id, def, &record.payload, &row.lane());
-        }
         let lane_id = lanes.id(conn, row.lane())?;
-        match &row.header {
-            Some(header) => {
-                checker.observe_at(count, header, record.offset);
-                order.observe(count, header, row.packet_ns);
-                if !row.length_ok {
-                    let key = StreamKey {
-                        apid: header.apid,
-                        packet_type: header.packet_type,
-                    };
-                    *wrong_length.entry(key).or_default() += 1;
-                }
-            }
-            None => non_packets += 1,
-        }
         insert.execute(params![
-            base_id + row.idx,
+            packet_id,
             file_id,
             lane_id,
             row.idx,
@@ -547,43 +503,15 @@ fn ingest_packets(
             row.label,
         ])?;
         // After the packet's own row, which these rows point at.
-        if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.keep)) {
-            for (field, num, text) in kept_values(def, &record.payload) {
-                insert_value.execute(params![packet_id, file_id, def.name, field, num, text])?;
-            }
+        for v in values {
+            insert_value.execute(params![
+                packet_id, file_id, v.packet, v.field, v.num, v.text
+            ])?;
         }
-        count += 1;
     }
 
-    let mut findings: Vec<FindingRow> = file_findings(
-        &checker.finish(),
-        &records.notices(),
-        end.as_ref(),
-        &wrong_length.into_iter().collect::<Vec<_>>(),
-        non_packets,
-    );
-    findings.extend(order.finish().into_iter().map(|f| FindingRow {
-        lane: Some(LaneKey::stream(f.key)),
-        packet_index: f.packet_index,
-        severity: if f.problem {
-            SEVERITY_PROBLEM
-        } else {
-            SEVERITY_INFO
-        },
-        kind: f.kind,
-        message: f.message,
-    }));
-    findings.extend(limits.finish().into_iter().map(|f| FindingRow {
-        lane: Some(f.lane),
-        packet_index: f.packet_index,
-        severity: if f.red {
-            SEVERITY_PROBLEM
-        } else {
-            SEVERITY_INFO
-        },
-        kind: "limit",
-        message: f.message,
-    }));
+    let report = check.finish();
+    let findings = report.rows(&records.notices(), end.as_ref());
     let mut insert_finding = conn.prepare_cached(sql::INSERT_FINDING)?;
     for finding in &findings {
         let lane_id = match finding.lane {
@@ -610,7 +538,7 @@ fn ingest_packets(
         .into_iter()
         .chain(end.map(|e| e.to_string()))
         .collect();
-    Ok((count, note.join("; ")))
+    Ok((report.records, note.join("; ")))
 }
 
 /// Reads one line, newline included, keeping at most `max` bytes of it.
