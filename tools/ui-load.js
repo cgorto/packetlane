@@ -77,10 +77,11 @@ const WRAP_DRAW = `(() => {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'packetlane-ui-'));
   const chrome = spawn(chromePath, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
     `--window-size=${WIDTH},${HEIGHT}`, '--no-first-run', '--no-default-browser-check', '--disable-extensions', 'about:blank'],
-  { stdio: ['ignore', 'ignore', 'pipe'] });
-  // Chrome goes on writing to its profile for a moment after it is told to
-  // stop, so stop it outright and try the removal more than once.
-  const cleanup = () => { try { chrome.kill('SIGKILL'); } catch (e) { /* gone already */ } try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch (e) { /* leave it */ } };
+  { stdio: ['ignore', 'ignore', 'pipe'], detached: true });
+  // Chrome's helper processes go on writing to its profile after the main
+  // one stops, so stop the whole group outright and try the removal more
+  // than once.
+  const cleanup = () => { try { process.kill(-chrome.pid, 'SIGKILL'); } catch (e) { /* gone already */ } try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch (e) { /* leave it */ } };
   process.on('exit', cleanup);
 
   // Chrome prints the port it chose.
