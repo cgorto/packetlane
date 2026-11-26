@@ -381,7 +381,8 @@ src/shell/    imperative shell: files, SQLite, sockets, command line
 web/          the page: structure, style, script (embedded at build time)
 tests/        end-to-end tests, decoders against damaged input, and the test
               that keeps I/O out of src/pure
-              load.rs measures large runs and is run only when asked for
+              load.rs measures large runs and is run only when asked for;
+              store_sql.rs pins which index each view of the timeline uses
 tools/        ui-load.js measures the page in a headless Chrome
 docs/         architecture.md, parsing.md
 container/    development container stub and editor settings
@@ -405,6 +406,12 @@ sets the size and `LOAD_DIR` keeps the stores; the top of `tests/load.rs`
 lists the other settings. It fails on what does not depend on the machine:
 packets not stored, an answer too large to send, ingest holding a run in
 memory. Times fail it only if `LOAD_BUDGET_MS` is set.
+
+To see what a change did, run once with `LOAD_DIR=before`, make the
+change, and run again with `LOAD_DIR=after LOAD_BASELINE=before`: each
+time is printed with its change, and marked where that is more than the
+times move on their own. `LOAD_PACKETS=300000` does both runs in under a
+minute.
 
 ```
 packetlane serve --db store.db --root <run folder>
