@@ -676,8 +676,9 @@ file plus these lines in `src/pure/decode/mod.rs`.
 - **Report byte offsets.** Put the payload's file offset on `Record.offset`,
   and the offending entry's file offset on `DecodeError::Implausible.offset`.
 - **Keep container and packet parsing apart.** Return the raw payload bytes in
-  `Record.payload`. Shared code (`pure::ingest::whole_packet_header` and
-  `shell::cli`) decides whether the payload is a space packet and routes
+  `Record.payload`. Shared code (`pure::pipeline::FileCheck`, which every
+  record of every format goes through, and `pure::ingest::logged_header`
+  under it) decides whether the payload is a space packet and routes
   non-packets to their own lane.
 - **Convert receive times to Unix nanoseconds.** If the container carries a
   receive timestamp, store it as `Option<i64>` nanoseconds since
