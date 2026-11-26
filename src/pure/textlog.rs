@@ -5,7 +5,7 @@ use regex::Regex;
 use crate::pure::time::{self, Civil, NS_PER_SEC};
 
 /// Matches an ISO-like timestamp anywhere in the first 64 characters of a line.
-pub const DEFAULT_PATTERN: &str = r"^.{0,64}?(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})[T ](?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:[.,](?P<frac>\d{1,9}))?(?P<tz>Z|[+-]\d{2}:?\d{2})?";
+pub const DEFAULT_PATTERN: &str = r"^.{0,64}?(?P<year>\d{4})[-/](?P<month>\d{2})[-/](?P<day>\d{2})[T ](?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})(?:[.,](?P<frac>\d{1,9}))?(?P<tz>Z|[+-]\d{2}:?\d{2})?";
 
 const MAX_ENTRY_BYTES: usize = 65_536;
 const TRUNCATED_SUFFIX: &str = "\n[truncated]";
@@ -429,6 +429,11 @@ mod tests {
     #[test]
     fn default_iso_pattern_and_first_64_chars() {
         let fmt = LogFormat::iso();
+        // COSMOS message logs write the date with slashes.
+        assert_eq!(
+            fmt.timestamp("2026/01/02 03:04:05.123  INFO: Log File Opened : x.bin"),
+            Some(iso_ns("2026-01-02T03:04:05.123Z"))
+        );
         assert_eq!(
             fmt.timestamp("[INFO] 2026-01-02T03:04:05.123Z link up"),
             Some(iso_ns("2026-01-02T03:04:05.123Z"))

@@ -43,7 +43,8 @@ file container      whatever the logging program wraps around each entry
   are packed inside frames and can straddle two frames, so they must be
   reassembled before packet parsing. Treat transfer frames as a separate layer
   that outputs a packet stream; do not mix reassembly into a packet parser.
-  (This codebase does not implement a transfer-frame layer yet.)
+  Here that layer is `src/pure/frame.rs` (one frame) and
+  `src/pure/decode/cadu.rs` (finding frames and reassembling packets).
 
 A decoder's job ends at: "here is one logged item, the byte offset where its
 payload starts in the file, and the receive time and label if the container
@@ -484,6 +485,9 @@ pub enum Step {
     /// `consumed` bytes of structure (a file header, a declaration) that
     /// produced no record. Drop them and call again.
     Skip { consumed: usize },
+    /// `consumed` bytes that could not be turned into records, and what
+    /// that cost. Drop them and call again.
+    Lost { consumed: usize, notice: Notice },
     /// The next entry is not complete in the bytes offered. Call again with
     /// the same bytes plus more. At end of file this means a truncated tail.
     NeedMore,
@@ -767,17 +771,19 @@ can jump straight to the bytes with `xxd -s 0x4f2a10 -l 64 file.bin`.
 **Rule:** Decide the resynchronisation policy per format:
 
 - **Formats with a sync marker** (such as transfer frames starting with
-  `1A CF FC 1D`): scan forward to the next marker, verify markers repeat at the
-  expected frame spacing, and report how many bytes were skipped. (Not yet
-  implemented in this codebase.)
+  `1A CF FC 1D`): scan forward to the next marker and report what was passed
+  over with `Step::Lost`. `cadu.rs` does this for bytes outside any frame,
+  frames that fail to parse, and jumps in a virtual channel's frame count.
+  It does not yet check that a marker found after junk is followed by
+  another at the frame spacing, so without a frame CRC a chance marker in
+  junk is read as a frame.
 - **Length-prefixed formats with no marker** (bare packets, COSMOS 4, COSMOS 5,
   `PKLG`): one bad length loses the rest of the stream. The built-in decoders
-  stop with `Step::Fatal`. Note that `Step` currently has no "skipped corrupt
-  range with warning" variant — `Step::Skip` is silent and is only for normal
+  stop with `Step::Fatal`. `Step::Skip` is silent and is only for normal
   container structure such as file headers or declarations. If a custom format
   ever requires scanning past corruption, resync only at a position where
   several entries in a row chain cleanly (plausible lengths, CCSDS version 0,
-  known APIDs) and report the skipped byte range explicitly.
+  known APIDs) and report the skipped byte range with `Step::Lost`.
 
 ---
 
@@ -871,19 +877,31 @@ same across missions.
 - Telemetry and commands with the same APID number are separate streams with
   separate sequence counters.
 - Commands may carry a name-based or always-zero count instead of a running
-  counter. Check before reporting command gaps.
+  counter. Check before reporting command gaps. `continuity` does: a stream
+  of three or more packets that all carry one count gets a single note
+  (`constant_count`) and no repeat findings. One packet with a different
+  count anywhere and the stream is treated as counting.
 - The **secondary header is mission defined**. It usually starts with a
   timestamp, but its width, **epoch** (the zero point a clock counts from), and
   encoding come from the mission's interface documents. Two common encodings
   (both supported in `[packet_time]` in `src/pure/config.rs`) are an
   unsegmented count (**CUC**: seconds plus a binary fraction) and a
   day-segmented one (**CDS**: days since an epoch plus milliseconds of day).
+  A third, `unix`, is whole seconds followed by microseconds as a 32-bit
+  number, counted from 1970 unless configured otherwise.
   Take the format from configuration; never hard-code it in a decoder.
+- **The secondary header flag is not always honest.** By default a time is
+  read only from packets that set it. COSMOS's example telemetry carries a
+  time and leaves the flag clear, so `require_secondary_header = false`
+  reads the time regardless. With the flag out of the picture nothing says
+  which packets have a time at all, so that setting applies to telemetry
+  only unless `applies_to` says otherwise: commands from the same
+  definitions have arguments where the time would be.
 
 ### Time and the three clocks
 
-Keep three clocks apart (see `README.md`): **packet time** (from the packet's
-secondary header), **receive time** (from the log container), and **text log
+Keep three clocks apart (see `README.md`): **packet time** (from the packet,
+usually its secondary header), **receive time** (from the log container), and **text log
 time** (from text log lines).
 
 - Store every time as integer nanoseconds (`i64`) plus which clock it belongs
@@ -907,25 +925,37 @@ and carry no text logs. Both already have decoders in this codebase
 new readers from format layouts; do not port original source code without
 checking its licence against this project's.
 
-#### COSMOS 4 (`COSMOS4_`)
+#### COSMOS 4 (`COSMOS4_` and `COSMOS2_`)
 
-File header, 128 ASCII bytes: `COSMOS4_`, then `CMD` or `TLM`, `_`, a 32-byte
+COSMOS 4 wrote two layouts. Versions up to 4.2 start the file with `COSMOS2_`
+and have no flags byte and no extra block; versions from 4.3 start it with
+`COSMOS4_` and have both. Everything else is the same, and one decoder reads
+both, choosing by the file header.
+
+File header, 128 ASCII bytes: `COSMOS4_` or `COSMOS2_`, then `CMD` or `TLM`, `_`, a 32-byte
 space-padded configuration name, `_`, an 83-byte space-padded hostname.
 
 Each entry:
 
 | Size | Field |
 |---|---|
-| 1 | flags: `0x80` stored, `0x40` extra |
-| 4 + n | only if extra: length, then that many bytes of JSON |
+| 1 | `COSMOS4_` only. Flags: `0x80` stored, `0x40` extra |
+| 4 + n | `COSMOS4_` only, and only if extra: length, then that many bytes of JSON |
 | 4 | receive time, seconds since the Unix epoch |
 | 4 | receive time, microseconds |
 | 1 + n | target name length, then the name |
 | 1 + n | packet name length, then the name |
 | 4 + n | packet length, then the packet |
 
-No index, no footer. A telemetry log normally begins with one metadata packet
-that is not a space packet.
+No index, no footer. A log normally begins with one metadata packet, `SYSTEM
+META`, that is not a space packet: byte 0 is a packet id, bytes 1 to 32 the
+configuration name, bytes 33 to 62 the COSMOS version. The decoder reports the
+configuration, host and version through `Decoder::describe`, and ingest keeps
+that text in the file's note.
+
+COSMOS 1 logs start with a 42-byte header instead: `COSMOS`, then `CMD` or
+`TLM` in either case, one separator byte, and a 32-byte configuration name.
+Their entries are the same as under `COSMOS2_`.
 
 #### COSMOS 5 (`COSMOS5_`)
 
@@ -942,13 +972,54 @@ what follows it), a 2-byte flags field, then a body chosen by `flags & 0xF000`:
 
 Other flag bits: `0x0800` command (otherwise telemetry), `0x0400` stored,
 `0x0200` an id is present. Names appear once, in declarations; packets refer to
-them by index, counted from zero in order of appearance. The reader therefore
-keeps the two name tables as it goes. A separate `.idx` file maps entries to
-byte offsets and is not needed for a forward read.
+them by index. The reader therefore keeps the two name tables as it goes.
+Packets are counted from zero in each file, in order of appearance. Targets
+are not: the writer counts them across every file it has written, so a file
+may declare target 15 first. A target is declared just before the first packet
+that refers to it, and that is how the decoder learns where a file's target
+numbers start. A target used for both commands and telemetry is declared
+twice. The file ends with an offset marker. A separate `.idx` file (it starts
+`COSIDX5_`) maps entries to byte offsets and is not needed for a forward read.
+
+The COSMOS 5 raw log layout, the `COSMOS2_` layout and the example target's
+packets described below were checked against real log files from the COSMOS
+repository; `tests/real_cosmos_files.rs` repeats the check on those files.
+The `COSMOS4_` flags byte and the `SYSTEM META` packet come from reading
+COSMOS's source only: no real file with either was to hand.
+
+What COSMOS 4's own example target puts in such logs is worth knowing, since
+definitions copied from it are common:
+
+- Telemetry packets do not set the secondary header flag, though bytes 6 to 13
+  hold a time: seconds, then microseconds, since 1970. A 16-bit packet id
+  follows. Sequence counts start at 1. To read that time:
+
+  ```toml
+  [packet_time]
+  code = "unix"
+  require_secondary_header = false
+  ```
+
+  In a real telemetry log this puts packet time a millisecond or two before
+  the time COSMOS logged the packet, as it should be.
+- Every command is on one APID, told apart by a 16-bit packet id at byte 6.
+  The sequence count is always 0: COSMOS does not count commands. The length
+  field holds the definition's default. That is the packet's real length in
+  the 4.2.4 example definitions, and 0 in a real command log from older ones.
 
 In both COSMOS formats, do not assume the stored bytes are space packets: these
 systems log whatever their interfaces deliver. Check the header and report
 anything that is not.
+
+The one exception made is for those commands (`logged_header` in
+`src/pure/ingest.rs`). The log records each item's size, so the length field
+is not needed to find the end. An item is taken as a packet despite its
+length field only if all of these hold: the log gives it a name, the header
+is version 0, the type is command, the sequence flags say unsegmented, and
+the length field claims fewer bytes than are there. The file gets one
+`length_field` note per stream. Keep the test that narrow: one arbitrary
+item in eight starts with three zero bits, and COSMOS's `SYSTEM META` and
+`UNKNOWN UNKNOWN` entries must stay out of the packet lanes.
 
 ### Text logs
 

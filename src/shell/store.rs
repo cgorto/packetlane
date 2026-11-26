@@ -2,7 +2,7 @@
 //! what the statements are, and what their results mean, is decided in
 //! `pure::sql`, `pure::ingest` and `pure::cross`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -14,13 +14,18 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::Serialize;
 
 use crate::pure::config::{Config, ResolvedTime, SourceInfo};
-use crate::pure::continuity::Checker;
+use crate::pure::continuity::{Checker, StreamKey};
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
-use crate::pure::ingest::{FindingRow, LaneKey, file_findings, packet_row, ptype_code};
+use crate::pure::format::kept_values;
+use crate::pure::ingest::{
+    FindingRow, LaneKey, SEVERITY_INFO, SEVERITY_PROBLEM, file_findings, packet_row, ptype_code,
+};
+use crate::pure::limits::LimitChecker;
+use crate::pure::order::OrderChecker;
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
-use crate::shell::files::{Hashing, ReadError, Records, open_sniffed};
+use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -335,13 +340,13 @@ impl Store {
             }
         }
 
-        let (format, file) = open_sniffed(path)?;
-        let decoder = decoder_for(format);
+        let (format, mut file) = open_sniffed(path)?;
+        let decoder = decoder_for(format, config);
         if format != Format::Text && decoder.is_none() {
             // Nothing to store. Keep the removal of an earlier version, if any.
             tx.commit()?;
             let note = match format {
-                Format::Gzip => "Compressed file; decompress a copy and ingest that",
+                Format::Gzip => "Compressed file that cannot be read, or holds another one",
                 Format::Empty => "Empty file",
                 _ => "Unrecognised format",
             };
@@ -369,16 +374,44 @@ impl Store {
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
                 let (packets, note) = ingest_packets(
-                    &tx, file, decoder, file_id, run_id, &source, time_rule, &mut lanes,
+                    &tx, &mut file, decoder, config, file_id, run_id, &source, time_rule,
+                    &mut lanes,
                 )?;
                 (packets, 0, note)
             }
             None => {
                 let assembler = Assembler::new(config.log_format_for(rel, source.utc_offset_s));
-                let entries = ingest_text(&tx, file, file_id, &source, assembler, &mut lanes)?;
+                let entries = ingest_text(&tx, &mut file, file_id, &source, assembler, &mut lanes)?;
                 (0, entries, String::new())
             }
         };
+        // How the content was reached, what it says about itself and how
+        // reading ended, then why the compressed data gave out, if it did.
+        let fault = file
+            .fault()
+            .map(|why| format!("Compressed data unreadable past this point: {why}"));
+        let note: Vec<String> = file
+            .is_gzip()
+            .then(|| "gzip".to_string())
+            .into_iter()
+            .chain((!note.is_empty()).then_some(note))
+            .chain(fault.clone())
+            .collect();
+        let note = note.join("; ");
+        if let Some(message) = fault {
+            tx.execute(
+                sql::INSERT_FINDING,
+                params![
+                    run_id,
+                    file_id,
+                    None::<i64>,
+                    None::<i64>,
+                    SEVERITY_PROBLEM,
+                    "truncated",
+                    message
+                ],
+            )?;
+        }
 
         tx.execute(
             sql::FINISH_FILE,
@@ -435,8 +468,9 @@ impl<'a> Lanes<'a> {
 #[allow(clippy::too_many_arguments)]
 fn ingest_packets(
     conn: &Connection,
-    file: File,
+    file: &mut Source,
     decoder: Box<dyn Decoder>,
+    config: &Config,
     file_id: i64,
     run_id: i64,
     source: &SourceInfo,
@@ -445,12 +479,24 @@ fn ingest_packets(
 ) -> Result<(u64, String)> {
     let base_id: i64 = conn.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
+    let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut checker = Checker::new();
+    let mut limits = LimitChecker::default();
+    let mut order = OrderChecker::new();
     let mut count = 0u64;
     let mut non_packets = 0u64;
+    let mut wrong_length: BTreeMap<StreamKey, u64> = BTreeMap::new();
     let mut end = None;
 
-    for item in Records::new(BufReader::new(file), decoder) {
+    // Most runs have no definition with limits or kept fields; then there
+    // is no need to look one up for every packet.
+    let watched = config
+        .packets
+        .iter()
+        .any(|d| d.fields.iter().any(|f| f.limits.is_some() || f.keep));
+
+    let mut records = Records::new(BufReader::new(file), decoder);
+    for item in &mut records {
         let record = match item {
             Ok(record) => record,
             Err(ReadError::Io(e)) => return Err(e.into()),
@@ -460,9 +506,29 @@ fn ingest_packets(
             }
         };
         let row = packet_row(count, &record, time_rule, source.clock_offset_ns);
+        let packet_id = base_id + row.idx;
+        let def = match watched {
+            true => config.packet_for(record.label.as_deref(), row.header.as_ref()),
+            false => None,
+        };
+        if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.limits.is_some())) {
+            // The definition's address tells it apart from the others.
+            let id = std::ptr::from_ref(def) as usize;
+            limits.observe(count, id, def, &record.payload, &row.lane());
+        }
         let lane_id = lanes.id(conn, row.lane())?;
         match &row.header {
-            Some(header) => checker.observe_at(count, header, record.offset),
+            Some(header) => {
+                checker.observe_at(count, header, record.offset);
+                order.observe(count, header, row.packet_ns);
+                if !row.length_ok {
+                    let key = StreamKey {
+                        apid: header.apid,
+                        packet_type: header.packet_type,
+                    };
+                    *wrong_length.entry(key).or_default() += 1;
+                }
+            }
             None => non_packets += 1,
         }
         insert.execute(params![
@@ -480,10 +546,44 @@ fn ingest_packets(
             row.sum,
             row.label,
         ])?;
+        // After the packet's own row, which these rows point at.
+        if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.keep)) {
+            for (field, num, text) in kept_values(def, &record.payload) {
+                insert_value.execute(params![packet_id, file_id, def.name, field, num, text])?;
+            }
+        }
         count += 1;
     }
 
-    let findings: Vec<FindingRow> = file_findings(&checker.finish(), end.as_ref(), non_packets);
+    let mut findings: Vec<FindingRow> = file_findings(
+        &checker.finish(),
+        records.notices(),
+        end.as_ref(),
+        &wrong_length.into_iter().collect::<Vec<_>>(),
+        non_packets,
+    );
+    findings.extend(order.finish().into_iter().map(|f| FindingRow {
+        lane: Some(LaneKey::stream(f.key)),
+        packet_index: f.packet_index,
+        severity: if f.problem {
+            SEVERITY_PROBLEM
+        } else {
+            SEVERITY_INFO
+        },
+        kind: f.kind,
+        message: f.message,
+    }));
+    findings.extend(limits.finish().into_iter().map(|f| FindingRow {
+        lane: Some(f.lane),
+        packet_index: f.packet_index,
+        severity: if f.red {
+            SEVERITY_PROBLEM
+        } else {
+            SEVERITY_INFO
+        },
+        kind: "limit",
+        message: f.message,
+    }));
     let mut insert_finding = conn.prepare_cached(sql::INSERT_FINDING)?;
     for finding in &findings {
         let lane_id = match finding.lane {
@@ -504,8 +604,13 @@ fn ingest_packets(
             finding.message
         ])?;
     }
-    let note = end.map(|e| e.to_string()).unwrap_or_default();
-    Ok((count, note))
+    // What the file says about itself, then why reading stopped early.
+    let note: Vec<String> = records
+        .describe()
+        .into_iter()
+        .chain(end.map(|e| e.to_string()))
+        .collect();
+    Ok((count, note.join("; ")))
 }
 
 /// Reads one line, newline included, keeping at most `max` bytes of it.
@@ -537,7 +642,7 @@ fn read_line_bounded<R: BufRead>(r: &mut R, out: &mut Vec<u8>, max: usize) -> io
 
 fn ingest_text(
     conn: &Connection,
-    file: File,
+    file: &mut Source,
     file_id: i64,
     source: &SourceInfo,
     mut assembler: Assembler,

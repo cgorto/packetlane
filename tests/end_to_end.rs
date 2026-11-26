@@ -87,7 +87,8 @@ fn ingest_finds_the_built_in_faults_and_leaves_the_logs_alone() {
     let reader = Store::open_read_only(&db, Duration::from_secs(10)).unwrap();
     assert_eq!(
         count(&reader, "select count(*) from packets"),
-        360 + 180 + 537 + 3
+        // Each COSMOS 4 file also opens with its SYSTEM META packet.
+        360 + (180 + 1) + 537 + (3 + 1)
     );
     assert_eq!(
         count(
@@ -143,7 +144,7 @@ fn ingest_finds_the_built_in_faults_and_leaves_the_logs_alone() {
             .iter()
             .all(|f| f.status == Status::AlreadyIngested)
     );
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
     assert_eq!(again.problems, 4);
 
     // The input folder holds exactly what it held before, byte for byte.
@@ -158,7 +159,9 @@ fn a_cut_off_log_is_read_as_far_as_it_goes() {
     let run = scratch.demo();
     let log = run.join("ground/downlink.bin");
     let bytes = fs::read(&log).unwrap();
-    fs::write(&log, &bytes[..bytes.len() - 5]).unwrap();
+    // Cut into the last packet: past the closing marker the file ends with.
+    let cut = packetlane::pure::synth::DEMO_COSMOS5_TAIL + 5;
+    fs::write(&log, &bytes[..bytes.len() - cut]).unwrap();
     fs::write(run.join("ground/notes.gz"), [0x1F, 0x8B, 8, 0]).unwrap();
 
     let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
@@ -275,7 +278,7 @@ fn the_server_refuses_anything_it_should_not_serve() {
         &auth,
     );
     assert_eq!(status, 200);
-    assert!(density.contains("\"total\":1097"), "{density}");
+    assert!(density.contains("\"total\":1099"), "{density}");
 
     // Without the token, or with the wrong one.
     assert_eq!(get("/", "").0, 401);
@@ -353,7 +356,7 @@ fn the_server_refuses_anything_it_should_not_serve() {
         );
     }
     let (_, n) = post("/api/query", "{\"sql\":\"select count(*) from packets\"}");
-    assert!(n.contains("[[1080]]"), "{n}");
+    assert!(n.contains("[[1082]]"), "{n}");
 
     // Malformed requests get an answer, not a hang or a crash.
     assert_eq!(http(port, "BREW / HTTP/1.1\r\n\r\n").0, 405);
@@ -417,7 +420,7 @@ fn ingest_through_the_page_and_again_after_the_configuration_changes() {
         "{runs}"
     );
     let reader = Store::open_read_only(&db, Duration::from_secs(10)).unwrap();
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
     // Without configuration there is no packet time and no packet names.
     assert_eq!(count(&reader, "select count(packet_ns) from packets"), 0);
     assert!(!get("/api/run?run=1").1.contains("PAYLOAD_SCIENCE"));
@@ -425,14 +428,14 @@ fn ingest_through_the_page_and_again_after_the_configuration_changes() {
     // The same request again changes nothing.
     let (_, body) = ingest();
     assert!(!body.contains("\"status\":\"ingested\""), "{body}");
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
 
     // With the configuration in place the run is read afresh, once.
     fs::rename(&aside, &config).unwrap();
     let (status, body) = ingest();
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("\"reread\":true"), "{body}");
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
     assert_eq!(count(&reader, "select count(packet_ns) from packets"), 1077);
     assert_eq!(count(&reader, "select count(*) from runs"), 1);
     assert!(get("/api/run?run=1").1.contains("PAYLOAD_SCIENCE"));
@@ -447,7 +450,7 @@ fn ingest_through_the_page_and_again_after_the_configuration_changes() {
     let (status, body) = ingest();
     assert_eq!(status, 400);
     assert!(body.contains("0 to 2047"), "{body}");
-    assert_eq!(count(&reader, "select count(*) from packets"), 1080);
+    assert_eq!(count(&reader, "select count(*) from packets"), 1082);
 }
 
 #[test]
@@ -726,4 +729,944 @@ fn the_server_serves_nothing_from_outside_its_folders() {
     let present = get("/api/browse?path=%2Fetc%2Fpasswd").0;
     let missing = get("/api/browse?path=%2Fetc%2Fno-such-file-here").0;
     assert_eq!((present, missing), (403, 403));
+}
+
+/// A file of CADUs is recognised by its sync markers, read with the frame
+/// layout from the configuration, and stored as the packets inside it.
+#[test]
+fn a_file_of_cadus_is_ingested_as_its_packets() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let mut a = Source::new(0x1A3, 0, 5);
+    let mut b = Source::new(0x0B0, 0, 300);
+    let packets: Vec<u8> = (0..40)
+        .flat_map(|_| [a.emit(), b.emit()].concat())
+        .collect();
+    let params = Config::parse(toml).unwrap().frame_params(256);
+    fs::write(run.join("station/pass.cadu"), demo_cadus(&params, &packets)).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let file = summary
+        .files
+        .iter()
+        .find(|f| f.rel == "station/pass.cadu")
+        .unwrap();
+    assert_eq!(file.status, Status::Ingested);
+    assert_eq!(file.packets, 80, "{}", file.note);
+    assert_eq!(
+        file.note,
+        "TM frames in 256-byte CADUs, randomised, CRC, 32 check bytes"
+    );
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM files WHERE format = 'cadu'"),
+        1
+    );
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM packets WHERE apid = 419"),
+        40
+    );
+
+    // The wrong layout is reported, not read as an empty file.
+    fs::write(run.join("packetlane.toml"), "[frames]\nkind = \"aos\"\n").unwrap();
+    let summary = ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let file = summary
+        .files
+        .iter()
+        .find(|f| f.rel == "station/pass.cadu")
+        .unwrap();
+    assert_eq!(file.packets, 0);
+    assert!(file.note.contains("AOS frame version"), "{}", file.note);
+}
+
+/// A log as COSMOS 4.2 wrote it is ingested, and what it says about itself
+/// is kept next to why reading stopped.
+#[test]
+fn a_cosmos2_log_is_ingested_and_described() {
+    use packetlane::pure::synth::{Source, cosmos2_entry, cosmos2_header};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("gse")).unwrap();
+    let mut meta = vec![1u8];
+    meta.extend_from_slice(b"FLATSAT_A");
+    meta.resize(33, 0);
+    meta.extend_from_slice(b"4.2.4");
+    meta.resize(123, 0);
+    let mut src = Source::new(0x1A3, 0, 5);
+    let mut data = cosmos2_header(true, "FLATSAT_A", "gse-01");
+    data.extend(cosmos2_entry(
+        1_700_000_000_000_000_000,
+        "SYSTEM",
+        "META",
+        &meta,
+    ));
+    for i in 0..10 {
+        let t = 1_700_000_001_000_000_000 + i * 1_000_000_000;
+        data.extend(cosmos2_entry(t, "SIM", "HK", &src.emit()));
+    }
+    data.truncate(data.len() - 3);
+    fs::write(run.join("gse/2023_11_14_22_13_20_tlm.bin"), data).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let summary = ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let file = &summary.files[0];
+    assert_eq!(file.status, Status::Ingested);
+    assert_eq!(file.format, "cosmos2");
+    assert_eq!(file.packets, 10); // META and nine whole packets
+    assert!(
+        file.note
+            .starts_with("COSMOS config FLATSAT_A on gse-01, version 4.2.4; Truncated"),
+        "{}",
+        file.note
+    );
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM packets WHERE apid = 419"),
+        9
+    );
+}
+
+/// Starts a server over `db` and returns a function that GETs an API path
+/// and parses the JSON reply.
+fn serve(db: PathBuf, root: PathBuf) -> impl Fn(&str) -> serde_json::Value {
+    let server = Server::bind(Options {
+        db,
+        roots: vec![root],
+        config: None,
+        user_config: None,
+        port: 0,
+    })
+    .unwrap();
+    let (port, token) = (server.port(), server.token().to_string());
+    std::thread::spawn(move || server.run());
+    move |target: &str| {
+        let (status, body) = http(
+            port,
+            &format!(
+                "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Packetlane-Token: {token}\r\n\r\n"
+            ),
+        );
+        assert_eq!(status, 200, "{target}: {body}");
+        serde_json::from_str(&body).unwrap()
+    }
+}
+
+/// A packet in a CADU file is not a run of bytes in that file: it is spread
+/// over frames and may be randomised. The packet view must still show it.
+#[test]
+fn packets_inside_cadus_can_be_read_back() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::format::hex;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let mut a = Source::new(0x1A3, 0, 5);
+    let mut b = Source::new(0x0B0, 0, 700);
+    let packets: Vec<Vec<u8>> = (0..12).flat_map(|_| [a.emit(), b.emit()]).collect();
+    let params = Config::parse(toml).unwrap().frame_params(256);
+    let mut file = vec![0x55u8; 100]; // the capture starts mid-frame
+    file.extend(demo_cadus(&params, &packets.concat()));
+    fs::write(run.join("station/pass.cadu"), file).unwrap();
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let ids = store
+        .query_user("SELECT id FROM packets ORDER BY idx", 100)
+        .unwrap();
+    assert_eq!(ids.rows.len(), packets.len());
+    drop(store);
+
+    let get = serve(db, run);
+    for (row, packet) in ids.rows.iter().zip(&packets) {
+        let body = get(&format!("/api/packet?id={}", row[0].int().unwrap()));
+        assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+        let shown = &packet[..packet.len().min(body["hex"].as_str().unwrap().len() / 2)];
+        assert_eq!(body["hex"], hex(shown));
+    }
+}
+
+/// Damage a CADU decoder reads past is stored as findings, not swallowed.
+#[test]
+fn frames_lost_from_a_cadu_file_become_findings() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let toml = "[frames]\ncrc = true\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let mut src = Source::new(0x1A3, 0, 40);
+    let packets: Vec<u8> = (0..60).flat_map(|_| src.emit()).collect();
+    let mut file = demo_cadus(&Config::parse(toml).unwrap().frame_params(128), &packets);
+    file.drain(5 * 128..7 * 128); // two frames gone
+    file[10 * 128 + 50] ^= 1; // one fails its CRC
+    fs::write(run.join("station/pass.cadu"), file).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let found = store
+        .query_user(
+            "SELECT kind, severity, message FROM findings ORDER BY id",
+            50,
+        )
+        .unwrap();
+    let kinds: Vec<&str> = found.rows.iter().map(|r| r[0].text().unwrap()).collect();
+    assert!(kinds.contains(&"frame_gap"), "{kinds:?}");
+    assert!(kinds.contains(&"bad_frame"), "{kinds:?}");
+    // The packets that were in those frames also show as sequence gaps.
+    assert!(kinds.contains(&"gap"), "{kinds:?}");
+    let gap = found
+        .rows
+        .iter()
+        .find(|r| r[0].text() == Some("frame_gap"))
+        .unwrap();
+    assert_eq!(gap[1].text(), Some("problem"));
+    assert!(
+        gap[2].text().unwrap().contains("2 frames missing"),
+        "{:?}",
+        gap[2]
+    );
+}
+
+/// With no configuration at all, a CADU file's layout is read off its
+/// frames, and the file says what it was read as.
+#[test]
+fn a_cadu_file_needs_no_configuration_when_its_frames_say_enough() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    let written = "[frames]\nkind = \"aos\"\nrandomized = true\ncrc = true\nrs_parity_bytes = 64\n";
+    let mut src = Source::new(0x1A3, 0, 300);
+    let packets: Vec<u8> = (0..30).flat_map(|_| src.emit()).collect();
+    let params = Config::parse(written).unwrap().frame_params(256);
+    fs::write(run.join("station/pass.cadu"), demo_cadus(&params, &packets)).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let summary = ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let file = &summary.files[0];
+    assert_eq!(file.packets, 30, "{}", file.note);
+    assert_eq!(
+        file.note,
+        "AOS frames in 256-byte CADUs, randomised, CRC, 64 check bytes"
+    );
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM findings"), 0);
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Gzip files are read as what they hold: packet logs, CADUs and text.
+/// Offsets count bytes of the content, and packets can be read back.
+#[test]
+fn gzip_files_are_read_as_their_content() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::format::hex;
+    use packetlane::pure::synth::{Source, cosmos2_entry, cosmos2_header, demo_cadus};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("a")).unwrap();
+    let mut src = Source::new(0x1A3, 0, 300);
+    let packets: Vec<Vec<u8>> = (0..20).map(|_| src.emit()).collect();
+
+    let mut cosmos = cosmos2_header(true, "CFG", "host");
+    for (i, p) in packets.iter().enumerate() {
+        cosmos.extend(cosmos2_entry(
+            1_700_000_000_000_000_000 + i as i64,
+            "SIM",
+            "HK",
+            p,
+        ));
+    }
+    fs::write(run.join("a/tlm.bin.gz"), gzip(&cosmos)).unwrap();
+    let params = Config::default().frame_params(256);
+    let mut framed = Config::parse("[frames]\nrandomized = true\ncrc = true\n")
+        .unwrap()
+        .frame_params(256);
+    framed.cadu_len = params.cadu_len;
+    fs::write(
+        run.join("a/pass.cadu.gz"),
+        gzip(&demo_cadus(&framed, &packets.concat())),
+    )
+    .unwrap();
+    fs::write(
+        run.join("a/messages.txt.gz"),
+        gzip(b"2026/01/02 03:04:05.123  INFO: one\n2026/01/02 03:04:06.000  WARN: two\n"),
+    )
+    .unwrap();
+    // Two members back to back are one file's content.
+    let (first, second) = cosmos.split_at(cosmos.len() / 2);
+    fs::write(
+        run.join("a/split.bin.gz"),
+        [gzip(first), gzip(second)].concat(),
+    )
+    .unwrap();
+    // Cut short: what decompresses is used, and the cut is reported.
+    let whole = gzip(&cosmos);
+    fs::write(run.join("a/cut.bin.gz"), &whole[..whole.len() * 2 / 3]).unwrap();
+    // A gzip file inside a gzip file is not unwrapped twice.
+    fs::write(
+        run.join("a/twice.gz"),
+        gzip(&gzip(b"2026-01-02 03:04:05 x\n")),
+    )
+    .unwrap();
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let file = |rel: &str| summary.files.iter().find(|f| f.rel == rel).unwrap();
+
+    let tlm = file("a/tlm.bin.gz");
+    assert_eq!((tlm.format, tlm.packets), ("cosmos2", 20));
+    assert_eq!(tlm.note, "gzip; COSMOS config CFG on host");
+    let pass = file("a/pass.cadu.gz");
+    assert_eq!((pass.format, pass.packets), ("cadu", 20), "{}", pass.note);
+    assert!(
+        pass.note
+            .starts_with("gzip; TM frames in 256-byte CADUs, randomised, CRC")
+    );
+    let text = file("a/messages.txt.gz");
+    assert_eq!(
+        (text.format, text.entries, text.note.as_str()),
+        ("text", 2, "gzip")
+    );
+    assert_eq!(file("a/split.bin.gz").packets, 20);
+    assert_eq!(file("a/twice.gz").status, Status::NotReadable);
+
+    let cut = file("a/cut.bin.gz");
+    assert_eq!(cut.status, Status::Ingested);
+    assert!(cut.packets > 0 && cut.packets < 20, "{}", cut.packets);
+    assert!(
+        cut.note
+            .contains("Compressed data unreadable past this point"),
+        "{}",
+        cut.note
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM findings f JOIN files x ON x.id = f.file_id
+             WHERE x.rel = 'a/cut.bin.gz' AND f.message LIKE 'Compressed data%'"
+        ),
+        1
+    );
+
+    let ids = store
+        .query_user(
+            "SELECT p.id, p.idx FROM packets p JOIN files f ON f.id = p.file_id
+             WHERE f.rel IN ('a/tlm.bin.gz', 'a/pass.cadu.gz') AND p.idx IN (0, 7, 19)
+             ORDER BY p.id",
+            100,
+        )
+        .unwrap();
+    assert_eq!(ids.rows.len(), 6);
+    drop(store);
+    let get = serve(db, run);
+    for row in &ids.rows {
+        let body = get(&format!("/api/packet?id={}", row[0].int().unwrap()));
+        assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+        let packet = &packets[row[1].int().unwrap() as usize];
+        let shown = &packet[..packet.len().min(body["hex"].as_str().unwrap().len() / 2)];
+        assert_eq!(body["hex"], hex(shown));
+    }
+}
+
+/// A field leaving its limits is a finding at the packet where it happened,
+/// and the packet view shows the converted value and where it stands.
+#[test]
+fn a_value_leaving_its_limits_is_a_finding() {
+    use packetlane::pure::synth::{cosmos2_entry, cosmos2_header, packet};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("gse")).unwrap();
+    fs::write(
+        run.join("packetlane.toml"),
+        r#"
+[[packet]]
+apid = 100
+label = "SIM HK"
+name = "Housekeeping"
+  [[packet.field]]
+  name = "TEMP"
+  bit_offset = 48
+  bit_length = 16
+  byte_order = "little"
+  unit = "C"
+  poly = [-100.0, 0.5]
+  limits = { red_low = -80, yellow_low = -70, yellow_high = 60, red_high = 80 }
+
+[[packet]]
+apid = 100
+label = "SIM OTHER"
+name = "Same APID, another layout"
+"#,
+    )
+    .unwrap();
+    // Engineering temperature t is sent as (t + 100) * 2, little-endian.
+    let temps = [20.0, 21.0, 65.0, 66.0, 90.0, 91.0, 20.0];
+    let mut data = cosmos2_header(true, "CFG", "gse");
+    for (i, t) in temps.iter().enumerate() {
+        let raw = ((t + 100.0) * 2.0) as u16;
+        let t_ns = 1_700_000_000_000_000_000 + i as i64 * 1_000_000_000;
+        data.extend(cosmos2_entry(
+            t_ns,
+            "SIM",
+            "HK",
+            &packet(100, i as u16, &raw.to_le_bytes()),
+        ));
+        // The same APID under another name must not be judged by HK's limits.
+        data.extend(cosmos2_entry(
+            t_ns,
+            "SIM",
+            "OTHER",
+            &packet(100, i as u16, &[0xFF, 0xFF]),
+        ));
+    }
+    fs::write(run.join("gse/tlm.bin"), data).unwrap();
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let found = store
+        .query_user(
+            "SELECT f.severity, f.message, p.idx FROM findings f
+             LEFT JOIN packets p ON p.id = f.packet_id WHERE f.kind = 'limit' ORDER BY f.id",
+            10,
+        )
+        .unwrap();
+    let lines: Vec<(&str, &str, i64)> = found
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].text().unwrap(),
+                r[1].text().unwrap(),
+                r[2].int().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "info",
+                "Housekeeping TEMP went yellow high: 65 C (limit 60)",
+                4
+            ),
+            (
+                "problem",
+                "Housekeeping TEMP went red high: 90 C (limit 80)",
+                8
+            ),
+        ]
+    );
+    let id = store
+        .query_user("SELECT id FROM packets WHERE idx = 8", 1)
+        .unwrap()
+        .rows[0][0]
+        .int()
+        .unwrap();
+    drop(store);
+
+    let body = serve(db, run)(&format!("/api/packet?id={id}"));
+    let field = &body["fields"][0];
+    assert_eq!(field["value"], 380);
+    assert_eq!(field["converted"], 90.0);
+    assert_eq!(field["limit"], "red high");
+    assert_eq!(field["unit"], "C");
+}
+
+/// Fields marked `keep` have their value stored for every packet, where
+/// SQL can find it, and the rows follow the file when it is read again.
+#[test]
+fn kept_field_values_can_be_searched() {
+    use packetlane::pure::synth::{cosmos2_entry, cosmos2_header, packet};
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("gse")).unwrap();
+    let config = |keep_mode: bool| {
+        format!(
+            r#"
+[[packet]]
+apid = 100
+label = "SIM HK"
+name = "Housekeeping"
+  [[packet.field]]
+  name = "MODE"
+  bit_offset = 48
+  bit_length = 8
+  labels = {{ "0" = "IDLE", "2" = "SAFE" }}
+  keep = {keep_mode}
+  [[packet.field]]
+  name = "TEMP"
+  bit_offset = 56
+  bit_length = 16
+  poly = [-100.0, 0.5]
+  keep = true
+  [[packet.field]]
+  name = "TAG"
+  bit_offset = 72
+  bit_length = 16
+  kind = "ascii"
+  keep = true
+  [[packet.field]]
+  name = "PAIR"
+  bit_offset = 88
+  bit_length = 8
+  count = 2
+  keep = true
+  [[packet.field]]
+  name = "NOT_KEPT"
+  bit_offset = 48
+  bit_length = 8
+"#
+        )
+    };
+    fs::write(run.join("packetlane.toml"), config(true)).unwrap();
+    let mut data = cosmos2_header(true, "CFG", "gse");
+    for i in 0..6u16 {
+        let mode = if i == 3 { 2 } else { 0 };
+        let raw = 240 + i * 2; // 20, 21, 22 ... degrees
+        let mut body = vec![mode];
+        body.extend(raw.to_be_bytes());
+        body.extend(*b"ok");
+        body.extend([i as u8, 9]);
+        let t = 1_700_000_000_000_000_000 + i64::from(i) * 1_000_000_000;
+        data.extend(cosmos2_entry(t, "SIM", "HK", &packet(100, i, &body)));
+    }
+    // The last packet is too short to hold anything past MODE.
+    data.extend(cosmos2_entry(
+        1_700_000_009_000_000_000,
+        "SIM",
+        "HK",
+        &packet(100, 6, &[0]),
+    ));
+    fs::write(run.join("gse/tlm.bin"), &data).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    let targets = std::slice::from_ref(&run);
+    ingest_targets(&mut store, targets, None, None, None).unwrap();
+
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM value_view WHERE field = 'NOT_KEPT'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM value_view WHERE field = 'MODE'"
+        ),
+        7
+    );
+    // Six whole packets and one that only reaches MODE.
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM value_view"), 7 + 3 * 6);
+    // The question the feature is for: where was MODE SAFE?
+    assert_eq!(
+        count(
+            &store,
+            "SELECT idx FROM value_view WHERE field = 'MODE' AND text = 'SAFE'"
+        ),
+        3
+    );
+    // Numbers are the engineering value, so they compare as such.
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM value_view WHERE field = 'TEMP' AND value >= 23"
+        ),
+        3
+    );
+    let row = store
+        .query_user(
+            "SELECT packet, text, value, apid, file FROM value_view
+             WHERE field IN ('TAG', 'PAIR') AND idx = 4 ORDER BY field",
+            5,
+        )
+        .unwrap();
+    assert_eq!(row.rows[0][1].text(), Some("4, 9"));
+    assert_eq!(row.rows[1][0].text(), Some("Housekeeping"));
+    assert_eq!(row.rows[1][1].text(), Some("ok"));
+    assert_eq!(row.rows[1][3].int(), Some(100));
+    assert_eq!(row.rows[1][4].text(), Some("gse/tlm.bin"));
+
+    // A changed configuration reads the run again: no rows are left behind.
+    fs::write(run.join("packetlane.toml"), config(false)).unwrap();
+    ingest_targets(&mut store, targets, None, None, None).unwrap();
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM field_values WHERE field = 'MODE'"
+        ),
+        0
+    );
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM field_values"), 3 * 6);
+    // So does a file that has changed.
+    fs::write(run.join("gse/tlm.bin"), &data[..data.len() - 20]).unwrap();
+    ingest_targets(&mut store, targets, None, None, None).unwrap();
+    assert_eq!(count(&store, "SELECT COUNT(*) FROM field_values"), 3 * 6);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM field_values WHERE packet_id NOT IN (SELECT id FROM packets)"
+        ),
+        0
+    );
+}
+
+/// Segments out of order and packet time stepping back are found at ingest.
+#[test]
+fn segment_order_and_packet_time_are_checked() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::format::cuc_bytes;
+    use packetlane::pure::synth::timed_packet;
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("a")).unwrap();
+    let toml = "[packet_time]\ncode = \"cuc\"\nepoch = \"1970-01-01T00:00:00Z\"\n";
+    fs::write(run.join("packetlane.toml"), toml).unwrap();
+    let rule = Config::parse(toml).unwrap().resolved_time().unwrap();
+    // (sequence flags, seconds): a continuation with no first at packet 2,
+    // and time stepping back at packet 4.
+    let script = [(3u8, 100), (3, 101), (0, 102), (2, 103), (3, 90), (3, 91)];
+    let mut data = Vec::new();
+    for (i, (flags, secs)) in script.iter().enumerate() {
+        let time = cuc_bytes(&rule, secs * 1_000_000_000).unwrap();
+        let mut packet = timed_packet(0x1A3, i as u16, &time, &[0]);
+        packet[2] = (packet[2] & 0x3F) | (flags << 6);
+        data.extend(packet);
+    }
+    fs::write(run.join("a/packets.bin"), data).unwrap();
+
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let found = store
+        .query_user(
+            "SELECT f.kind, f.severity, f.message, p.idx FROM findings f
+             JOIN packets p ON p.id = f.packet_id ORDER BY f.id",
+            10,
+        )
+        .unwrap();
+    let lines: Vec<(&str, &str, &str, i64)> = found
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].text().unwrap(),
+                r[1].text().unwrap(),
+                r[2].text().unwrap(),
+                r[3].int().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            (
+                "segment",
+                "problem",
+                "Continuation segment with no first segment",
+                2
+            ),
+            ("time_back", "info", "Packet time went back 13.000 s", 4),
+        ]
+    );
+}
+
+/// Logs shaped like the ones COSMOS 4 writes for its own example target,
+/// checked against real files from the COSMOS repository: what this tool
+/// makes of them today. Three of these are limits, written down as such.
+#[test]
+fn logs_shaped_like_cosmos_4s_own() {
+    use packetlane::pure::synth::{
+        cosmos_cmd, cosmos_tlm, cosmos2_entry, cosmos2_header, system_meta,
+    };
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("logs")).unwrap();
+    fs::write(
+        run.join("packetlane.toml"),
+        r#"
+[packet_time]
+code = "unix"
+require_secondary_header = false
+
+[[packet]]
+apid = 999
+type = "tc"
+label = "INST COLLECT"
+name = "INST COLLECT"
+  [[packet.field]]
+  name = "TYPE"
+  bit_offset = 64
+  bit_length = 16
+"#,
+    )
+    .unwrap();
+    let config = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+    let t0 = 1_389_370_487_000_000_000;
+
+    // Telemetry: one APID per packet, counts that start at 1, no secondary
+    // header flag, seconds and microseconds, a packet id.
+    let mut tlm = cosmos2_header(true, config, "GSE-PC");
+    tlm.extend(cosmos2_entry(
+        t0,
+        "SYSTEM",
+        "META",
+        &system_meta(config, "4.2.4"),
+    ));
+    for i in 1..=40u16 {
+        let t = t0 + i64::from(i) * 100_000_000;
+        tlm.extend(cosmos2_entry(
+            t,
+            "INST",
+            "ADCS",
+            &cosmos_tlm(2, i, t, 1, &[0; 70]),
+        ));
+        if i % 10 == 1 {
+            let seq = i / 10 + 1;
+            tlm.extend(cosmos2_entry(
+                t,
+                "INST",
+                "PARAMS",
+                &cosmos_tlm(3, seq, t, 1, &[0; 10]),
+            ));
+        }
+    }
+    tlm.extend(cosmos2_entry(
+        t0 + 5_000_000_000,
+        "UNKNOWN",
+        "UNKNOWN",
+        &[0xAB; 10],
+    ));
+    fs::write(run.join("logs/tlm.bin"), tlm).unwrap();
+
+    // Commands: all on APID 999 and every count 0. The length field is
+    // whatever default the definition gives it. In one file the defaults
+    // are right (12 and 1, as in COSMOS 4.2.4's example definitions); in
+    // the other they are 0, as in a real command log from older ones.
+    let collect_body = [0x00, 0x07, 0x3F, 0x80, 0, 0, 0xAB, 0, 0, 0, 0];
+    for (name, collect_len, abort_len) in [("right", 12, 1), ("wrong", 0, 0)] {
+        let mut cmd = cosmos2_header(false, config, "GSE-PC");
+        for i in 0..6i64 {
+            let t = t0 + i * 1_000_000_000;
+            let abort = cosmos_cmd(999, abort_len, 2, &[]);
+            cmd.extend(cosmos2_entry(t, "INST", "ABORT", &abort));
+            let collect = cosmos_cmd(999, collect_len, 1, &collect_body);
+            cmd.extend(cosmos2_entry(t, "INST", "COLLECT", &collect));
+        }
+        fs::write(run.join(format!("logs/{name}_cmd.bin")), cmd).unwrap();
+    }
+
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let in_file = |what: &str, file: &str, and: &str| {
+        count(
+            &store,
+            &format!("SELECT COUNT(*) FROM {what} WHERE file = 'logs/{file}' {and}"),
+        )
+    };
+
+    // Telemetry reads cleanly: nothing to report but the two entries that
+    // are not space packets, the metadata and the unidentified one.
+    assert_eq!(
+        in_file("finding_view", "tlm.bin", "AND severity = 'problem'"),
+        0
+    );
+    assert_eq!(in_file("packet_view", "tlm.bin", "AND apid = 2"), 40);
+    assert_eq!(in_file("packet_view", "tlm.bin", "AND apid IS NULL"), 2);
+    assert_eq!(
+        count(&store, "SELECT MIN(seq) FROM packet_view WHERE apid = 3"),
+        1
+    );
+
+    // Their time is seconds and microseconds with no secondary header flag,
+    // which the configuration above says how to read. Here each was logged
+    // at the moment it was stamped. Commands carry no time and get none.
+    assert_eq!(
+        in_file("packet_view", "tlm.bin", "AND packet_ns = receive_ns"),
+        44
+    );
+    assert_eq!(count(&store, "SELECT COUNT(packet_ns) FROM packets"), 44);
+    assert_eq!(
+        store
+            .query_user(
+                "SELECT packet_time FROM packet_view WHERE apid = 3 ORDER BY idx LIMIT 1",
+                1
+            )
+            .unwrap()
+            .rows[0][0]
+            .text(),
+        Some("2014-01-10T16:14:47.100")
+    );
+
+    // Commands are packets on APID 999 in both files. COSMOS never counts
+    // them, so the one count on all of them is noted once and is not a
+    // problem. Where the length fields are wrong that is noted too, and the
+    // size the log recorded is used.
+    for (file, wrong) in [("right_cmd.bin", 0), ("wrong_cmd.bin", 1)] {
+        assert_eq!(in_file("packet_view", file, "AND apid = 999"), 12, "{file}");
+        assert_eq!(in_file("packet_view", file, "AND apid IS NULL"), 0);
+        assert_eq!(in_file("finding_view", file, "AND severity = 'problem'"), 0);
+        assert_eq!(
+            in_file("finding_view", file, "AND kind = 'constant_count'"),
+            1
+        );
+        assert_eq!(
+            in_file("finding_view", file, "AND kind = 'length_field'"),
+            wrong
+        );
+        assert_eq!(in_file("finding_view", file, ""), 1 + wrong, "{file}");
+    }
+    assert_eq!(summary.problems, 0);
+
+    // Either way they are told apart by the name COSMOS logged them under,
+    // and a definition labelled with that name decodes them.
+    let ids = store
+        .query_user(
+            "SELECT id FROM packet_view WHERE label = 'INST COLLECT' ORDER BY file, idx",
+            20,
+        )
+        .unwrap();
+    let (right, wrong) = (ids.rows[0][0].int().unwrap(), ids.rows[6][0].int().unwrap());
+    drop(store);
+    let get = serve(db, run);
+    for (id, length_ok) in [(right, true), (wrong, false)] {
+        let body = get(&format!("/api/packet?id={id}"));
+        assert_eq!(body["name"], "INST COLLECT");
+        assert_eq!(body["fields"][0]["value"], 7);
+        assert_eq!(body["header"]["apid"], 999);
+        assert_eq!(body["length"], 19);
+        assert_eq!(body["length_field_ok"], length_ok);
+    }
+}
+
+#[test]
+fn kept_fields_and_arrival_delay_can_be_plotted() {
+    let scratch = Scratch::new();
+    let run = scratch.demo();
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    drop(store);
+    let get = serve(db, run);
+
+    let meta = get("/api/run?run=1");
+    let lane = |source: &str, apid: u64| {
+        meta["lanes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["source"] == source && l["apid"] == apid)
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let (bench_hk, ground_hk, ground_cmd) = (
+        lane("bench-a", 100),
+        lane("ground", 100),
+        lane("ground", 200),
+    );
+    let series = meta["series"].as_array().unwrap();
+    let has = |lane: i64, kind: &str, field: &str| {
+        series.iter().any(|s| {
+            s["lane"] == lane && s["kind"] == kind && (kind == "lag" || s["field"] == field)
+        })
+    };
+    // The demo keeps two housekeeping fields, on each host that logged them.
+    for lane in [bench_hk, ground_hk] {
+        assert!(has(lane, "value", "BUS_VOLTS") && has(lane, "value", "CYCLE"));
+        assert!(has(lane, "lag", ""));
+    }
+    let volts = series
+        .iter()
+        .find(|s| s["lane"] == bench_hk && s["field"] == "BUS_VOLTS")
+        .unwrap();
+    assert_eq!(volts["unit"], "V");
+    assert_eq!(volts["count"], 60);
+    // Commands carry no time of their own, so there is no delay to plot.
+    assert!(!has(ground_cmd, "lag", ""));
+
+    let origin = meta["clocks"]["receive"]["origin"].as_str().unwrap();
+    let window = format!("run=1&clock=receive&origin={origin}&from=0&to=60000000000");
+    let points = |query: &str| -> Vec<(i64, f64, f64, i64)> {
+        get(&format!("/api/series?{window}&{query}"))["points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p[0].as_i64().unwrap(),
+                    p[1].as_f64().unwrap(),
+                    p[2].as_f64().unwrap(),
+                    p[3].as_i64().unwrap(),
+                )
+            })
+            .collect()
+    };
+
+    // Six ten-second buckets of a voltage that ramps from 28.0 to 28.3 V
+    // every seven seconds: each holds the whole range.
+    let volts = points(&format!(
+        "buckets=6&lane={bench_hk}&packet=SIM_HK&field=BUS_VOLTS"
+    ));
+    assert_eq!(volts.len(), 6);
+    assert_eq!(volts.iter().map(|p| p.3).sum::<i64>(), 60);
+    for (i, p) in volts.iter().enumerate() {
+        assert_eq!(p.0, i as i64);
+        assert!(
+            (p.1 - 28.0).abs() < 1e-5 && (p.2 - 28.3).abs() < 1e-5,
+            "{p:?}"
+        );
+    }
+    // Fine enough buckets hold one packet each, and so one value.
+    let cycle = points(&format!(
+        "buckets=600&lane={bench_hk}&packet=SIM_HK&field=CYCLE"
+    ));
+    assert_eq!(cycle.len(), 60);
+    assert!(cycle.iter().all(|p| p.1 == p.2 && p.3 == 1));
+    assert!(cycle.windows(2).all(|w| w[1].1 == w[0].1 + 1.0));
+
+    // With no field named, the line is receive time less packet time, in
+    // milliseconds. The bench logs its unit a millisecond after the stamp.
+    let lag = points(&format!("buckets=6&lane={bench_hk}"));
+    assert_eq!(lag.iter().map(|p| p.3).sum::<i64>(), 60);
+    assert!(lag.iter().all(|p| p.1 == 1.0 && p.2 == 1.0), "{lag:?}");
+    // The ground station hears it later, and its clock is corrected first.
+    let lag = points(&format!("buckets=6&lane={ground_hk}"));
+    assert!(lag.iter().all(|p| p.1 == 40.0 && p.2 == 40.0), "{lag:?}");
+
+    // A lane of another run, or a field that was not kept, has no points.
+    assert!(
+        points(&format!(
+            "buckets=6&lane={bench_hk}&packet=SIM_HK&field=MODE"
+        ))
+        .is_empty()
+    );
+    assert!(points("buckets=6&lane=999999").is_empty());
 }

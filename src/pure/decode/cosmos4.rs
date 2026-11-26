@@ -1,11 +1,14 @@
-//! Push decoder for COSMOS 4 packet log files (`COSMOS4_`).
+//! Push decoder for COSMOS 4 packet log files, in both layouts that COSMOS 4
+//! wrote: `COSMOS2_` (up to 4.2) and `COSMOS4_` (4.3 on). It also reads the
+//! 42-byte header of COSMOS 1 (`COSMOS`, `CMD` or `TLM`, a separator, a
+//! 32-byte config name), whose entries are the same as under `COSMOS2_`.
 //!
 //! Layout (big-endian, see `docs/parsing.md` section 8):
-//! - 128-byte ASCII file header: `COSMOS4_`, `CMD` or `TLM`, `_`, 32-byte
+//! - 128-byte ASCII file header: `COSMOS4_` or `COSMOS2_`, `CMD` or `TLM`, `_`, 32-byte
 //!   space-padded config name, `_`, 83-byte space-padded hostname.
 //! - Repeated entries:
-//!   - 1 byte flags (`0x80` stored, `0x40` extra)
-//!   - if extra: 4-byte length + that many bytes of JSON
+//!   - `COSMOS4_` only: 1 byte flags (`0x80` stored, `0x40` extra)
+//!   - `COSMOS4_` only, if extra: 4-byte length + that many bytes of JSON
 //!   - 4-byte receive time seconds since the Unix epoch (unsigned big-endian)
 //!   - 4-byte receive time microseconds (unsigned big-endian)
 //!   - 1-byte target name length + name bytes
@@ -15,6 +18,7 @@
 use super::{DecodeError, Decoder, MAX_ENTRY, Record, Step};
 
 const HEADER_LEN: usize = 128;
+const COSMOS1_HEADER_LEN: usize = 42;
 const MAGIC_PREFIX_LEN: usize = 11;
 const FLAG_STORED: u8 = 0x80;
 const FLAG_EXTRA: u8 = 0x40;
@@ -26,6 +30,35 @@ const MIN_AFTER_PACKET_NAME: usize = 4;
 #[derive(Debug, Default)]
 pub struct Cosmos4Decoder {
     header_seen: bool,
+    /// True for `COSMOS4_`: entries begin with a flags byte.
+    has_flags: bool,
+    /// From the file header: the configuration name and the logging host.
+    config: String,
+    hostname: String,
+    /// From the first SYSTEM META packet: the configuration name and the
+    /// COSMOS version that wrote the file.
+    meta: Option<(String, String)>,
+}
+
+/// Text from a fixed-width field: printable ASCII only, padding trimmed.
+/// The bytes come from the file, so nothing else is let through.
+fn field_text(bytes: &[u8]) -> String {
+    let text: String = bytes
+        .iter()
+        .take_while(|&&b| b != 0)
+        .filter(|b| b.is_ascii_graphic() || **b == b' ')
+        .map(|&b| char::from(b))
+        .collect();
+    text.trim().to_string()
+}
+
+/// True if `prefix` starts with the 42-byte header that COSMOS 1 wrote:
+/// `COSMOS`, then `CMD` or `TLM` in either case.
+pub fn is_cosmos1(prefix: &[u8]) -> bool {
+    prefix.get(..6) == Some(b"COSMOS")
+        && prefix
+            .get(6..9)
+            .is_some_and(|t| t.eq_ignore_ascii_case(b"CMD") || t.eq_ignore_ascii_case(b"TLM"))
 }
 
 impl Cosmos4Decoder {
@@ -52,32 +85,45 @@ impl Decoder for Cosmos4Decoder {
             let Some(prefix) = buf.get(..MAGIC_PREFIX_LEN) else {
                 return Step::NeedMore;
             };
-            if prefix != b"COSMOS4_CMD" && prefix != b"COSMOS4_TLM" {
-                return Step::Fatal(DecodeError::Implausible {
-                    offset,
-                    reason: "invalid COSMOS 4 file header",
-                });
-            }
-            if buf.len() < HEADER_LEN {
+            // (header length, has flags, where the config name is, where the hostname is)
+            let (header_len, has_flags, config, hostname) = match prefix {
+                b"COSMOS4_CMD" | b"COSMOS4_TLM" => (HEADER_LEN, true, 12..44, 45..HEADER_LEN),
+                b"COSMOS2_CMD" | b"COSMOS2_TLM" => (HEADER_LEN, false, 12..44, 45..HEADER_LEN),
+                _ if is_cosmos1(prefix) => (COSMOS1_HEADER_LEN, false, 10..42, 0..0),
+                _ => {
+                    return Step::Fatal(DecodeError::Implausible {
+                        offset,
+                        reason: "invalid COSMOS 4 file header",
+                    });
+                }
+            };
+            let Some(header) = buf.get(..header_len) else {
                 return Step::NeedMore;
-            }
+            };
+            self.has_flags = has_flags;
+            self.config = field_text(&header[config]);
+            self.hostname = field_text(&header[hostname]);
             self.header_seen = true;
             return Step::Skip {
-                consumed: HEADER_LEN,
+                consumed: header_len,
             };
         }
 
-        let Some(&flags) = buf.first() else {
-            return Step::NeedMore;
-        };
+        let mut pos: usize = 0;
+        let mut flags = 0u8;
+        if self.has_flags {
+            let Some(&byte) = buf.first() else {
+                return Step::NeedMore;
+            };
+            flags = byte;
+            pos = 1;
+        }
         if flags & !ALLOWED_FLAGS != 0 {
             return Step::Fatal(DecodeError::Implausible {
                 offset,
                 reason: "unknown COSMOS 4 entry flags",
             });
         }
-
-        let mut pos: usize = 1;
 
         if flags & FLAG_EXTRA != 0 {
             let Some(raw_extra_len) = read_u32_be(buf, pos) else {
@@ -172,6 +218,17 @@ impl Decoder for Cosmos4Decoder {
             });
         };
 
+        // SYSTEM META: byte 0 is a packet id, bytes 1..33 the configuration
+        // name, bytes 33..63 the COSMOS version. COSMOS itself requires 33.
+        if self.meta.is_none()
+            && target_bytes == b"SYSTEM"
+            && packet_bytes == b"META"
+            && let Some(config) = payload.get(1..33)
+        {
+            let version = payload.get(33..63).unwrap_or_default();
+            self.meta = Some((field_text(config), field_text(version)));
+        }
+
         let receive_time_ns = i64::from(secs) * 1_000_000_000 + i64::from(usecs) * 1_000;
         let label = format!(
             "{} {}",
@@ -188,6 +245,36 @@ impl Decoder for Cosmos4Decoder {
                 payload: payload.to_vec(),
             },
         }
+    }
+
+    /// For example `COSMOS config SIM_CFG on bench-a, COSMOS 4.2.4`. The
+    /// name in SYSTEM META wins over the one in the file header: it is what
+    /// COSMOS itself switches configuration on.
+    fn describe(&self) -> Option<String> {
+        let (meta_config, version) = match &self.meta {
+            Some((config, version)) => (config.as_str(), version.as_str()),
+            None => ("", ""),
+        };
+        let config = if meta_config.is_empty() {
+            &self.config
+        } else {
+            meta_config
+        };
+        let mut place = Vec::new();
+        if !config.is_empty() {
+            place.push(format!("config {config}"));
+        }
+        if !self.hostname.is_empty() {
+            place.push(format!("on {}", self.hostname));
+        }
+        let mut parts = Vec::new();
+        if !place.is_empty() {
+            parts.push(place.join(" "));
+        }
+        if !version.is_empty() {
+            parts.push(format!("version {version}"));
+        }
+        (!parts.is_empty()).then(|| format!("COSMOS {}", parts.join(", ")))
     }
 }
 
@@ -287,7 +374,7 @@ mod tests {
             data.extend(cosmos4_entry(*time_ns, target, pkt, payload));
         }
 
-        let mut dec = decoder_for(Format::Cosmos4).expect("cosmos4 decoder");
+        let mut dec = decoder_for(Format::Cosmos4, &Default::default()).expect("cosmos4 decoder");
         let (records, end) = decode_all(dec.as_mut(), &data);
         assert_eq!(end, None);
         assert_eq!(records.len(), items.len());
@@ -453,5 +540,232 @@ mod tests {
         assert_eq!(end, None);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].label.as_deref(), Some("T\u{FFFD} \u{FFFD}P"));
+    }
+
+    /// Hand-computed from the COSMOS 4.2.4 writer: a `COSMOS2_` header and
+    /// entries with no flags byte. The file opens, as a 4.2.4 log does, with
+    /// a SYSTEM META packet that is not a space packet.
+    #[test]
+    fn cosmos2_hand_written_vector() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(b"COSMOS2_TLM_");
+        data.extend_from_slice(b"SIM_CFG");
+        data.extend_from_slice(&[b' '; 25]);
+        data.push(b'_');
+        data.extend_from_slice(b"HOST1");
+        data.extend_from_slice(&[b' '; 78]);
+        assert_eq!(data.len(), 128);
+
+        // Entry 1 at byte 128. Payload starts at 128 + 4 + 4 + 1 + 6 + 1 + 4 + 4 = 152.
+        // Its first byte, 0x65, would be an unknown flags value if this
+        // layout were read as `COSMOS4_`.
+        data.extend_from_slice(&[
+            0x65, 0x53, 0xF1, 0x00, // seconds: 1_700_000_000
+            0x00, 0x01, 0xE2, 0x40, // microseconds: 123_456
+            0x06, b'S', b'Y', b'S', b'T', b'E', b'M', // target
+            0x04, b'M', b'E', b'T', b'A', // packet
+            0x00, 0x00, 0x00, 0x04, // payload len: 4
+            0x01, b'C', b'F', b'G', // payload
+        ]);
+        assert_eq!(data.len(), 156);
+
+        // Entry 2 at byte 156. Payload starts at 156 + 4 + 4 + 1 + 3 + 1 + 2 + 4 = 175.
+        data.extend_from_slice(&[
+            0x65, 0x53, 0xF1, 0x01, // seconds: 1_700_000_001
+            0x00, 0x00, 0x01, 0xF4, // microseconds: 500
+            0x03, b'S', b'I', b'M', // target
+            0x02, b'H', b'K', // packet
+            0x00, 0x00, 0x00, 0x07, // payload len: 7
+            0x00, 0x64, 0xC0, 0x00, 0x00, 0x00, 0xAB, // one space packet, APID 100
+        ]);
+
+        assert_eq!(crate::pure::decode::sniff(&data), Format::Cosmos2);
+        let mut dec = decoder_for(Format::Cosmos2, &Default::default()).expect("decoder");
+        let (records, end) = decode_all(dec.as_mut(), &data);
+        assert_eq!(end, None);
+        assert_eq!(records.len(), 2);
+
+        assert_eq!(records[0].offset, 152);
+        assert_eq!(records[0].receive_time_ns, Some(1_700_000_000_123_456_000));
+        assert_eq!(records[0].label.as_deref(), Some("SYSTEM META"));
+        assert_eq!(records[0].payload, vec![0x01, b'C', b'F', b'G']);
+
+        assert_eq!(records[1].offset, 175);
+        assert_eq!(records[1].receive_time_ns, Some(1_700_000_001_000_500_000));
+        assert_eq!(records[1].label.as_deref(), Some("SIM HK"));
+        assert_eq!(
+            records[1].payload,
+            vec![0x00, 0x64, 0xC0, 0x00, 0x00, 0x00, 0xAB]
+        );
+    }
+
+    #[test]
+    fn cosmos2_truncation_at_every_offset() {
+        use crate::pure::synth::{cosmos2_entry, cosmos2_header};
+        let mut data = cosmos2_header(true, "CFG", "HOST");
+        let mut ends = vec![data.len()];
+        for (i, payload) in [&[1u8, 2, 3][..], &packet(0x10, 0, &[4, 5]), &[9]]
+            .iter()
+            .enumerate()
+        {
+            let t = 1_700_000_000_000_000_000 + i as i64 * 1_000_000_000;
+            data.extend(cosmos2_entry(t, "SIM", "HK", payload));
+            ends.push(data.len());
+        }
+        for cut in 0..=data.len() {
+            let (records, end) = decode_all(&mut Cosmos4Decoder::new(), &data[..cut]);
+            let whole = ends.iter().filter(|&&e| e <= cut).count().saturating_sub(1);
+            assert_eq!(records.len(), whole, "cut at {cut}");
+            if cut == 0 || ends.contains(&cut) {
+                assert_eq!(end, None, "cut at {cut}");
+            } else {
+                assert!(
+                    matches!(end, Some(DecodeEnd::Truncated { .. })),
+                    "cut at {cut}"
+                );
+            }
+        }
+    }
+
+    /// The two layouts differ only by the flags byte, so the header must
+    /// decide: the same entries under the other header do not read the same.
+    #[test]
+    fn the_header_selects_the_layout() {
+        use crate::pure::synth::{cosmos2_entry, cosmos2_header};
+        let entry2 = cosmos2_entry(1_700_000_000_000_000_000, "SIM", "HK", &[1, 2, 3]);
+        let entry4 = cosmos4_entry(1_700_000_000_000_000_000, "SIM", "HK", &[1, 2, 3]);
+        let read = |header: Vec<u8>, entry: &[u8]| {
+            decode_all(&mut Cosmos4Decoder::new(), &[&header[..], entry].concat())
+        };
+        let good2 = read(cosmos2_header(true, "C", "H"), &entry2);
+        let good4 = read(cosmos4_header(true, "C", "H"), &entry4);
+        assert_eq!(good2.1, None);
+        assert_eq!(good2.0[0].payload, good4.0[0].payload);
+        assert_eq!(good2.0[0].receive_time_ns, good4.0[0].receive_time_ns);
+        // 0x65, the top byte of the seconds, is not a valid flags byte.
+        let (records, end) = read(cosmos4_header(true, "C", "H"), &entry2);
+        assert!(records.is_empty());
+        assert!(matches!(end, Some(DecodeEnd::Error(_))));
+        assert_ne!(read(cosmos2_header(true, "C", "H"), &entry4).0, good4.0);
+    }
+
+    /// The 42-byte COSMOS 1 header, laid out as the COSMOS 4.2.4 reader
+    /// expects it: marker 0..6, log type 6..9, config name 10..42. Entries
+    /// are the same as under `COSMOS2_`.
+    #[test]
+    fn cosmos1_hand_written_vector() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(b"COSMOStlm_");
+        data.extend_from_slice(b"OLD_CFG");
+        data.extend_from_slice(&[b' '; 25]);
+        assert_eq!(data.len(), 42);
+        // Entry at byte 42. Payload starts at 42 + 4 + 4 + 1 + 3 + 1 + 2 + 4 = 61.
+        data.extend_from_slice(&[
+            0x65, 0x53, 0xF1, 0x00, // seconds: 1_700_000_000
+            0x00, 0x00, 0x00, 0x07, // microseconds: 7
+            0x03, b'S', b'I', b'M', // target
+            0x02, b'H', b'K', // packet
+            0x00, 0x00, 0x00, 0x02, // payload len: 2
+            0xCA, 0xFE, // payload
+        ]);
+
+        assert_eq!(crate::pure::decode::sniff(&data), Format::Cosmos1);
+        let mut dec = decoder_for(Format::Cosmos1, &Default::default()).expect("decoder");
+        let (records, end) = decode_all(dec.as_mut(), &data);
+        assert_eq!(end, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 61);
+        assert_eq!(records[0].receive_time_ns, Some(1_700_000_000_000_007_000));
+        assert_eq!(records[0].label.as_deref(), Some("SIM HK"));
+        assert_eq!(records[0].payload, vec![0xCA, 0xFE]);
+        assert_eq!(dec.describe().as_deref(), Some("COSMOS config OLD_CFG"));
+
+        // Cut anywhere: no panic, and never more than the one record.
+        for cut in 0..data.len() {
+            let (records, _) = decode_all(&mut Cosmos4Decoder::new(), &data[..cut]);
+            assert!(records.is_empty(), "cut at {cut}");
+        }
+    }
+
+    /// A SYSTEM META payload as COSMOS 4.2.4 lays it out: packet id, 32-byte
+    /// configuration name, 30-byte COSMOS version, then more.
+    fn system_meta(config: &[u8], version: &[u8]) -> Vec<u8> {
+        let mut out = vec![1u8];
+        out.extend_from_slice(config);
+        out.resize(33, 0);
+        out.extend_from_slice(version);
+        out.resize(123, 0);
+        out
+    }
+
+    #[test]
+    fn describes_the_file_from_its_header_and_system_meta() {
+        use crate::pure::synth::{cosmos2_entry, cosmos2_header};
+        let t = 1_700_000_000_000_000_000;
+        let describe = |data: &[u8]| {
+            let mut dec = Cosmos4Decoder::new();
+            let (_, end) = decode_all(&mut dec, data);
+            assert_eq!(end, None);
+            dec.describe()
+        };
+
+        // Nothing read yet: nothing to say.
+        assert_eq!(Cosmos4Decoder::new().describe(), None);
+
+        // Header only.
+        let header = cosmos2_header(true, "HDR_CFG", "bench-a");
+        assert_eq!(
+            describe(&header).as_deref(),
+            Some("COSMOS config HDR_CFG on bench-a")
+        );
+
+        // SYSTEM META names the configuration COSMOS actually used, and the
+        // version. The first one in the file is the one reported.
+        let mut data = header.clone();
+        data.extend(cosmos2_entry(
+            t,
+            "SYSTEM",
+            "META",
+            &system_meta(b"META_CFG", b"4.2.4"),
+        ));
+        data.extend(cosmos2_entry(t, "SIM", "HK", &packet(0x10, 0, &[1])));
+        data.extend(cosmos2_entry(
+            t,
+            "SYSTEM",
+            "META",
+            &system_meta(b"LATER", b"9.9.9"),
+        ));
+        assert_eq!(
+            describe(&data).as_deref(),
+            Some("COSMOS config META_CFG on bench-a, version 4.2.4")
+        );
+
+        // A META too short to hold a configuration name is ignored, as
+        // COSMOS ignores it; so is a packet that only shares the name META.
+        let mut data = header.clone();
+        data.extend(cosmos2_entry(t, "SYSTEM", "META", &[1, b'X']));
+        data.extend(cosmos2_entry(
+            t,
+            "SIM",
+            "META",
+            &system_meta(b"WRONG", b"1"),
+        ));
+        assert_eq!(
+            describe(&data).as_deref(),
+            Some("COSMOS config HDR_CFG on bench-a")
+        );
+
+        // The text comes from the file: only printable ASCII gets through.
+        let mut data = cosmos2_header(true, "", "");
+        data.extend(cosmos2_entry(
+            t,
+            "SYSTEM",
+            "META",
+            &system_meta(b"A\x1b[31m<b>\xffB\nC", b"4.2\r\n.4"),
+        ));
+        assert_eq!(
+            describe(&data).as_deref(),
+            Some("COSMOS config A[31m<b>BC, version 4.2.4")
+        );
     }
 }

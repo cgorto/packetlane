@@ -7,6 +7,7 @@
   </div>
   <input id="search" type="search" placeholder="Search" aria-label="Search" autocomplete="off" spellcheck="false">
   <span class="grow"></span>
+  <select id="add-plot" aria-label="Add a plot" hidden></select>
   <button id="fit">Fit</button>
   <button id="open-files">Files</button>
   <button id="open-sql">SQL</button>
@@ -15,6 +16,7 @@
   <section id="center">
     <div id="axis-row"><button id="unhide" aria-label="Show hidden" hidden></button><canvas id="axis"></canvas></div>
     <div id="scroll"><div id="rows"><div id="labels"></div><div id="stage"><canvas id="tl"></canvas></div></div></div>
+    <div id="plots"></div>
     <div id="over-row"><span id="date"></span><canvas id="over"></canvas></div>
   </section>
   <aside id="side">

@@ -11,6 +11,9 @@
 //!   using the APID.
 //! - `Stray`: a packet or two that fit no run.
 //! - `Suppressed`: a stream produced more of one kind than is worth listing.
+//! - `Constant`: every packet has the same count. The emitter does not count
+//!   its packets (COSMOS, for one, sends every command with count 0), so
+//!   there is nothing to check and the repeats are not problems.
 //!
 //! Known limits, from working with counters alone:
 //!
@@ -40,6 +43,9 @@ const MAX_RETIRED: usize = 64;
 /// to have ended. It can still be continued exactly, but a gap or duplicate
 /// is no longer attributed to it.
 const STALE_AFTER: u64 = 64;
+/// A stream needs this many packets, all with one count, before it is taken
+/// to be uncounted. Fewer could be one packet and its repeat.
+const MIN_CONSTANT: u64 = 3;
 /// Findings of one kind listed individually per stream; the rest are counted.
 const MAX_LISTED: u64 = 20;
 
@@ -82,6 +88,10 @@ pub enum FindingKind {
         what: &'static str,
         more: u64,
     },
+    /// Not a problem: the stream does not count its packets.
+    Constant {
+        seq: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +105,15 @@ pub struct Finding {
 }
 
 impl Finding {
+    /// False for what is only worth knowing: a stream that does not count,
+    /// or how many findings were left out of the list.
+    pub fn is_problem(&self) -> bool {
+        !matches!(
+            self.kind,
+            FindingKind::Suppressed { .. } | FindingKind::Constant { .. }
+        )
+    }
+
     /// What was found, without the stream name or the position.
     pub fn summary(&self) -> String {
         match &self.kind {
@@ -120,6 +139,9 @@ impl Finding {
                 };
                 format!("{more} more {label} not listed")
             }
+            FindingKind::Constant { seq } => {
+                format!("Sequence count is always {seq}: this stream does not count its packets")
+            }
         }
     }
 }
@@ -128,6 +150,7 @@ impl fmt::Display for Finding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let place = match self.kind {
             FindingKind::Suppressed { .. } => ", last at",
+            FindingKind::Constant { .. } => ", from",
             _ => " at",
         };
         write!(
@@ -203,6 +226,13 @@ struct Stream {
     gaps: Tally,
     duplicates: Tally,
     strays: Tally,
+    /// The first packet: count, index, offset.
+    first: Option<(u16, u64, u64)>,
+    /// Whether any packet's count differed from the first's.
+    varied: bool,
+    /// Where this stream's listed duplicates sit in the findings list, in
+    /// case the stream turns out not to count at all.
+    duplicate_findings: Vec<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -261,6 +291,10 @@ impl Checker {
         let stream = self.streams.entry(key).or_default();
         stream.packets += 1;
         let pos = stream.packets;
+        match stream.first {
+            None => stream.first = Some((seq, index, offset)),
+            Some((first, ..)) => stream.varied |= first != seq,
+        }
         let live = |r: &Run| pos - r.last_pos <= STALE_AFTER;
 
         // 1. The next packet of a run we are already following.
@@ -290,6 +324,7 @@ impl Checker {
             run.last_index = index;
             run.last_pos = pos;
             if stream.duplicates.add(index, offset) {
+                stream.duplicate_findings.push(self.findings.len());
                 self.findings.push(Finding {
                     key,
                     kind: FindingKind::Duplicate { seq },
@@ -416,10 +451,29 @@ impl Checker {
                 retired,
                 packets,
                 gaps,
-                duplicates,
+                mut duplicates,
                 mut strays,
+                first,
+                varied,
+                duplicate_findings,
             } = stream;
             streams.push((key, packets));
+
+            // One count on every packet is a stream that does not count,
+            // not a packet repeated over and over.
+            if let Some((seq, packet_index, offset)) = first
+                && !varied
+                && packets >= MIN_CONSTANT
+            {
+                self.retracted.extend(duplicate_findings);
+                duplicates = Tally::default();
+                self.findings.push(Finding {
+                    key,
+                    kind: FindingKind::Constant { seq },
+                    packet_index,
+                    offset,
+                });
+            }
 
             let mut runs: Vec<Run> = retired.into_iter().chain(active).collect();
             runs.sort_by_key(|r| r.first_index);
@@ -541,6 +595,82 @@ mod tests {
     use crate::pure::decode::decode_all;
     use crate::pure::decode::raw::RawDecoder;
     use crate::pure::synth::{Source, interleaved, packet};
+
+    fn counts(seqs: &[u16]) -> Report {
+        let data: Vec<u8> = seqs.iter().flat_map(|&s| packet(7, s, &[0])).collect();
+        check(&data)
+    }
+
+    #[test]
+    fn a_stream_that_never_counts_is_noted_once() {
+        for n in [3usize, 12, 500] {
+            let report = counts(&vec![0; n]);
+            assert_eq!(kinds(&report), [&FindingKind::Constant { seq: 0 }], "{n}");
+            assert!(!report.findings[0].is_problem());
+            assert_eq!(report.findings[0].packet_index, 0);
+        }
+        // Any one count will do, not only 0.
+        assert_eq!(
+            kinds(&counts(&[9; 40])),
+            [&FindingKind::Constant { seq: 9 }]
+        );
+    }
+
+    #[test]
+    fn repeats_in_a_stream_that_counts_stay_problems() {
+        // Two packets could be one and its repeat.
+        assert_eq!(
+            kinds(&counts(&[0, 0])),
+            [&FindingKind::Duplicate { seq: 0 }]
+        );
+        // One other count anywhere, and the stream counts.
+        let mut seqs = vec![0u16; 30];
+        seqs.push(1);
+        let report = counts(&seqs);
+        assert_eq!(report.findings.len(), 21, "{:?}", report.findings);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| !matches!(f.kind, FindingKind::Constant { .. }))
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| matches!(f.kind, FindingKind::Suppressed { more: 9, .. }))
+        );
+        let report = counts(&[5, 6, 7, 7, 7, 8]);
+        assert_eq!(
+            kinds(&report),
+            [
+                &FindingKind::Duplicate { seq: 7 },
+                &FindingKind::Duplicate { seq: 7 }
+            ]
+        );
+    }
+
+    #[test]
+    fn an_uncounted_stream_does_not_hide_its_neighbours() {
+        // APID 7 never counts; APID 8 counts and loses a packet.
+        let mut data = Vec::new();
+        for i in 0..10u16 {
+            data.extend(packet(7, 0, &[0]));
+            if i != 4 {
+                data.extend(packet(8, i, &[0]));
+            }
+        }
+        let report = check(&data);
+        assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
+        assert!(matches!(
+            report.findings[0].kind,
+            FindingKind::Constant { seq: 0 }
+        ));
+        assert!(matches!(
+            report.findings[1].kind,
+            FindingKind::Gap { missing: 1, .. }
+        ));
+    }
 
     fn check(data: &[u8]) -> Report {
         let mut checker = Checker::new();
@@ -704,8 +834,11 @@ mod tests {
     }
 
     #[test]
-    fn constant_counter_does_not_flood() {
-        let data: Vec<u8> = (0..1000).flat_map(|_| packet(0x1A3, 0, &[0; 4])).collect();
+    fn a_stuck_counter_does_not_flood() {
+        // It counted once, so it is a counter, and then it stuck.
+        let data: Vec<u8> = (0..1001u16)
+            .flat_map(|i| packet(0x1A3, i.min(1), &[0; 4]))
+            .collect();
         let report = check(&data);
         assert_eq!(report.findings.len(), 21, "{:?}", report.findings.len());
         assert_eq!(

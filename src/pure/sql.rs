@@ -98,6 +98,29 @@ CREATE TABLE IF NOT EXISTS coarse_meta (
   width INTEGER NOT NULL,
   PRIMARY KEY (run_id, clock)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS field_values (
+  packet_id INTEGER NOT NULL REFERENCES packets(id),
+  file_id INTEGER NOT NULL REFERENCES files(id),
+  packet TEXT NOT NULL,
+  field TEXT NOT NULL,
+  num REAL,
+  text TEXT
+);
+CREATE INDEX IF NOT EXISTS field_values_field ON field_values (field, num);
+CREATE INDEX IF NOT EXISTS field_values_file ON field_values (file_id);
+CREATE INDEX IF NOT EXISTS field_values_packet ON field_values (packet_id);
+DROP VIEW IF EXISTS value_view;
+CREATE VIEW value_view AS
+  SELECT v.packet_id AS id, r.root AS run, l.source, f.rel AS file, p.apid, v.packet, v.field,
+         v.num AS value, v.text,
+         strftime('%Y-%m-%dT%H:%M:%f', p.receive_ns / 1000000000.0, 'unixepoch') AS receive_time,
+         strftime('%Y-%m-%dT%H:%M:%f', p.packet_ns / 1000000000.0, 'unixepoch') AS packet_time,
+         p.idx, p.receive_ns, p.packet_ns
+  FROM field_values v
+  JOIN packets p ON p.id = v.packet_id
+  JOIN files f ON f.id = v.file_id
+  JOIN lanes l ON l.id = p.lane_id
+  JOIN runs r ON r.id = f.run_id;
 DROP VIEW IF EXISTS packet_view;
 CREATE VIEW packet_view AS
   SELECT p.id, r.root AS run, l.source, f.rel AS file, p.apid,
@@ -383,6 +406,82 @@ pub fn log_density(run: i64, clock: Clock, from: i64, to: i64, buckets: i64) -> 
     ))
 }
 
+/// What a run has to plot from kept fields: every lane, packet name and
+/// field with numbers stored. Columns: lane, packet, field, count.
+pub fn run_series(run: i64) -> Query {
+    Query::new(
+        "SELECT p.lane_id, v.packet, v.field, COUNT(*)
+         FROM field_values v JOIN packets p ON p.id = v.packet_id
+         WHERE v.num IS NOT NULL AND v.file_id IN (SELECT id FROM files WHERE run_id = ?)
+         GROUP BY p.lane_id, v.packet, v.field
+         ORDER BY p.lane_id, v.packet, v.field",
+        vec![run.into()],
+    )
+}
+
+/// One kept field of one lane over a window, reduced to the lowest and
+/// highest value in each bucket. Columns: bucket, min, max, count.
+///
+/// `CROSS JOIN` makes SQLite start from the packets in the window and look
+/// their values up, so the cost follows the window. Left to itself it
+/// starts from every stored value of the field, however narrow the view.
+#[allow(clippy::too_many_arguments)]
+pub fn value_series(
+    run: i64,
+    clock: Clock,
+    lane: i64,
+    packet: &str,
+    field: &str,
+    from: i64,
+    to: i64,
+    buckets: i64,
+) -> Query {
+    let c = clock.packet_column();
+    Query::new(
+        format!(
+            "SELECT (p.{c} - ?) / ? AS b, MIN(v.num), MAX(v.num), COUNT(*)
+             FROM packets p CROSS JOIN field_values v ON v.packet_id = p.id
+             WHERE p.lane_id = ? AND p.lane_id IN {RUN_LANES} AND p.{c} BETWEEN ? AND ?
+               AND v.packet = ? AND v.field = ? AND v.num IS NOT NULL
+             GROUP BY b ORDER BY b"
+        ),
+        vec![
+            from.into(),
+            bucket_width(from, to, buckets).into(),
+            lane.into(),
+            run.into(),
+            from.into(),
+            to.into(),
+            packet.into(),
+            field.into(),
+        ],
+    )
+}
+
+/// How long after its own time each packet of a lane was received, in
+/// milliseconds, by bucket. Columns: bucket, min, max, count.
+pub fn lag_series(run: i64, clock: Clock, lane: i64, from: i64, to: i64, buckets: i64) -> Query {
+    let c = clock.packet_column();
+    Query::new(
+        format!(
+            "SELECT ({c} - ?) / ? AS b, MIN(receive_ns - packet_ns) / 1000000.0,
+                    MAX(receive_ns - packet_ns) / 1000000.0, COUNT(*)
+             FROM packets
+             WHERE lane_id = ? AND lane_id IN {RUN_LANES} AND {c} BETWEEN ? AND ?
+               AND receive_ns IS NOT NULL AND packet_ns IS NOT NULL
+             GROUP BY b ORDER BY b"
+        ),
+        vec![
+            from.into(),
+            bucket_width(from, to, buckets).into(),
+            lane.into(),
+            run.into(),
+            from.into(),
+            to.into(),
+        ],
+    )
+}
+
 /// Individual packets in a window. Columns: id, lane, time, seq, length.
 pub fn packet_items(run: i64, clock: Clock, from: i64, to: i64, limit: i64) -> Query {
     let c = clock.packet_column();
@@ -464,7 +563,8 @@ pub const RUN_FILE_PATHS: &str = "SELECT path, rel FROM files WHERE run_id = ? O
 /// Statements that empty a run, each taking the run id. Used when its
 /// configuration changes, because names, clocks and time formats are
 /// applied as files are read.
-pub const RESET_RUN: [&str; 7] = [
+pub const RESET_RUN: [&str; 8] = [
+    "DELETE FROM field_values WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM packets WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM logs WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM findings WHERE run_id = ?",
@@ -480,7 +580,8 @@ pub const RUN_ID: &str = "SELECT id FROM runs WHERE root = ?";
 pub const FILE_BY_REL: &str = "SELECT id, size, checksum FROM files WHERE run_id = ? AND rel = ?";
 /// Statements that remove one file and what was read from it, each taking
 /// the file id.
-pub const DELETE_FILE: [&str; 5] = [
+pub const DELETE_FILE: [&str; 6] = [
+    "DELETE FROM field_values WHERE file_id = ?",
     "DELETE FROM packets WHERE file_id = ?",
     "DELETE FROM logs WHERE file_id = ?",
     "DELETE FROM findings WHERE file_id = ?",
@@ -502,6 +603,8 @@ pub const INSERT_PACKET: &str = "INSERT INTO packets
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 pub const INSERT_LOG: &str =
     "INSERT INTO logs (file_id, lane_id, offset, log_ns, text) VALUES (?, ?, ?, ?, ?)";
+/// One kept field value of one packet: the number, the text, or both.
+pub const INSERT_VALUE: &str = "INSERT INTO field_values (packet_id, file_id, packet, field, num, text) VALUES (?, ?, ?, ?, ?, ?)";
 pub const INSERT_FINDING: &str = "INSERT INTO findings
      (run_id, file_id, lane_id, packet_id, severity, kind, message) VALUES (?, ?, ?, ?, ?, ?, ?)";
 pub const DELETE_CROSS_FINDINGS: &str = "DELETE FROM findings WHERE run_id = ? AND file_id IS NULL";

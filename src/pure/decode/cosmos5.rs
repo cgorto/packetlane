@@ -5,7 +5,8 @@
 //! - Repeated entries, each a 4-byte length (counting what follows it), a
 //!   2-byte flags field, and a body determined by `flags & 0xF000`:
 //!   - `0x1000` target declaration: target name; optional trailing 32-byte id if `0x0200`
-//!   - `0x2000` packet declaration: 2-byte target index, packet name; optional trailing 32-byte id if `0x0200`
+//!   - `0x2000` packet declaration: 2-byte target index, packet name; optional trailing 32-byte id if `0x0200`.
+//!     Target indexes do not start at 0 in every file: see the comment where they are read.
 //!   - `0x3000` raw packet: 2-byte packet index, 8-byte time in ns since Unix epoch, payload bytes
 //!   - `0x4000` JSON packet: 2-byte packet index, 8-byte time, JSON text (skipped)
 //!   - `0x5000` offset marker: string (skipped)
@@ -27,6 +28,9 @@ const RAW_PACKET_HEADER_LEN: u64 = 4 + 2 + 2 + 8;
 pub struct Cosmos5Decoder {
     magic_seen: bool,
     targets: Vec<String>,
+    /// The number the writer gave the first target declared in this file.
+    /// Known once a packet declaration refers to it.
+    target_base: Option<u16>,
     packets: Vec<String>,
 }
 
@@ -153,7 +157,19 @@ impl Decoder for Cosmos5Decoder {
                         reason: "COSMOS 5 packet declaration too short",
                     });
                 };
-                let Some(target_name) = self.targets.get(usize::from(target_idx)) else {
+                // The COSMOS 5 writer numbers packets from 0 in each file but
+                // targets across every file it has written, so the first
+                // target declared here may have any number. A target is
+                // declared just before the first packet that refers to it,
+                // which fixes what the numbers in this file start from.
+                let declared = u16::try_from(self.targets.len()).unwrap_or(u16::MAX);
+                let base = *self
+                    .target_base
+                    .get_or_insert(target_idx.saturating_sub(declared.saturating_sub(1)));
+                let known = target_idx
+                    .checked_sub(base)
+                    .and_then(|i| self.targets.get(usize::from(i)));
+                let Some(target_name) = known else {
                     return Step::Fatal(DecodeError::Implausible {
                         offset,
                         reason: "COSMOS 5 packet declaration names unknown target",
@@ -369,7 +385,7 @@ mod tests {
             data.extend(writer.entry(*time_ns, target, pkt, payload, *command));
         }
 
-        let mut dec = decoder_for(Format::Cosmos5).expect("cosmos5 decoder");
+        let mut dec = decoder_for(Format::Cosmos5, &Default::default()).expect("cosmos5 decoder");
         let (records, end) = decode_all(dec.as_mut(), &data);
         assert_eq!(end, None);
         assert_eq!(records.len(), items.len());
@@ -452,6 +468,25 @@ mod tests {
             end,
             Some(DecodeEnd::Error(DecodeError::Implausible { offset: 8, .. }))
         ));
+
+        // 2b. A target numbered from 15, as in a file that is not the
+        // writer's first, and then a packet declaration outside what
+        // has been declared.
+        let mut later = Cosmos5Writer::magic();
+        later.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x10, 0x00, b'I', b'N', b'S', b'T']);
+        later.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x20, 0x00, 0x00, 0x0F, b'H', b'K']);
+        let ok_len = later.len() as u64;
+        later.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x20, 0x00, 0x00, 0x11, b'X', b'Y']);
+        let (_, end) = decode_all(&mut Cosmos5Decoder::new(), &later);
+        assert!(matches!(
+            end,
+            Some(DecodeEnd::Error(DecodeError::Implausible { offset, .. })) if offset == ok_len
+        ));
+        // Nor one below where the file's numbers start.
+        let mut below = later[..ok_len as usize].to_vec();
+        below.extend_from_slice(&[0x00, 0x00, 0x00, 0x06, 0x20, 0x00, 0x00, 0x0E, b'X', b'Y']);
+        let (_, end) = decode_all(&mut Cosmos5Decoder::new(), &below);
+        assert!(matches!(end, Some(DecodeEnd::Error(_))));
 
         // 3. Raw packet referencing undeclared packet index.
         let mut bad_packet = Cosmos5Writer::magic();
@@ -542,6 +577,51 @@ mod tests {
                 ),
                 "big entry len={big_len} should be Fatal"
             );
+        }
+    }
+
+    /// A file laid out as the COSMOS 5 writer lays one out once it has
+    /// written others: targets numbered on from 15, a target declared again
+    /// for its commands, packet declarations with ids, a closing marker.
+    #[test]
+    fn reads_a_file_laid_out_as_cosmos_5_writes_them() {
+        let mut writer = Cosmos5Writer::like_cosmos(15);
+        let mut data = Cosmos5Writer::magic();
+        let tlm = packet(3, 1, &[1, 2, 3]);
+        let cmd = packet(999, 0, &[4]);
+        data.extend(writer.entry(1_000, "INST", "PARAMS", &tlm, false));
+        data.extend(writer.entry(2_000, "INST", "ABORT", &cmd, true));
+        data.extend(writer.entry(3_000, "SYSTEM", "META", &[1, 0], false));
+        data.extend(writer.entry(4_000, "INST", "PARAMS", &tlm, false));
+        data.extend(Cosmos5Writer::offset_marker("1614891537276-0"));
+
+        // As in a real file: target declared with no id, as number 15 ...
+        assert_eq!(
+            data[8..18],
+            [0, 0, 0, 6, 0x10, 0x00, b'I', b'N', b'S', b'T']
+        );
+        // ... then the packet, pointing at 15, with a 32-byte id.
+        assert_eq!(
+            data[18..26],
+            [0, 0, 0, 2 + 2 + 6 + 32, 0x22, 0x00, 0x00, 0x0F]
+        );
+
+        let (records, end) = decode_all(&mut Cosmos5Decoder::new(), &data);
+        assert_eq!(end, None);
+        let labels: Vec<&str> = records
+            .iter()
+            .map(|r| r.label.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            ["INST PARAMS", "INST ABORT", "SYSTEM META", "INST PARAMS"]
+        );
+        assert_eq!(records[0].payload, tlm);
+        assert_eq!(records[1].payload, cmd);
+        assert_eq!(records[3].receive_time_ns, Some(4_000));
+        for r in &records {
+            let at = r.offset as usize;
+            assert_eq!(data[at..at + r.payload.len()], r.payload[..]);
         }
     }
 }

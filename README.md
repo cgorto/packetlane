@@ -62,20 +62,41 @@ when they could not run, so they can gate a script.
 ### Reading
 
 - **Formats**, detected from the first bytes: bare packet streams, COSMOS 4
-  and COSMOS 5 packet logs, and text logs. Site-specific formats are added as
-  decoders (`docs/parsing.md`).
+  packet logs (the `COSMOS2_` and `COSMOS4_` layouts, and the older COSMOS 1
+  header), COSMOS 5 packet logs, files of CADUs (sync marker plus TM or AOS
+  transfer frame), and text logs. Site-specific formats are added as decoders
+  (`docs/parsing.md`).
+- **CADU files**: packets are reassembled from the frames, per virtual
+  channel. Frame type, randomisation, frame CRC and the length of the check
+  symbols are read from the file where its bytes show them; the `[frames]`
+  table overrules or fills in the rest. Check symbols are skipped, not used
+  to correct errors.
+- **Gzip files** are read as what they hold.
 - **Text logs**: one configurable pattern per log type picks out the
   timestamp; lines without one stay attached to the entry above.
 - Truncated files are read as far as they go, then reported, not rejected.
 - Logged items that are not space packets are kept and shown in their own
   lane.
+- A command in a log that names its items (the COSMOS formats) is taken as a
+  packet even when its length field claims fewer bytes than the log recorded,
+  and the file gets a note saying so. COSMOS fills that field from the
+  command's definition, and the definition can be wrong.
 
 ### Checks
 
 Per file, for every APID and packet type:
 
 - lost packets, repeated packets, counter restarts, packets out of order;
-- **two emitters sharing one APID** (interleaved sequence counters).
+- a stream whose sequence count is the same on every packet (three or more)
+  is noted as not counting, and is not reported as repeats;
+- **two emitters sharing one APID** (interleaved sequence counters);
+- segmented packets whose segments do not come as first, continuation, last;
+- packet time stepping backwards (a note, since replayed data does this);
+- a field leaving the **limits** its definition gives it, once per excursion.
+
+Per CADU file, what was given up to keep reading: frames missing from a
+virtual channel's count, frames that fail their CRC or do not parse, and
+bytes outside any frame.
 
 Across the files of a run:
 
@@ -92,7 +113,8 @@ Limits of working from counters alone are listed at the top of
   by its place in the run and a checksum of its content: ingesting it again
   changes nothing, and a file that has changed replaces what was read before.
   Changing the configuration makes the whole run be read again.
-- Views `packet_view`, `log_view`, `finding_view` and `file_view` are the
+- Views `packet_view`, `log_view`, `finding_view`, `file_view` and
+  `value_view` (the stored values of fields marked `keep`) are the
   friendly way in for queries: one row per item, with the run, source and
   file by name and times as text.
 - `packetlane query` and the SQL box in the UI accept one statement that
@@ -114,8 +136,27 @@ Limits of working from counters alone are listed at the top of
 - Three clocks: **Receive** (when each host logged it), **Packet** (the
   packet's own timestamp) and **Order** (order of ingest, for packets with no
   usable time).
-- The view (run, clock, range, lanes, selection, search) is kept in the
-  address, so it can be bookmarked while the server is running.
+- **Plots** sit under the lanes on the same time axis. The **Plot…** menu
+  lists what the run can plot:
+  - any field marked `keep = true` in its packet definition, as its
+    engineering value, with the definition's limits shaded behind it;
+  - for any lane whose packets carry a time of their own, **receive − packet
+    time** in milliseconds: how long after the packet was stamped the host
+    logged it. A paused, restarted or stalled simulator shows here without
+    any packet definitions.
+
+  Zoomed out, each pixel column shows the lowest and highest value that
+  fell in it, so a one-packet spike is not averaged away. The lane's
+  findings are drawn as vertical lines, and the pointer marks the same
+  moment on every plot.
+
+  A plot reads the packets in view each time the view moves; nothing is
+  precomputed for it as it is for the lanes. On a run of 900,000 packets
+  with a million kept values, a whole-run plot takes 0.1 to 0.2 s and a
+  zoomed-in one a few milliseconds, and opening the run takes 0.4 s longer
+  than without kept values. Expect ten times that at ten times the size.
+- The view (run, clock, range, lanes, plots, selection, search) is kept in
+  the address, so it can be bookmarked while the server is running.
 
 The UI carries almost no text, so the controls are listed here:
 
@@ -132,6 +173,8 @@ The UI carries almost no text, so the controls are listed here:
 | `n` `p` | next and previous finding |
 | drag in the strip at the bottom | move the view |
 | ○ and ✕ on a lane | pin it to the top; hide it |
+| **Plot…** menu; ✕ on a plot | add a plot; remove it |
+| wheel, drag or double-click on a plot | zoom, pan or fit, as on the lanes |
 | `/` | search |
 | `Esc` | clear the selection |
 
@@ -178,7 +221,7 @@ Three clocks are in play and they do not agree:
 
 | Clock | Comes from | Catch |
 |---|---|---|
-| Packet time | the packet's secondary header | format and epoch are mission defined; independent of wall time |
+| Packet time | the packet, usually its secondary header | format and epoch are mission defined; independent of wall time |
 | Receive time | the log container | each host's clock is skewed differently |
 | Log time | text log lines | timezone often unstated; sometimes no year |
 
@@ -214,6 +257,7 @@ Any web page open in the same browser can send requests to a loopback port, so
 | `serde`, `serde_json` | JSON between server and browser; reading configuration |
 | `regex` | text log timestamp patterns |
 | `toml` | the configuration file |
+| `flate2` | reading gzip files |
 
 Written on the standard library instead of adding crates: the HTTP server,
 packet parsing, time arithmetic, argument parsing, checksums. The frontend is
@@ -231,12 +275,20 @@ been built here.
 
 - **Log grab**: collecting logs for a time window from a list of hosts.
 - **Compare two runs** of the same scenario on a shared time axis.
-- **Transfer frame** layer, for logs that store frames instead of packets.
-- **Live tail** of a log that is still being written.
+- **Live tail** of a log that is still being written, and **live ingest**
+  from a TCP or UDP port a simulator sends telemetry on.
 - **Problem report export** to attach to a ticket.
-- Decoded field values are shown per packet; they cannot be searched or
-  plotted.
-- Importing packet definitions from a spreadsheet or database.
+- Reed-Solomon error correction of transfer frames, and TC frames.
+- Plots show one series each: no overlaying two fields, no fixed or shared
+  value scale, no markers for commands, no export. Only fields marked `keep`
+  before ingest can be plotted.
+- Packet definitions cover fixed-size numbers, text and arrays, polynomial
+  conversions and one set of limits. Not covered: little-endian bit fields,
+  items placed from the end of a packet, other conversions, and telling
+  packets on one APID apart outside COSMOS logs.
+- Importing packet definitions from a spreadsheet or database. (COSMOS 4
+  definition files can be converted with `packetlane import-cosmos`; it keeps
+  what this tool can show and lists what it left out.)
 - Removing a run from the store (delete the store file to start over).
 - Windows: paths are handled the Unix way only.
 

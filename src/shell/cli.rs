@@ -8,9 +8,11 @@ use std::time::Duration;
 
 use crate::pure::api::check_user_sql;
 use crate::pure::args::Args;
-use crate::pure::continuity::Checker;
+use crate::pure::continuity::{Checker, FindingKind};
+use crate::pure::cosmos_defs;
 use crate::pure::decode::decoder_for;
-use crate::pure::ingest::{non_packet_message, whole_packet_header};
+use crate::pure::ingest::{logged_header, non_packet_message, wrong_length_message};
+use crate::pure::order::OrderChecker;
 use crate::pure::sql::Cell;
 use crate::pure::synth::demo_run;
 use crate::shell::files::{Records, open_sniffed};
@@ -25,6 +27,7 @@ Usage:
   packetlane query [options] <sql>        Run one read-only SQL statement
   packetlane serve [options] [path]...    Ingest paths and serve the timeline on loopback
   packetlane demo <folder> [--seconds N]  Write a sample run to a new folder
+  packetlane import-cosmos <file>...      Print COSMOS 4 packet definitions as [[packet]] config
 
 Options:
   --db <file>       Store file (default: packetlane.db in your state folder)
@@ -44,6 +47,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Some((cmd, rest)) if cmd == "ingest" => report(ingest(rest)),
         Some((cmd, rest)) if cmd == "query" => report(query(rest)),
         Some((cmd, rest)) if cmd == "demo" => report(demo(rest)),
+        Some((cmd, rest)) if cmd == "import-cosmos" => report(import_cosmos(rest)),
         Some((cmd, rest)) if cmd == "serve" => report(serve(rest)),
         _ => {
             eprintln!("{USAGE}");
@@ -75,7 +79,7 @@ fn check(files: &[String]) -> ExitCode {
 
 fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let (format, file) = open_sniffed(Path::new(path))?;
-    let Some(decoder) = decoder_for(format) else {
+    let Some(decoder) = decoder_for(format, &Default::default()) else {
         return Err(format!("Format {} holds no readable packets", format.name()).into());
     };
     let certainty = if format.is_certain() {
@@ -83,25 +87,36 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     } else {
         " (guessed)"
     };
-    println!("{path}: format {}{certainty}", format.name());
+    let wrapped = if file.is_gzip() { ", in gzip" } else { "" };
+    println!("{path}: format {}{certainty}{wrapped}", format.name());
 
     let mut checker = Checker::new();
+    let mut order = OrderChecker::new();
     let mut packets = 0u64;
     let mut other = 0u64;
+    let mut wrong_length = 0u64;
     let mut read_problem = None;
-    for item in Records::new(BufReader::new(file), decoder) {
+    let mut file = file;
+    let mut records = Records::new(BufReader::new(&mut file), decoder);
+    for item in &mut records {
         match item {
-            Ok(record) => match whole_packet_header(&record.payload) {
-                Some(header) => {
+            Ok(record) => match logged_header(&record.payload, record.label.is_some()) {
+                Some((header, length_ok)) => {
+                    wrong_length += u64::from(!length_ok);
+                    // No configuration here, so no packet time to compare.
+                    order.observe(packets, &header, None);
                     packets += 1;
                     checker.observe(&header, record.offset);
                 }
                 None => other += 1,
             },
-            Err(e) => read_problem = Some(e),
+            Err(e) => read_problem = Some(e.to_string()),
         }
     }
     let report = checker.finish();
+    if let Some(about) = records.describe() {
+        println!("{path}: {about}");
+    }
 
     let streams = report.streams.len() as u64;
     println!(
@@ -112,16 +127,55 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     if other > 0 {
         println!("  {}", non_packet_message(other));
     }
+    if wrong_length > 0 {
+        println!("  Note: {}", wrong_length_message(wrong_length));
+    }
     for (key, count) in &report.streams {
         println!("  {key}: {count} {}", plural(*count, "packet", "packets"));
     }
     for finding in &report.findings {
-        println!("  Problem: {finding}");
+        let what = match finding.kind {
+            FindingKind::Constant { .. } => "Note",
+            _ => "Problem",
+        };
+        println!("  {what}: {finding}");
+    }
+    let order = order.finish();
+    for finding in &order {
+        match finding.packet_index {
+            Some(i) => println!(
+                "  Problem: {}: {} at packet #{i}",
+                finding.key, finding.message
+            ),
+            None => println!("  Problem: {}: {}", finding.key, finding.message),
+        }
+    }
+    let notices = records.notices().clone();
+    drop(records);
+    if let Some(why) = file.fault() {
+        read_problem
+            .get_or_insert_with(|| format!("Compressed data unreadable past this point: {why}"));
+    }
+    for notice in &notices.list {
+        let what = if notice.is_problem() {
+            "Problem"
+        } else {
+            "Note"
+        };
+        println!("  {what}: {notice}");
+    }
+    if notices.more > 0 {
+        println!("  Problem: {} more losses are not listed", notices.more);
     }
     if let Some(e) = &read_problem {
         println!("  Problem: {e}");
     }
-    Ok(!report.findings.is_empty() || read_problem.is_some())
+    let lost = notices.more > 0 || notices.list.iter().any(|n| n.is_problem());
+    let counted = report
+        .findings
+        .iter()
+        .any(|f| !matches!(f.kind, FindingKind::Constant { .. }));
+    Ok(counted || !order.is_empty() || read_problem.is_some() || lost)
 }
 
 type CliResult = Result<ExitCode, Box<dyn std::error::Error + Send + Sync>>;
@@ -222,6 +276,38 @@ fn query(rest: &[String]) -> CliResult {
         eprintln!("packetlane: More rows than shown; add a LIMIT");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Prints the configuration on standard output and what was left out on
+/// standard error, so the output can be redirected straight into a file.
+fn import_cosmos(files: &[String]) -> CliResult {
+    if files.is_empty() {
+        return Err("import-cosmos needs at least one cmd_tlm definition file".into());
+    }
+    let mut sources = Vec::new();
+    for path in files {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        sources.push((path.clone(), text));
+    }
+    let import = cosmos_defs::import(&sources);
+    for warning in &import.warnings {
+        eprintln!("{warning}");
+    }
+    let fields: usize = import.packets.iter().map(|p| p.fields.len()).sum();
+    eprintln!(
+        "{} {}, {fields} {}, {} {}",
+        import.packets.len(),
+        plural(import.packets.len() as u64, "packet", "packets"),
+        plural(fields as u64, "field", "fields"),
+        import.warnings.len(),
+        plural(import.warnings.len() as u64, "warning", "warnings"),
+    );
+    print!("{}", cosmos_defs::to_toml(&import.packets));
+    Ok(if import.packets.is_empty() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn demo(rest: &[String]) -> CliResult {

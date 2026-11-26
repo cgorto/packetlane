@@ -3,7 +3,7 @@
 //! `pure::http` and `pure::api`.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,14 +12,15 @@ use std::time::{Duration, Instant};
 
 use crate::pure::api::{
     self, Command, Guard, packet_location, render_density, render_items, render_log, render_packet,
-    render_query, render_run, render_runs, render_search,
+    render_query, render_run, render_runs, render_search, render_series,
 };
 use crate::pure::checksum::fnv1a;
+use crate::pure::config::Config;
 use crate::pure::format::hex;
 use crate::pure::http::{MAX_BODY, MAX_HEAD, Parsed, Response, parse_request};
 use crate::pure::sql::{self, bucket_width};
 use crate::shell::browse;
-use crate::shell::files::read_full;
+use crate::shell::files::read_back;
 use crate::shell::ingest::{components, ingest_targets};
 use crate::shell::store::{Result, Store};
 
@@ -201,6 +202,7 @@ fn handle(mut stream: TcpStream, shared: &Shared) {
 fn read_item(
     path: &str,
     roots: &[Vec<String>],
+    config: &Config,
     offset: u64,
     length: usize,
     sum: i64,
@@ -215,15 +217,10 @@ fn read_item(
     if !canonical.is_file() {
         return Err("Not a file".to_string());
     }
-    let mut file = File::open(&canonical).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| e.to_string())?;
-    let mut bytes = vec![0u8; length];
-    let got = read_full(&mut file, &mut bytes).map_err(|e| e.to_string())?;
-    if got != length || fnv1a(&bytes) as i64 != sum {
-        return Err("File changed since ingest; ingest it again".to_string());
-    }
-    Ok(bytes)
+    let same = |bytes: &[u8]| fnv1a(bytes) as i64 == sum;
+    read_back(&canonical, config, offset, length, same)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "File changed since ingest; ingest it again".to_string())
 }
 
 fn execute(shared: &Shared, command: Command) -> Result<Response> {
@@ -233,11 +230,22 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
         Command::Runs => render_runs(&reader()?.query(&sql::runs(), 1000)?),
         Command::Run { run } => {
             let store = reader()?;
+            // Listing the kept fields reads every stored value of the run.
+            // If that cannot be done in time the run still opens, with
+            // only the plots that need no list.
+            let series = store
+                .query(&sql::run_series(run), 10_000)
+                .unwrap_or_else(|_| sql::Table {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    truncated: false,
+                });
             render_run(
                 &store.query(&sql::run_row(run), 1)?,
                 &store.query(&sql::run_lanes(run), 100_000)?,
                 &store.query(&sql::run_files(run), 100_000)?,
                 &store.query(&sql::run_findings(run), 10_000)?,
+                &series,
             )
         }
         Command::Density { window, buckets } => {
@@ -269,6 +277,22 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
             };
             render_items(w, &packets, logs.as_ref())
         }
+        Command::Series {
+            window,
+            buckets,
+            lane,
+            field,
+        } => {
+            let w = &window;
+            let query = match &field {
+                Some((packet, field)) => {
+                    sql::value_series(w.run, w.clock, lane, packet, field, w.from, w.to, buckets)
+                }
+                None => sql::lag_series(w.run, w.clock, lane, w.from, w.to, buckets),
+            };
+            let table = reader()?.query(&query, 4001)?;
+            render_series(w, bucket_width(w.from, w.to, buckets), &table)
+        }
         Command::Packet { id } => {
             let store = reader()?;
             let detail = store.query(&sql::packet_detail(id), 1)?;
@@ -282,7 +306,10 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
                         .and_then(|r| r.first())
                         .and_then(|c| c.text())
                         .unwrap_or("");
-                    let bytes = read_item(&path, &shared.root_parts, offset, length, sum);
+                    // A configuration that no longer parses was accepted at
+                    // ingest; fall back to none, as rendering does.
+                    let parsed = Config::parse(config).unwrap_or_default();
+                    let bytes = read_item(&path, &shared.root_parts, &parsed, offset, length, sum);
                     render_packet(&detail, bytes.as_deref().map_err(String::as_str), config)
                 }
             }

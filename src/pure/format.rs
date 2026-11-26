@@ -3,7 +3,9 @@
 
 use serde::Serialize;
 
-use crate::pure::config::{FieldDef, FieldKind, PacketDef, ResolvedTime, TimeCode};
+use crate::pure::config::{
+    ByteOrder, FieldDef, FieldKind, LimitState, PacketDef, ResolvedTime, TimeCode,
+};
 
 /// Reads up to 64 bits starting `bit_offset` bits into `bytes`, most
 /// significant bit first. `None` if the range runs past the end.
@@ -45,6 +47,8 @@ pub enum Value {
     Int(i64),
     Float(f64),
     Text(String),
+    /// The elements of an array field.
+    List(Vec<Value>),
 }
 
 impl Serialize for Value {
@@ -59,6 +63,7 @@ impl Serialize for Value {
             Value::Int(v) => s.serialize_str(&v.to_string()),
             Value::Float(v) => s.serialize_f64(*v),
             Value::Text(v) => s.serialize_str(v),
+            Value::List(v) => s.collect_seq(v),
         }
     }
 }
@@ -73,32 +78,54 @@ pub struct Decoded {
     pub label: Option<String>,
     pub unit: String,
     pub error: Option<&'static str>,
+    /// The engineering value, where the field has a conversion.
+    pub converted: Option<f64>,
+    /// Where the value stands against the field's limits, unless it is
+    /// inside them: "yellow low", "red high" and so on.
+    pub limit: Option<&'static str>,
 }
 
-fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String>), &'static str> {
-    const PAST_END: &str = "Past end of packet";
+/// A field's value as a number in engineering units: the raw number put
+/// through the field's polynomial, if it has one. `None` for text, arrays
+/// and anything unreadable.
+pub fn engineering(field: &FieldDef, packet: &[u8]) -> Option<f64> {
+    if field.count != 1 {
+        return None;
+    }
+    let raw = match number(field, packet, u64::from(field.bit_offset)).ok()? {
+        Value::UInt(v) => v as f64,
+        Value::Int(v) => v as f64,
+        Value::Float(v) => v,
+        _ => return None,
+    };
+    if field.poly.is_empty() {
+        return Some(raw);
+    }
+    let mut power = 1.0;
+    let mut sum = 0.0;
+    for c in &field.poly {
+        sum += c * power;
+        power *= raw;
+    }
+    sum.is_finite().then_some(sum)
+}
+
+const PAST_END: &str = "Past end of packet";
+
+/// One number of a field's kind and byte order, `bit_offset` bits in.
+fn number(field: &FieldDef, packet: &[u8], bit_offset: u64) -> Result<Value, &'static str> {
+    let bits = field.bit_length;
+    let mut raw = extract_bits(packet, bit_offset, bits).ok_or(PAST_END)?;
+    if field.byte_order == ByteOrder::Little {
+        // Validation allows this only for whole bytes on a byte boundary,
+        // where the first byte in the packet is the least significant.
+        raw = raw.swap_bytes() >> (64 - bits.min(64));
+    }
     match field.kind {
-        FieldKind::Uint => {
-            let raw = extract_bits(packet, u64::from(field.bit_offset), field.bit_length)
-                .ok_or(PAST_END)?;
-            Ok((
-                Value::UInt(raw),
-                field.labels.get(&raw.to_string()).cloned(),
-            ))
-        }
-        FieldKind::Int => {
-            let raw = extract_bits(packet, u64::from(field.bit_offset), field.bit_length)
-                .ok_or(PAST_END)?;
-            let value = sign_extend(raw, field.bit_length);
-            Ok((
-                Value::Int(value),
-                field.labels.get(&value.to_string()).cloned(),
-            ))
-        }
-        FieldKind::Float => {
-            let raw = extract_bits(packet, u64::from(field.bit_offset), field.bit_length)
-                .ok_or(PAST_END)?;
-            let value = match field.bit_length {
+        FieldKind::Uint => Ok(Value::UInt(raw)),
+        FieldKind::Int => Ok(Value::Int(sign_extend(raw, bits))),
+        _ => {
+            let value = match bits {
                 // Through text, so a 32-bit value shows as 28.05, not as the
                 // nearest 64-bit number to it, 28.049999237060547.
                 32 => {
@@ -109,11 +136,35 @@ fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String
                 _ => return Err("Float must be 32 or 64 bits"),
             };
             if value.is_finite() {
-                Ok((Value::Float(value), None))
+                Ok(Value::Float(value))
             } else {
                 // JSON has no way to write these as numbers.
-                Ok((Value::Text(value.to_string()), None))
+                Ok(Value::Text(value.to_string()))
             }
+        }
+    }
+}
+
+fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String>), &'static str> {
+    match field.kind {
+        FieldKind::Uint | FieldKind::Int | FieldKind::Float if field.count > 1 => {
+            let each = (0..u64::from(field.count)).map(|i| {
+                number(
+                    field,
+                    packet,
+                    u64::from(field.bit_offset) + i * u64::from(field.bit_length),
+                )
+            });
+            Ok((Value::List(each.collect::<Result<_, _>>()?), None))
+        }
+        FieldKind::Uint | FieldKind::Int | FieldKind::Float => {
+            let value = number(field, packet, u64::from(field.bit_offset))?;
+            let label = match &value {
+                Value::UInt(v) => field.labels.get(&v.to_string()).cloned(),
+                Value::Int(v) => field.labels.get(&v.to_string()).cloned(),
+                _ => None,
+            };
+            Ok((value, label))
         }
         FieldKind::Hex | FieldKind::Ascii => {
             if !field.bit_offset.is_multiple_of(8) || !field.bit_length.is_multiple_of(8) {
@@ -144,25 +195,71 @@ fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String
     }
 }
 
+/// The values of a packet's fields that are marked `keep`, as (field name,
+/// number, text). The number is the engineering value; the text is the
+/// value's label, a text field's content, or an array's elements. A field
+/// that cannot be read from this packet is left out.
+pub fn kept_values<'a>(
+    def: &'a PacketDef,
+    packet: &[u8],
+) -> Vec<(&'a str, Option<f64>, Option<String>)> {
+    def.fields
+        .iter()
+        .filter(|field| field.keep)
+        .filter_map(|field| {
+            let (value, label) = decode_field(field, packet).ok()?;
+            let text = match value {
+                Value::Text(text) => Some(text),
+                Value::List(items) => Some(
+                    items
+                        .iter()
+                        .map(|v| match v {
+                            Value::UInt(n) => n.to_string(),
+                            Value::Int(n) => n.to_string(),
+                            Value::Float(n) => n.to_string(),
+                            Value::Text(t) => t.clone(),
+                            Value::List(_) => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                _ => label,
+            };
+            Some((field.name.as_str(), engineering(field, packet), text))
+        })
+        .collect()
+}
+
 /// Decodes every field of a definition against one packet. A field that
 /// cannot be read is reported in place; the others are still decoded.
 pub fn decode_fields(def: &PacketDef, packet: &[u8]) -> Vec<Decoded> {
     def.fields
         .iter()
         .map(|field| match decode_field(field, packet) {
-            Ok((value, label)) => Decoded {
-                name: field.name.clone(),
-                value: Some(value),
-                label,
-                unit: field.unit.clone(),
-                error: None,
-            },
+            Ok((value, label)) => {
+                let number = engineering(field, packet);
+                Decoded {
+                    name: field.name.clone(),
+                    value: Some(value),
+                    label,
+                    unit: field.unit.clone(),
+                    error: None,
+                    converted: number.filter(|_| !field.poly.is_empty()),
+                    limit: number
+                        .zip(field.limits)
+                        .map(|(v, limits)| limits.state(v))
+                        .filter(|s| *s != LimitState::Green)
+                        .map(LimitState::name),
+                }
+            }
             Err(error) => Decoded {
                 name: field.name.clone(),
                 value: None,
                 label: None,
                 unit: field.unit.clone(),
                 error: Some(error),
+                converted: None,
+                limit: None,
             },
         })
         .collect()
@@ -184,7 +281,8 @@ fn be_uint(bytes: &[u8]) -> u64 {
 }
 
 /// The packet's own timestamp, in nanoseconds since the Unix epoch, read
-/// from its secondary header as the configuration describes. `None` if the
+/// as the configuration describes. Whether the packet is one to read a time
+/// from at all is the caller's question: see `ResolvedTime::applies`. `None` if the
 /// packet is too short or the result does not fit.
 pub fn packet_time_ns(rule: &ResolvedTime, packet: &[u8]) -> Option<i64> {
     let field = |start: usize, len: usize| -> Option<u64> {
@@ -201,6 +299,15 @@ pub fn packet_time_ns(rule: &ResolvedTime, packet: &[u8]) -> Option<i64> {
             // fine / 256^n seconds, in nanoseconds, rounded down.
             let denominator = 1i128 << (8 * rule.fine_bytes as u32);
             i128::from(coarse) * 1_000_000_000 + i128::from(fine) * 1_000_000_000 / denominator
+        }
+        TimeCode::Unix => {
+            let seconds = field(rule.byte_offset, rule.coarse_bytes)?;
+            let micros_start = rule.byte_offset.checked_add(rule.coarse_bytes)?;
+            let micros = field(micros_start, 4)?;
+            if micros >= 1_000_000 {
+                return None;
+            }
+            i128::from(seconds) * 1_000_000_000 + i128::from(micros) * 1_000
         }
         TimeCode::Cds => {
             let days = field(rule.byte_offset, rule.day_bytes)?;
@@ -372,6 +479,32 @@ bit_length = 8
     }
 
     #[test]
+    fn unix_time() {
+        use crate::pure::synth::cosmos_tlm;
+        let rule = rule("[packet_time]\ncode = \"unix\"");
+        // A packet from a real COSMOS log: 0x52D02E78 seconds, 0x000B3F34
+        // microseconds, which is 2014-01-10T17:31:36.737076Z.
+        let packet = [
+            0x00, 0x02, 0xC0, 0x01, 0x00, 0x09, 0x52, 0xD0, 0x2E, 0x78, 0x00, 0x0B, 0x3F, 0x34,
+            0x00, 0x01,
+        ];
+        let t = 1_389_375_096_737_076_000;
+        assert_eq!(packet_time_ns(&rule, &packet), Some(t));
+        assert_eq!(
+            crate::pure::time::format_iso(t),
+            "2014-01-10T17:31:36.737076000Z"
+        );
+        assert_eq!(packet, *cosmos_tlm(2, 1, t, 1, &[]));
+        assert_eq!(packet_time_ns(&rule, &packet[..13]), None);
+        // A million microseconds is not a time.
+        let mut bad = packet;
+        bad[10..14].copy_from_slice(&1_000_000u32.to_be_bytes());
+        assert_eq!(packet_time_ns(&rule, &bad), None);
+        bad[10..14].copy_from_slice(&999_999u32.to_be_bytes());
+        assert_eq!(packet_time_ns(&rule, &bad), Some(1_389_375_096_999_999_000));
+    }
+
+    #[test]
     fn cuc_round_trip_within_field_resolution() {
         let rule = rule("[packet_time]\ncode = \"cuc\"\nfine_bytes = 3\nsubtract_seconds = 37");
         let unix_2026 = 1_767_225_600_000_000_000i64;
@@ -432,5 +565,69 @@ bit_length = 8
             serde_json::to_string(&values).unwrap(),
             r#"["81985529216486895",42,"-9223372036854775808",-7]"#
         );
+    }
+
+    #[test]
+    fn little_endian_numbers_and_arrays() {
+        let def = def(
+            "[[packet.field]]\nname = \"W\"\nbit_offset = 0\nbit_length = 16\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"I\"\nbit_offset = 16\nbit_length = 32\nkind = \"int\"\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"F\"\nbit_offset = 48\nbit_length = 32\nkind = \"float\"\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"D\"\nbit_offset = 80\nbit_length = 64\nkind = \"float\"\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"A\"\nbit_offset = 144\nbit_length = 16\ncount = 3\nbyte_order = \"little\"\n\
+             [[packet.field]]\nname = \"N\"\nbit_offset = 192\nbit_length = 4\nkind = \"int\"\ncount = 4\n\
+             [[packet.field]]\nname = \"PAST\"\nbit_offset = 200\nbit_length = 8\ncount = 2\n",
+        );
+        let mut packet = vec![0x34, 0x12];
+        packet.extend((-2i32).to_le_bytes());
+        packet.extend(21.5f32.to_le_bytes());
+        packet.extend((-0.125f64).to_le_bytes());
+        packet.extend([1, 0, 2, 0, 0xFF, 0xFF]);
+        packet.extend([0x1F, 0x80]);
+        let out = decode_fields(&def, &packet);
+        let value = |i: usize| out[i].value.clone().unwrap();
+        assert_eq!(value(0), Value::UInt(0x1234));
+        assert_eq!(value(1), Value::Int(-2));
+        assert_eq!(value(2), Value::Float(21.5));
+        assert_eq!(value(3), Value::Float(-0.125));
+        assert_eq!(
+            value(4),
+            Value::List(vec![Value::UInt(1), Value::UInt(2), Value::UInt(65535)])
+        );
+        let nibbles = [1, -1, -8, 0].map(Value::Int).to_vec();
+        assert_eq!(value(5), Value::List(nibbles));
+        assert_eq!(serde_json::to_string(&value(4)).unwrap(), "[1,2,65535]");
+        // An array that runs off the end is an error as a whole.
+        assert_eq!(out[6].error, Some("Past end of packet"));
+
+        for (bad, want) in [
+            (
+                "bit_offset = 4\nbit_length = 16\nbyte_order = \"little\"",
+                "byte_order little",
+            ),
+            (
+                "bit_offset = 0\nbit_length = 12\nbyte_order = \"little\"",
+                "byte_order little",
+            ),
+            ("bit_offset = 0\nbit_length = 8\ncount = 0", "count must be"),
+            (
+                "bit_offset = 0\nbit_length = 8\ncount = 2000",
+                "count must be",
+            ),
+            (
+                "bit_offset = 0\nbit_length = 8\nkind = \"hex\"\ncount = 2",
+                "count must be",
+            ),
+            (
+                "bit_offset = 0\nbit_length = 8\ncount = 2\nlabels = { \"1\" = \"A\" }",
+                "cannot have labels",
+            ),
+        ] {
+            let text = format!(
+                "[[packet]]\napid = 1\nname = \"T\"\n[[packet.field]]\nname = \"X\"\n{bad}"
+            );
+            let err = Config::parse(&text).unwrap_err();
+            assert!(err.contains(want), "{bad:?} gave {err:?}");
+        }
     }
 }
