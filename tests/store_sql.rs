@@ -392,3 +392,63 @@ fn a_lane_left_without_packets_reads_as_empty() {
     );
     assert_eq!(empty[0][0], "1");
 }
+
+// ---- the list of what a run has to plot ----------------------------------------
+
+/// What a run has to plot, counted from every stored value: what the
+/// per-file counts replaced.
+const SERIES_FROM_VALUES: &str = "SELECT p.lane_id, v.packet, v.field, COUNT(*)
+     FROM field_values v JOIN packets p ON p.id = v.packet_id
+     WHERE v.num IS NOT NULL AND v.file_id IN (SELECT id FROM files WHERE run_id = 1)
+     GROUP BY p.lane_id, v.packet, v.field
+     ORDER BY p.lane_id, v.packet, v.field";
+
+/// Checks the list against the stored values. Returns how long it is.
+fn check_series(conn: &Connection) -> usize {
+    let counted = rows(conn, &sql::run_series(1));
+    let from_values = rows(
+        conn,
+        &Query {
+            sql: SERIES_FROM_VALUES.to_string(),
+            params: vec![],
+        },
+    );
+    assert_eq!(counted, from_values);
+    counted.len()
+}
+
+/// The list is kept as files are read, so it has to follow every way a
+/// file's values can change.
+#[test]
+fn the_list_of_kept_fields_follows_the_stored_values() {
+    let files: Vec<(String, Vec<u8>)> = demo_run(120)
+        .into_iter()
+        .map(|f| (f.rel.to_string(), f.bytes))
+        .collect();
+    let store = stored(&files);
+    let run = store.dir.join("run");
+    let db = store.dir.join("store.db");
+    let whole = check_series(&store.conn);
+    assert!(whole >= 2, "the demo keeps two fields");
+
+    // A file read again with less in it.
+    let (rel, bytes) = files
+        .iter()
+        .filter(|(rel, _)| rel.ends_with(".bin"))
+        .max_by_key(|(_, bytes)| bytes.len())
+        .unwrap();
+    std::fs::write(run.join(rel), &bytes[..bytes.len() / 3]).unwrap();
+    ingest(&db, &run);
+    assert!(check_series(&store.conn) > 0);
+
+    // The configuration changed, so the whole run is read again: one field
+    // is no longer kept.
+    let config = run.join("packetlane.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let at = text.find("keep = true").expect("a kept field");
+    let fewer = format!("{}keep = false{}", &text[..at], &text[at + 11..]);
+    std::fs::write(&config, fewer).unwrap();
+    ingest(&db, &run);
+    let after = check_series(&store.conn);
+    assert!(after > 0 && after < whole, "{after} of {whole}");
+}

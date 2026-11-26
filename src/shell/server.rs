@@ -230,9 +230,8 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
         Command::Runs => render_runs(&reader()?.query(&sql::runs(), 1000)?),
         Command::Run { run } => {
             let store = reader()?;
-            // Listing the kept fields reads every stored value of the run.
-            // If that cannot be done in time the run still opens, with
-            // only the plots that need no list.
+            // If the list of kept fields cannot be read the run still
+            // opens, with only the plots that need no list.
             let series = store
                 .query(&sql::run_series(run), 10_000)
                 .unwrap_or_else(|_| sql::Table {

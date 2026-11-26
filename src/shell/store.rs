@@ -476,6 +476,9 @@ fn ingest_packets(
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut check = FileCheck::new(config, source);
     let mut end = None;
+    // How many numbers were kept of each field of each lane, for the list
+    // of what the run has to plot.
+    let mut series: HashMap<(i64, &str, &str), i64> = HashMap::new();
 
     let mut records = Records::new(BufReader::new(file), decoder);
     for item in &mut records {
@@ -510,7 +513,14 @@ fn ingest_packets(
             insert_value.execute(params![
                 packet_id, file_id, v.packet, v.field, v.num, v.text
             ])?;
+            if v.num.is_some() {
+                *series.entry((lane_id, v.packet, v.field)).or_default() += 1;
+            }
         }
+    }
+    let mut insert_series = conn.prepare_cached(sql::INSERT_FILE_SERIES)?;
+    for ((lane_id, packet, field), count) in series {
+        insert_series.execute(params![file_id, lane_id, packet, field, count])?;
     }
 
     let report = check.finish();
