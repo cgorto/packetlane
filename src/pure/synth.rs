@@ -836,7 +836,7 @@ pub fn cltu(frames: &[u8], randomized: bool) -> Vec<u8> {
 mod demo_tests {
     use super::*;
     use crate::pure::config::Config;
-    use crate::pure::continuity::{Checker, FindingKind};
+    use crate::pure::continuity::{Checker, SeqKind};
     use crate::pure::decode::{Format, decode_all, decoder_for, sniff};
     use crate::pure::format::packet_time_ns;
     use crate::pure::ingest::whole_packet_header;
@@ -883,9 +883,9 @@ mod demo_tests {
                 .findings
                 .iter()
                 .map(|f| match f.kind {
-                    FindingKind::Gap { missing, .. } => format!("gap{missing}"),
-                    FindingKind::Reset { .. } => "reset".to_string(),
-                    FindingKind::Interleaved { counters } => format!("interleaved{counters}"),
+                    SeqKind::Gap { missing, .. } => format!("gap{missing}"),
+                    SeqKind::Reset { .. } => "reset".to_string(),
+                    SeqKind::Interleaved { counters } => format!("interleaved{counters}"),
                     _ => "other".to_string(),
                 })
                 .collect();

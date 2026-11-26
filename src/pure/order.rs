@@ -10,21 +10,15 @@ use std::collections::BTreeMap;
 
 use crate::pure::ccsds::{IDLE_APID, PrimaryHeader, SEQ_MODULUS, SeqFlags};
 use crate::pure::continuity::StreamKey;
+use crate::pure::finding::{Finding, Kind, Severity};
 
 /// Findings of one kind listed per stream; the rest are counted.
 const MAX_LISTED: u32 = 20;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OrderFinding {
-    pub key: StreamKey,
-    /// The packet the finding points at, or `None` for a closing count.
-    pub packet_index: Option<u64>,
-    /// "segment" or "time_back".
-    pub kind: &'static str,
-    /// Time going back is normal for replayed data, so it is only a note.
-    pub problem: bool,
-    pub message: String,
-}
+/// What this check reports: kind [`Kind::Segment`] or [`Kind::TimeBack`],
+/// with no packet for a closing count. Time going back is normal for
+/// replayed data, so it is only a note.
+pub type OrderFinding = Finding<StreamKey>;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Segments {
@@ -97,7 +91,7 @@ impl OrderChecker {
         };
         let mut found = Vec::new();
         if let Some(what) = wrong {
-            found.push((0, "segment", true, what.to_string()));
+            found.push((0, Kind::Segment, Severity::Problem, what.to_string()));
         }
         if let (Some(last), Some(now)) = (stream.last_time, packet_ns)
             && now < last
@@ -105,22 +99,22 @@ impl OrderChecker {
             let back = (last - now) as f64 / 1e9;
             found.push((
                 1,
-                "time_back",
-                false,
+                Kind::TimeBack,
+                Severity::Info,
                 format!("Packet time went back {back:.3} s"),
             ));
         }
         if packet_ns.is_some() {
             stream.last_time = packet_ns;
         }
-        for (slot, kind, problem, message) in found {
+        for (slot, kind, severity, message) in found {
             if stream.listed[slot] < MAX_LISTED {
                 stream.listed[slot] += 1;
-                self.findings.push(OrderFinding {
-                    key,
-                    packet_index: Some(index),
+                self.findings.push(Finding {
+                    lane: key,
+                    packet: Some(index),
+                    severity,
                     kind,
-                    problem,
                     message,
                 });
             } else {
@@ -132,15 +126,15 @@ impl OrderChecker {
     pub fn finish(mut self) -> Vec<OrderFinding> {
         for (key, stream) in &self.streams {
             for (slot, kind, what) in [
-                (0, "segment", "segment order faults"),
-                (1, "time_back", "steps back in packet time"),
+                (0, Kind::Segment, "segment order faults"),
+                (1, Kind::TimeBack, "steps back in packet time"),
             ] {
                 if stream.unlisted[slot] > 0 {
-                    self.findings.push(OrderFinding {
-                        key: *key,
-                        packet_index: None,
+                    self.findings.push(Finding {
+                        lane: *key,
+                        packet: None,
+                        severity: Severity::Info,
                         kind,
-                        problem: false,
                         message: format!("{} more {what} not listed", stream.unlisted[slot]),
                     });
                 }
@@ -179,7 +173,7 @@ mod tests {
         checker
             .finish()
             .into_iter()
-            .map(|f| (f.packet_index, f.message))
+            .map(|f| (f.packet, f.message))
             .collect()
     }
 
@@ -240,7 +234,7 @@ mod tests {
         let got = checker.finish();
         let lines: Vec<(Option<u64>, &str, bool)> = got
             .iter()
-            .map(|f| (f.packet_index, f.message.as_str(), f.problem))
+            .map(|f| (f.packet, f.message.as_str(), f.is_problem()))
             .collect();
         assert_eq!(
             lines,
@@ -249,7 +243,7 @@ mod tests {
                 (Some(5), "Packet time went back 7.600 s", false),
             ]
         );
-        assert!(got.iter().all(|f| f.kind == "time_back"));
+        assert!(got.iter().all(|f| f.kind == Kind::TimeBack));
     }
 
     #[test]
@@ -267,7 +261,7 @@ mod tests {
         let got = checker.finish();
         let count = |kind: &str, listed: bool| {
             got.iter()
-                .filter(|f| f.kind == kind && f.packet_index.is_some() == listed)
+                .filter(|f| f.kind.name() == kind && f.packet.is_some() == listed)
                 .count()
         };
         assert_eq!(count("segment", true), 20);

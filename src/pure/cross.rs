@@ -1,16 +1,11 @@
 //! Checks that compare one source's log with another's. The store runs the
 //! comparison queries; this module turns their numbers into findings.
 
-use crate::pure::ingest::{SEVERITY_INFO, SEVERITY_PROBLEM};
+use crate::pure::finding::{Finding, Kind, Severity};
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct CrossFinding {
-    pub lane_id: i64,
-    pub packet_id: Option<i64>,
-    pub severity: &'static str,
-    pub kind: &'static str,
-    pub message: String,
-}
+/// A finding about stored lanes: `lane` and `packet` are their ids in the
+/// store.
+pub type CrossFinding = Finding<i64, i64>;
 
 /// Lane `a` and lane `b` carry the same stream as logged by two sources.
 /// `shared` packets of `a` are also in `b`; `missing` packets of `a` are not,
@@ -25,11 +20,11 @@ pub fn hop_finding(
 ) -> Option<CrossFinding> {
     (shared > 0 && missing > 0).then(|| {
         let unit = if missing == 1 { "packet" } else { "packets" };
-        CrossFinding {
-            lane_id: lane_a,
-            packet_id: first_missing,
-            severity: SEVERITY_PROBLEM,
-            kind: "hop_missing",
+        Finding {
+            lane: lane_a,
+            packet: first_missing,
+            severity: Severity::Problem,
+            kind: Kind::HopMissing,
             message: format!(
                 "{missing} {unit} from {source_a} missing in {source_b} ({shared} shared)"
             ),
@@ -51,11 +46,11 @@ pub fn origin_finding(
         .iter()
         .map(|(source, n)| format!("{source} ({n})"))
         .collect();
-    Some(CrossFinding {
-        lane_id,
-        packet_id,
-        severity: SEVERITY_INFO,
-        kind: "origins",
+    Some(Finding {
+        lane: lane_id,
+        packet: packet_id,
+        severity: Severity::Info,
+        kind: Kind::Origins,
         message: format!("Packet copies found in {}", list.join(", ")),
     })
 }
@@ -69,7 +64,7 @@ mod tests {
         assert!(hop_finding(1, "ground", "bench-a", 0, 40, None).is_none());
         assert!(hop_finding(1, "ground", "bench-a", 40, 0, None).is_none());
         let f = hop_finding(1, "ground", "bench-a", 25, 25, Some(9)).unwrap();
-        assert_eq!(f.packet_id, Some(9));
+        assert_eq!(f.packet, Some(9));
         assert_eq!(
             f.message,
             "25 packets from ground missing in bench-a (25 shared)"
@@ -81,6 +76,6 @@ mod tests {
         assert!(origin_finding(1, None, &[]).is_none());
         let f = origin_finding(1, None, &[("bench-a".into(), 25), ("bench-b".into(), 25)]).unwrap();
         assert!(f.message.ends_with("bench-a (25), bench-b (25)"));
-        assert_eq!(f.severity, SEVERITY_INFO);
+        assert_eq!(f.severity, Severity::Info);
     }
 }

@@ -402,6 +402,7 @@ pub fn sniff_cadu_len(prefix: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::pure::decode::{DecodeEnd, decode_all};
+    use crate::pure::finding::Kind;
     use crate::pure::rs::{Code, RsCode};
     use crate::pure::synth::{Source, cadus, frame_zones};
 
@@ -931,7 +932,7 @@ mod tests {
                     };
                     assert_eq!(notices, std::slice::from_ref(&want), "{p:?}");
                     assert!(!want.is_problem());
-                    assert_eq!(want.kind(), "corrected");
+                    assert_eq!(want.kind(), Kind::Corrected);
                 }
             }
         }

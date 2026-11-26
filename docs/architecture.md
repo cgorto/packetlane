@@ -27,7 +27,7 @@ the facts and asks the core.
 |---|---|---|
 | Reading logs | `decode`: push decoders take bytes and return records, bytes used, "need more" or an error | `files`: opens read-only, owns the read loop and buffer |
 | Text logs | `textlog`: lines in, timestamped entries out | reads lines |
-| Checks | `continuity`: headers in, findings out | prints or stores them |
+| Checks | `continuity`, `order`, `limits`, `cross`: packets or stored counts in, findings out, all as one type (`finding`) with a fixed list of kinds; `pipeline` runs the per-file ones | prints or stores them |
 | Naming and decoding packets | `config`, `format`: definitions plus bytes give named values | reads the config file, reads packet bytes back from the log |
 | Store | `sql`: schema text, statements and their parameters; `ingest`: records to rows | `store`: owns the connection, runs statements |
 | Web API | `http`: bytes to request, response to bytes; `api`: request to an authorised command, results to JSON | `server`: owns the socket, runs the command against the store |
