@@ -559,10 +559,14 @@ mod tests {
         }
     }
 
-    /// The generators as 131.0-B prints them: coefficients as powers of
-    /// alpha, highest first, up to the middle one. Typed in, not computed.
+    /// The generators' coefficients as powers of alpha, highest first, up
+    /// to the middle one. The RS(255,223) list is the one 131.0-B prints,
+    /// as remembered; the RS(255,239) list is only what the definition
+    /// gives, kept so that a change shows. What does not rest on memory or
+    /// on this code: the palindrome, and the zeros at the listed roots,
+    /// which are worked out with the slow multiply.
     #[test]
-    fn generators_are_the_published_ones() {
+    fn generators_have_the_roots_the_standard_lists() {
         const E16: [u8; 17] = [
             0, 249, 59, 66, 4, 43, 126, 251, 97, 30, 3, 213, 50, 66, 170, 5, 24,
         ];

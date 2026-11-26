@@ -741,7 +741,7 @@ fn a_file_of_cadus_is_ingested_as_its_packets() {
     let scratch = Scratch::new();
     let run = scratch.0.join("run");
     fs::create_dir_all(run.join("station")).unwrap();
-    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\n";
+    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\nrs_correct = true\n";
     fs::write(run.join("packetlane.toml"), toml).unwrap();
     let mut a = Source::new(0x1A3, 0, 5);
     let mut b = Source::new(0x0B0, 0, 300);
@@ -762,7 +762,7 @@ fn a_file_of_cadus_is_ingested_as_its_packets() {
     assert_eq!(file.packets, 80, "{}", file.note);
     assert_eq!(
         file.note,
-        "TM frames in 256-byte CADUs, randomised, CRC, 32 check bytes"
+        "TM frames in 256-byte CADUs, randomised, CRC, RS(255,223) interleave 1"
     );
     assert_eq!(
         count(&store, "SELECT COUNT(*) FROM files WHERE format = 'cadu'"),
@@ -868,7 +868,7 @@ fn packets_inside_cadus_can_be_read_back() {
     let scratch = Scratch::new();
     let run = scratch.0.join("run");
     fs::create_dir_all(run.join("station")).unwrap();
-    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\n";
+    let toml = "[frames]\nrandomized = true\ncrc = true\nrs_parity_bytes = 32\nrs_correct = true\n";
     fs::write(run.join("packetlane.toml"), toml).unwrap();
     let mut a = Source::new(0x1A3, 0, 5);
     let mut b = Source::new(0x0B0, 0, 700);
@@ -950,7 +950,7 @@ fn a_cadu_file_needs_no_configuration_when_its_frames_say_enough() {
     let scratch = Scratch::new();
     let run = scratch.0.join("run");
     fs::create_dir_all(run.join("station")).unwrap();
-    let written = "[frames]\nkind = \"aos\"\nrandomized = true\ncrc = true\nrs_parity_bytes = 64\n";
+    let written = "[frames]\nkind = \"aos\"\nrandomized = true\ncrc = true\nrs_interleave = 2\n";
     let mut src = Source::new(0x1A3, 0, 300);
     let packets: Vec<u8> = (0..30).flat_map(|_| src.emit()).collect();
     let params = Config::parse(written).unwrap().frame_params(256);
@@ -962,7 +962,7 @@ fn a_cadu_file_needs_no_configuration_when_its_frames_say_enough() {
     assert_eq!(file.packets, 30, "{}", file.note);
     assert_eq!(
         file.note,
-        "AOS frames in 256-byte CADUs, randomised, CRC, 64 check bytes"
+        "AOS frames in 256-byte CADUs, randomised, CRC, RS(255,223) interleave 2"
     );
     assert_eq!(count(&store, "SELECT COUNT(*) FROM findings"), 0);
 }

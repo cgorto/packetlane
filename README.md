@@ -72,14 +72,14 @@ when they could not run, so they can gate a script.
   or the length of the check symbols are read from the file where its bytes
   show them; the `[frames]` table overrules or fills in the rest.
 - **Reed-Solomon correction** of TM and AOS frames (CCSDS 131.0-B): RS(255,223)
-  and RS(255,239), interleave depths 1 to 8, shortened codeblocks, dual-basis
+  and RS(255,239), interleave depths 1, 2, 3, 4, 5 and 8, shortened codeblocks, dual-basis
   or conventional symbols. A frame is derandomised, corrected, and then held
   to its CRC if it has one. The code is taken from the file when one of the
   first frames is a clean codeword, so a recorder's zero-filled check symbols
   are skipped as before and not mistaken for a code. It has been tested
-  against the standard's constants (typed in, and cross-checked against
-  their definitions) and against this tool's own encoder, not against a
-  recorded downlink: see `docs/parsing.md`.
+  against the standard's constants (typed in from memory, and cross-checked
+  against their definitions) and against this tool's own encoder, not
+  against a recorded downlink: see `docs/parsing.md`.
 - **Telecommand captures** (CCSDS 231.0-B and 232.0-B): CLTUs are found by
   their start sequence, each BCH codeblock has a single wrong bit corrected,
   and fill is dropped by the frame's length. Packets are taken from the TC
@@ -342,12 +342,16 @@ been built here.
   codes applied). No erasure decoding, and no bit-level frame synchronisation:
   CADUs and CLTUs must be byte-aligned in the file.
 - TM frames with a Reed-Solomon code but none of the first sixteen clean, and
-  no `[frames]` entry naming the code: the check symbols are then skipped.
+  no `[frames]` entry naming the code: nothing then says the check symbols
+  are there. With a CRC their length is still found and they are stepped
+  over; without one they are read as frame data.
 - Telecommand: COP-1 is not followed (no FARM state, no CLCW from the
   downlink compared against the uplink; a retransmitted frame is reported as
   the count going back and its packets appear twice). No SDLS security
   header or trailer. LDPC-coded CLTUs are not read. More than one frame per
-  CLTU is read only without randomising. A CLTU's packets are shown by
+  CLTU is read only without randomising. Segments must add up to one
+  packet. A last codeblock padded with anything but `55` is read as the
+  start of another frame and reported. A CLTU's packets are shown by
   decoding back from the nearest start sequence, and bare TC frames from the
   start of the file, which is slow for a very large one.
 - Reed-Solomon and the telecommand formats have been checked against the

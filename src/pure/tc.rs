@@ -521,6 +521,11 @@ mod tests {
     fn parity_is_the_inverted_remainder_and_a_zero_filler() {
         // Nothing but zeros divides with no remainder; inverted, seven ones.
         assert_eq!(bch_parity(&[0; INFO_LEN]), 0xFE);
+        // `C5` is the generator's own bit pattern (1100 0101), so seven of
+        // them in a row are a multiple of it: no remainder either. This is
+        // what the tail sequence is made from, with its last byte spoiled.
+        assert_eq!(bch_parity(&[0xC5; INFO_LEN]), 0xFE);
+        assert_eq!(TAIL[..INFO_LEN], [0xC5; INFO_LEN]);
         let mut x = 0x1234_5678u32;
         for _ in 0..500 {
             let info: [u8; INFO_LEN] = std::array::from_fn(|_| {

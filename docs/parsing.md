@@ -1110,13 +1110,14 @@ is a code, and why check symbols with nothing known about them are skipped.
 **How to check an implementation with no coded file to hand.** An encoder
 and decoder written together agree with each other whatever they got wrong.
 These tests in `rs.rs` do not depend on the encoder: the field tables against
-bit-by-bit multiplication; the generator's coefficients against the list the
-standard prints, its palindrome shape and its zeros at exactly the listed
-roots; the dual-basis matrix against its definition; the syndromes of a
-single error against a hand calculation. The printed list and the matrix
-were typed in from memory of the standard, and agree with what the
-definitions give. These tests pin the constants, not the bit order on a real
-link. Until a recorded file has been decoded, say so.
+bit-by-bit multiplication; the generator's palindrome shape and its zeros at
+exactly the roots the standard lists; the dual-basis matrix against its
+definition; the syndromes of a single error against a hand calculation. The
+matrix and the RS(255,223) coefficient list were typed in from memory of the
+standard and agree with what the definitions give, which is two recollections
+agreeing and not a document checked. None of this pins what only a real link
+shows: the order of symbols within a codeword, the order of interleaving.
+Until a recorded file has been decoded, say so.
 
 ### Telecommand: CLTUs and TC transfer frames
 
@@ -1138,7 +1139,8 @@ codeblock:  7 bytes of frame | 7 parity bits + 1 filler bit
   bit in the 63 gives a syndrome that names the bit; two wrong bits give one
   that names none. Correct one, and treat anything else as a lost frame.
 - **Fill.** The frame is cut into 7-byte pieces and the last codeblock is
-  padded with `55`. Only the frame's length field says where the padding
+  padded with `55`. (Bytes after the frame that are not `55` are taken for a
+  second frame in the same CLTU, which early issues of the standard allowed.) Only the frame's length field says where the padding
   starts. Read the first codeblock, take the length from the header, and
   from that the number of codeblocks.
 - **The tail** is a codeblock built to fail decoding, which is how a
@@ -1168,7 +1170,7 @@ codeblock:  7 bytes of frame | 7 parity bits + 1 filler bit
   often be told from the data: without one the data starts with a packet
   header (first three bits 000); with one, a whole-packet frame starts with
   `11`. Reassemble per MAP, and drop what is half built when the frame
-  sequence jumps.
+  sequence jumps. Here a run of segments must come to exactly one packet.
 - **Offsets.** A packet's bytes are not together in a CLTU file: every
   eighth byte is parity, and a segmented packet is in several CLTUs. A
   record's offset is where its first byte is, and reading it back means

@@ -679,7 +679,13 @@ impl Config {
     pub fn frame_params_for(&self, layout: &Layout) -> FrameParams {
         let f = &self.frames;
         let rs = f.rs_code_for(layout.rs, layout.crc_parity);
-        let stated = rs.map(|rs| rs.parity_len()).or(f.rs_parity_bytes);
+        // Check symbols that are not to be used are still there to be
+        // stepped over: a code found in the file says how many, even when
+        // the configuration says to leave them alone.
+        let stated = rs
+            .map(|rs| rs.parity_len())
+            .or(f.rs_parity_bytes)
+            .or(layout.rs.map(|rs| rs.parity_len()));
         // A detected CRC is tied to the check-symbol length it was found
         // with: if the configuration gives a different length, it is not there.
         let has_crc = f.crc.unwrap_or(match (stated, layout.crc_parity) {
@@ -1129,6 +1135,16 @@ crc = false
         );
         // Unless the configuration says not to, or gives another length.
         assert_eq!(of("[frames]\nrs_correct = false", &seen), (None, 64, true));
+        // Not using them still means stepping over them, CRC or no CRC.
+        let no_crc = Layout {
+            crc_parity: None,
+            ..seen
+        };
+        assert_eq!(
+            of("[frames]\nrs_correct = false", &no_crc),
+            (None, 64, false)
+        );
+        assert_eq!(of("", &no_crc), (Some(found), 64, false));
         assert_eq!(
             of("[frames]\nrs_parity_bytes = 32", &seen),
             (None, 32, false)

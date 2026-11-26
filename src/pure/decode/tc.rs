@@ -9,7 +9,8 @@
 //! them is known, but a step can hand over only one record. So the step
 //! that reads a CLTU (or a bare frame) queues what it found, and each step
 //! after that hands over one item and consumes one byte, the last one
-//! consuming the rest. A CLTU is always longer than what it can yield.
+//! consuming the rest. A CLTU is always longer than what it can yield: a
+//! packet is at least seven bytes, and a run of segments yields one.
 //!
 //! Between CLTUs: a tail sequence and idle fill are passed over; anything
 //! else is skipped up to the next start sequence and reported. A file of
@@ -256,7 +257,17 @@ impl TcDecoder {
                 if partial.bytes.len() > MAX_REASSEMBLED {
                     self.lost(at, "segments add up to more than a space packet");
                 } else if flags == 0b10 {
-                    self.packets(&partial.bytes, |k| partial.offset_of(k));
+                    // One packet, not a run of them: a step can only hand
+                    // over as many items as the last frame has bytes.
+                    let one = PrimaryHeader::parse(&partial.bytes)
+                        .is_some_and(|h| h.version == 0 && h.total_len() == partial.bytes.len());
+                    match one {
+                        true => self.packets(&partial.bytes, |k| partial.offset_of(k)),
+                        false => self.lost(
+                            partial.offset_of(0),
+                            "segments do not add up to one space packet",
+                        ),
+                    }
                 } else {
                     self.partials.insert(key, partial);
                 }
@@ -864,6 +875,37 @@ mod tests {
                 notices[0].loss,
                 Loss::BadFrame {
                     reason: "segmented packet was not finished"
+                }
+            );
+        }
+    }
+
+    /// Segments carry one packet. Many small ones cut across two frames are
+    /// refused whole, not handed over until the bytes run out.
+    #[test]
+    fn segments_must_add_up_to_one_packet() {
+        for p in [CLTU, BARE] {
+            let many: Vec<u8> = (0..20).flat_map(|i| tc_packet(0x0C8, i, &[0])).collect();
+            let mut first = vec![0x40];
+            first.extend(&many[..many.len() - 1]);
+            let last = vec![0x80, many[many.len() - 1]];
+            let after = tc_packet(0x0C9, 0, &[1, 2, 3]);
+            let frames = [
+                TcFrame::ad(0x155, 1, 0).build(&first, true),
+                TcFrame::ad(0x155, 1, 1).build(&last, true),
+                TcFrame::ad(0x155, 1, 2).build(&tc_segments(0, &after, 100)[0], true),
+            ];
+            let (records, notices, end) = decode(&p, &wrap(&p, &frames).concat());
+            assert_eq!(end, None);
+            assert_eq!(payloads(&records), std::slice::from_ref(&after));
+            assert_eq!(notices.len(), 1);
+            assert_eq!(
+                notices[0],
+                Notice {
+                    offset: if p.cltu { 2 + 6 } else { 6 },
+                    loss: Loss::BadFrame {
+                        reason: "segments do not add up to one space packet"
+                    },
                 }
             );
         }
