@@ -610,13 +610,28 @@ pub const INSERT_FINDING: &str = "INSERT INTO findings
 pub const DELETE_CROSS_FINDINGS: &str = "DELETE FROM findings WHERE run_id = ? AND file_id IS NULL";
 
 /// Recomputes the per-lane totals and time ranges for a run.
-pub const REFRESH_PACKET_LANES: &str = "UPDATE lanes SET
+/// Sets each packet lane's count and time ranges from its packets, in two
+/// statements run in this order: the first clears them, so that a lane
+/// whose packets are all gone reads as empty; the second fills them in from
+/// one pass over the packets. Asking lane by lane instead reads every
+/// packet once per lane.
+pub const REFRESH_PACKET_LANES: [&str; 2] = [
+    "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count,
         packet_min, packet_max, packet_count, order_min, order_max) =
-       (SELECT COUNT(*), MIN(receive_ns), MAX(receive_ns), COUNT(receive_ns),
-               MIN(packet_ns), MAX(packet_ns), COUNT(packet_ns), MIN(id), MAX(id)
-        FROM packets WHERE lane_id = lanes.id)
-     WHERE run_id = ? AND kind != 'log'";
+       (0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL)
+     WHERE run_id = ? AND kind != 'log'",
+    "UPDATE lanes SET
+       (count, receive_min, receive_max, receive_count,
+        packet_min, packet_max, packet_count, order_min, order_max) =
+       (s.n, s.r_min, s.r_max, s.r_n, s.p_min, s.p_max, s.p_n, s.o_min, s.o_max)
+     FROM (SELECT lane_id, COUNT(*) AS n,
+                  MIN(receive_ns) AS r_min, MAX(receive_ns) AS r_max, COUNT(receive_ns) AS r_n,
+                  MIN(packet_ns) AS p_min, MAX(packet_ns) AS p_max, COUNT(packet_ns) AS p_n,
+                  MIN(id) AS o_min, MAX(id) AS o_max
+           FROM packets GROUP BY lane_id) AS s
+     WHERE lanes.id = s.lane_id AND lanes.run_id = ? AND lanes.kind != 'log'",
+];
 pub const REFRESH_LOG_LANES: &str = "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count, packet_min, packet_max, packet_count) =
        (SELECT COUNT(*), MIN(log_ns), MAX(log_ns), COUNT(log_ns),
@@ -640,22 +655,41 @@ pub fn lane_pairs(run: i64) -> Query {
     )
 }
 
-/// How lane `a` compares with lane `b`, matching packets by the checksum of
-/// their bytes, which the `(sum, lane_id)` index answers without a row read.
-/// One row: packets of `a` also in `b`; packets of `a` not in `b` that sit
-/// between the first and last shared packet; the id of the first such packet.
-pub fn hop_compare(lane_a: i64, lane_b: i64) -> Query {
+/// How every lane of a run compares with each lane that carries the same
+/// stream from another source, matching packets by the checksum of their
+/// bytes, which the `(sum, lane_id)` index answers without a row read.
+///
+/// One row for each pair (`a`, `b`) where `a` has packets that `b` lacks
+/// between the first and last packet they share. Columns: lane `a`, lane
+/// `b`, packets of `a` also in `b`, packets of `a` missing from `b` within
+/// that span, the id of the first such packet.
+///
+/// The packets are read twice in all, however many pairs there are: once
+/// to find what each pair shares and once to count what is missing.
+/// `CROSS JOIN` keeps SQLite to that order. Asking pair by pair instead
+/// reads every packet once per pair, which for hundreds of streams from
+/// several sources is most of the time an ingest takes.
+pub fn hop_compare_all(run: i64) -> Query {
     Query::new(
-        "WITH m AS MATERIALIZED (
-           SELECT p.id AS id,
-                  EXISTS (SELECT 1 FROM packets q
-                          WHERE q.sum = p.sum AND q.lane_id = ?1) AS hit
-           FROM packets p WHERE p.lane_id = ?2),
-         w AS (SELECT MIN(id) AS lo, MAX(id) AS hi FROM m WHERE hit = 1)
-         SELECT (SELECT COUNT(*) FROM m WHERE hit = 1),
-                (SELECT COUNT(*) FROM m, w WHERE hit = 0 AND id BETWEEN w.lo AND w.hi),
-                (SELECT MIN(id) FROM m, w WHERE hit = 0 AND id BETWEEN w.lo AND w.hi)",
-        vec![lane_b.into(), lane_a.into()],
+        "WITH pair AS MATERIALIZED (
+           SELECT a.id AS a, b.id AS b
+           FROM lanes a JOIN lanes b
+             ON b.run_id = a.run_id AND b.kind = 'packet' AND b.apid = a.apid
+            AND b.ptype = a.ptype AND b.source != a.source
+           WHERE a.run_id = ?1 AND a.kind = 'packet'),
+         shared AS MATERIALIZED (
+           SELECT pair.a AS a, pair.b AS b, COUNT(*) AS n, MIN(p.id) AS lo, MAX(p.id) AS hi
+           FROM packets p CROSS JOIN pair ON pair.a = p.lane_id
+           WHERE EXISTS (SELECT 1 FROM packets q
+                         WHERE q.sum = p.sum AND q.lane_id = pair.b)
+           GROUP BY pair.a, pair.b)
+         SELECT shared.a, shared.b, shared.n, COUNT(*), MIN(p.id)
+         FROM packets p CROSS JOIN shared ON shared.a = p.lane_id
+         WHERE p.id BETWEEN shared.lo AND shared.hi
+           AND NOT EXISTS (SELECT 1 FROM packets q
+                           WHERE q.sum = p.sum AND q.lane_id = shared.b)
+         GROUP BY shared.a, shared.b",
+        vec![run.into()],
     )
 }
 

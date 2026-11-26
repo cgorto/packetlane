@@ -246,7 +246,9 @@ impl Store {
 
         if changed {
             let tx = self.conn.transaction()?;
-            tx.execute(sql::REFRESH_PACKET_LANES, params![run_id])?;
+            for statement in sql::REFRESH_PACKET_LANES {
+                tx.execute(statement, params![run_id])?;
+            }
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_META, params![run_id])?;
@@ -621,6 +623,14 @@ fn ingest_text(
 fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
     let mut out = Vec::new();
 
+    // Every pair is compared in one query; the findings are then made in
+    // the order the pairs are listed, which is the order they are stored in.
+    let compared = run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?;
+    let compared: HashMap<(i64, i64), &Vec<Cell>> = compared
+        .rows
+        .iter()
+        .filter_map(|r| Some(((r[0].int()?, r[1].int()?), r)))
+        .collect();
     let pairs = run_query(conn, &sql::lane_pairs(run_id), usize::MAX)?;
     for row in &pairs.rows {
         let (Some(a), Some(source_a), Some(b), Some(source_b)) =
@@ -628,17 +638,16 @@ fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
         else {
             continue;
         };
-        let compared = run_query(conn, &sql::hop_compare(a, b), 1)?;
-        if let Some(r) = compared.rows.first() {
-            let shared = r[0].int().unwrap_or(0);
-            let missing = r[1].int().unwrap_or(0);
+        if let Some(r) = compared.get(&(a, b)) {
+            let shared = r[2].int().unwrap_or(0);
+            let missing = r[3].int().unwrap_or(0);
             out.extend(hop_finding(
                 a,
                 source_a,
                 source_b,
                 shared,
                 missing,
-                r[2].int(),
+                r[4].int(),
             ));
         }
     }
