@@ -78,7 +78,9 @@ const WRAP_DRAW = `(() => {
   const chrome = spawn(chromePath, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
     `--window-size=${WIDTH},${HEIGHT}`, '--no-first-run', '--no-default-browser-check', '--disable-extensions', 'about:blank'],
   { stdio: ['ignore', 'ignore', 'pipe'] });
-  const cleanup = () => { try { chrome.kill(); } catch (e) { /* gone already */ } try { fs.rmSync(profile, { recursive: true, force: true }); } catch (e) { /* leave it */ } };
+  // Chrome goes on writing to its profile for a moment after it is told to
+  // stop, so stop it outright and try the removal more than once.
+  const cleanup = () => { try { chrome.kill('SIGKILL'); } catch (e) { /* gone already */ } try { fs.rmSync(profile, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch (e) { /* leave it */ } };
   process.on('exit', cleanup);
 
   // Chrome prints the port it chose.
