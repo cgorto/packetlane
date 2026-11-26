@@ -12,6 +12,11 @@
 //!    `Skip` otherwise. The step that reaches the end of the zone consumes
 //!    the frame trailer too.
 //!
+//! If the file's frames carry Reed-Solomon check symbols and the code is
+//! known, each frame is corrected before it is parsed (`pure/rs.rs`). A
+//! frame with more errors than the code can put right is dropped like any
+//! other bad frame. How much was corrected is counted and reported once.
+//!
 //! Lost data is handled per virtual channel: a jump in the frame count, or a
 //! first header pointer that disagrees with the packet in progress, drops
 //! that packet and restarts at the next pointer. Bytes that are not a frame
@@ -20,9 +25,10 @@
 
 use std::collections::BTreeMap;
 
-use super::{DecodeError, Decoder, Loss, Notice, Record, Step};
+use super::{Coding, DecodeError, Decoder, Loss, Notice, Record, Step};
 use crate::pure::ccsds::{IDLE_APID, PRIMARY_HEADER_LEN, PrimaryHeader};
 use crate::pure::frame::{self, FrameKind, FrameParams, Layout, Pointer, SYNC};
+use crate::pure::rs::Basis;
 
 pub const MIN_CADU_LEN: usize = 32;
 pub const MAX_CADU_LEN: usize = 16 * 1024;
@@ -75,6 +81,9 @@ pub struct CaduDecoder {
     /// True from a frame that failed to parse until the next sync marker:
     /// the bytes passed over in between are that frame, not junk.
     in_bad_frame: bool,
+    /// Frames Reed-Solomon had to correct: how many, how many bytes it
+    /// changed in them, and where the first one is.
+    corrected: Option<(u64, u64, u64)>,
 }
 
 impl CaduDecoder {
@@ -90,6 +99,7 @@ impl CaduDecoder {
                 good_frames: 0,
                 bad_frames: 0,
                 in_bad_frame: false,
+                corrected: None,
             })
     }
 
@@ -118,11 +128,34 @@ impl CaduDecoder {
         };
         self.cadu.clear();
         self.cadu.extend_from_slice(raw);
+        // The sender coded first and randomised second, so undo in reverse.
         if self.params.randomized {
             frame::derandomize(&mut self.cadu[SYNC.len()..]);
         }
-        let frame = match frame::parse(&self.params, &self.cadu) {
-            Ok(frame) => frame,
+        let fixed = match self.params.rs {
+            Some(rs) => rs
+                .correct(&mut self.cadu[SYNC.len()..])
+                .map_err(|e| e.reason()),
+            None => Ok(0),
+        };
+        let parsed = fixed.and_then(|fixed| match frame::parse(&self.params, &self.cadu) {
+            Ok(frame) => Ok((frame, fixed)),
+            // Enough errors can carry a block to a different codeword. The
+            // CRC is the only thing that can tell.
+            Err(frame::CRC_MISMATCH) if fixed > 0 => {
+                Err("frame CRC mismatch after Reed-Solomon correction")
+            }
+            Err(reason) => Err(reason),
+        });
+        let frame = match parsed {
+            Ok((frame, fixed)) => {
+                if fixed > 0 {
+                    let (frames, bytes, _) = self.corrected.get_or_insert((0, 0, offset));
+                    *frames += 1;
+                    *bytes += fixed as u64;
+                }
+                frame
+            }
             Err(reason) => {
                 self.bad_frames += 1;
                 if self.good_frames == 0 && self.bad_frames >= GIVE_UP_AFTER {
@@ -303,10 +336,34 @@ impl Decoder for CaduDecoder {
         if p.has_crc {
             text.push_str(", CRC");
         }
-        if p.rs_parity_len > 0 {
-            text.push_str(&format!(", {} check bytes", p.rs_parity_len));
+        match p.rs {
+            Some(rs) => {
+                text.push_str(&format!(", {} interleave {}", rs.code.name(), rs.depth));
+                if rs.basis == Basis::Conventional {
+                    text.push_str(" conventional basis");
+                }
+            }
+            // Present but not used: say so by not naming a code.
+            None if p.rs_parity_len > 0 => {
+                text.push_str(&format!(", {} check bytes", p.rs_parity_len));
+            }
+            None => {}
         }
         Some(text)
+    }
+
+    fn summary(&self) -> Vec<Notice> {
+        self.corrected
+            .iter()
+            .map(|&(blocks, units, offset)| Notice {
+                offset,
+                loss: Loss::Corrected {
+                    coding: Coding::ReedSolomon,
+                    blocks,
+                    units,
+                },
+            })
+            .collect()
     }
 }
 
@@ -315,7 +372,7 @@ fn find_sync(bytes: &[u8]) -> Option<usize> {
 }
 
 /// How many whole CADUs from the start of a file layout detection looks at.
-const SNIFF_FRAMES: usize = 8;
+const SNIFF_FRAMES: usize = 16;
 
 /// The layout, if `prefix` reads as CADUs: three sync markers at one
 /// spacing of a believable size, with no marker between the first two.
@@ -345,6 +402,7 @@ pub fn sniff_cadu_len(prefix: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::pure::decode::{DecodeEnd, decode_all};
+    use crate::pure::rs::{Code, RsCode};
     use crate::pure::synth::{Source, cadus, frame_zones};
 
     const ZONE: usize = 50;
@@ -356,6 +414,9 @@ mod tests {
             kind,
             randomized: true,
             rs_parity_len: 32,
+            // Check symbols that are only there to be skipped. The tests
+            // further down that end in `_rs` use real ones.
+            rs: None,
             has_crc: true,
             aos_has_ocf: false,
             aos_has_header_check: false,
@@ -771,5 +832,280 @@ mod tests {
         assert_eq!(end, None);
         assert_eq!(notices.list, []);
         assert_eq!(payloads(&records), packets);
+    }
+
+    /// A layout with real check symbols: a data zone of about `zone` bytes,
+    /// made a little longer where the codeblock has to divide by the depth.
+    fn rs_params(kind: FrameKind, rs: RsCode, has_crc: bool, zone: usize) -> (FrameParams, usize) {
+        let fixed = if kind == FrameKind::Tm { 6 } else { 8 } + if has_crc { 2 } else { 0 };
+        let zone = zone + (rs.depth - (fixed + zone) % rs.depth) % rs.depth;
+        let p = FrameParams {
+            cadu_len: SYNC.len() + fixed + zone + rs.parity_len(),
+            kind,
+            randomized: true,
+            rs_parity_len: rs.parity_len(),
+            rs: Some(rs),
+            has_crc,
+            aos_has_ocf: false,
+            aos_has_header_check: false,
+            aos_insert_zone_len: 0,
+        };
+        assert!(rs.fits(p.cadu_len - SYNC.len()), "{p:?}");
+        (p, zone)
+    }
+
+    fn rs_cases() -> Vec<RsCode> {
+        let mut out = Vec::new();
+        for code in [Code::Rs223, Code::Rs239] {
+            for (depth, basis) in [
+                (1, Basis::Dual),
+                (2, Basis::Conventional),
+                (5, Basis::Dual),
+                (8, Basis::Dual),
+            ] {
+                out.push(RsCode { code, depth, basis });
+            }
+        }
+        out
+    }
+
+    /// Changes `count` different bytes after the marker, never the same
+    /// codeword more than `per_word` times. Returns how many it changed.
+    fn corrupt(cadu: &mut [u8], rs: &RsCode, per_word: usize, seed: &mut u32) -> usize {
+        let block = &mut cadu[SYNC.len()..];
+        let words = block.len() / rs.depth;
+        let mut changed = 0;
+        for lane in 0..rs.depth {
+            let mut hit = Vec::new();
+            while hit.len() < per_word.min(words) {
+                *seed ^= *seed << 13;
+                *seed ^= *seed >> 17;
+                *seed ^= *seed << 5;
+                let at = *seed as usize % words;
+                if !hit.contains(&at) {
+                    hit.push(at);
+                    block[at * rs.depth + lane] ^= (*seed >> 24) as u8 | 1;
+                    changed += 1;
+                }
+            }
+        }
+        changed
+    }
+
+    fn noted(p: &FrameParams, data: &[u8]) -> (Vec<Record>, Vec<Notice>, Option<DecodeEnd>) {
+        let mut decoder = CaduDecoder::new(*p).unwrap();
+        let (records, notices, end) = crate::pure::decode::decode_all_noting(&mut decoder, data);
+        assert_eq!(notices.more, 0);
+        (records, notices.list, end)
+    }
+
+    /// Every frame damaged as badly as the code allows, in the header, the
+    /// packets, the CRC and the check symbols alike: every packet comes
+    /// back, and the damage is counted once for the file.
+    #[test]
+    fn corrects_every_frame_at_the_limit_rs() {
+        let mut seed = 0x9E37_79B9u32;
+        for kind in [FrameKind::Tm, FrameKind::Aos] {
+            for rs in rs_cases() {
+                for has_crc in [true, false] {
+                    let (p, zone) = rs_params(kind, rs, has_crc, 60);
+                    let packets = packets();
+                    let mut cadus = cadus(&p, 2, &frame_zones(&packets, zone));
+                    let clean = cadus.concat();
+                    assert_eq!(noted(&p, &clean).1, [], "{p:?}");
+
+                    let mut changed = 0;
+                    for cadu in cadus.iter_mut().skip(1) {
+                        changed += corrupt(cadu, &rs, rs.code.power(), &mut seed);
+                    }
+                    let (records, notices, end) = noted(&p, &cadus.concat());
+                    assert_eq!(end, None, "{p:?}");
+                    assert_eq!(payloads(&records), packets, "{p:?}");
+                    let want = Notice {
+                        offset: p.cadu_len as u64,
+                        loss: Loss::Corrected {
+                            coding: Coding::ReedSolomon,
+                            blocks: cadus.len() as u64 - 1,
+                            units: changed as u64,
+                        },
+                    };
+                    assert_eq!(notices, std::slice::from_ref(&want), "{p:?}");
+                    assert!(!want.is_problem());
+                    assert_eq!(want.kind(), "corrected");
+                }
+            }
+        }
+    }
+
+    /// One codeword of one frame with one error too many: that frame is
+    /// lost, and only that frame.
+    #[test]
+    fn a_frame_past_correcting_is_dropped_rs() {
+        let mut seed = 0x1357_9BDFu32;
+        for rs in rs_cases() {
+            let (p, zone) = rs_params(FrameKind::Tm, rs, true, 60);
+            let packets = packets();
+            let zones = frame_zones(&packets, zone);
+            let mut cadus = cadus(&p, 2, &zones);
+            let k = 4;
+            // Depth 1 for the damage: all of it lands in the first codeword.
+            let one = RsCode { depth: 1, ..rs };
+            let words = (p.cadu_len - SYNC.len()) / rs.depth;
+            let mut word: Vec<u8> = (0..words)
+                .map(|i| cadus[k][SYNC.len() + i * rs.depth])
+                .collect();
+            let mut marked = SYNC.to_vec();
+            marked.append(&mut word);
+            corrupt(&mut marked, &one, rs.code.power() + 1, &mut seed);
+            for i in 0..words {
+                cadus[k][SYNC.len() + i * rs.depth] = marked[SYNC.len() + i];
+            }
+
+            let (records, notices, end) = noted(&p, &cadus.concat());
+            assert_eq!(end, None);
+            let mut start = 0;
+            let want: Vec<Vec<u8>> = packets
+                .iter()
+                .filter(|pk| {
+                    let end = start + pk.len();
+                    let keep = end <= k * zone || start >= (k + 1) * zone;
+                    start = end;
+                    keep
+                })
+                .cloned()
+                .collect();
+            assert_eq!(payloads(&records), want, "{rs:?}");
+            assert_eq!(notices.len(), 2, "{notices:?}");
+            assert_eq!(
+                notices[0],
+                Notice {
+                    offset: (k * p.cadu_len) as u64,
+                    loss: Loss::BadFrame {
+                        reason: "more errors than Reed-Solomon can correct"
+                    },
+                }
+            );
+            assert!(matches!(
+                notices[1].loss,
+                Loss::FrameGap {
+                    missing: Some(1),
+                    ..
+                }
+            ));
+        }
+    }
+
+    /// Reed-Solomon can only say a block is a codeword, not that it is the
+    /// one that was sent. A corrected frame is still held to its CRC.
+    #[test]
+    fn a_corrected_frame_must_still_pass_its_crc_rs() {
+        let rs = RsCode {
+            code: Code::Rs223,
+            depth: 1,
+            basis: Basis::Dual,
+        };
+        let (p, zone) = rs_params(FrameKind::Tm, rs, true, 60);
+        let mut cadus = cadus(&p, 2, &frame_zones(&packets(), zone));
+        // Frame 3 as a different codeword: a data byte changed and the
+        // check symbols worked out again, the CRC left as it was.
+        let k = 3;
+        let block_end = p.cadu_len - p.rs_parity_len;
+        frame::derandomize(&mut cadus[k][SYNC.len()..]);
+        cadus[k][20] ^= 0x04;
+        let parity = rs.encode(&cadus[k][SYNC.len()..block_end]).unwrap();
+        cadus[k][block_end..].copy_from_slice(&parity);
+        frame::derandomize(&mut cadus[k][SYNC.len()..]);
+        let reasons = |data: &[u8]| -> Vec<&'static str> {
+            noted(&p, data)
+                .1
+                .iter()
+                .filter_map(|n| match n.loss {
+                    Loss::BadFrame { reason } => Some(reason),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(reasons(&cadus.concat()), ["frame CRC mismatch"]);
+        cadus[k][40] ^= 0x80;
+        assert_eq!(
+            reasons(&cadus.concat()),
+            ["frame CRC mismatch after Reed-Solomon correction"]
+        );
+    }
+
+    #[test]
+    fn sniffs_the_code_from_a_clean_frame_rs() {
+        let mut seed = 0x0F1E_2D3Cu32;
+        for kind in [FrameKind::Tm, FrameKind::Aos] {
+            for rs in rs_cases() {
+                for has_crc in [true, false] {
+                    let (p, zone) = rs_params(kind, rs, has_crc, 60);
+                    let mut cadus = cadus(&p, 2, &frame_zones(&packets(), zone));
+                    let want = Layout {
+                        cadu_len: p.cadu_len,
+                        kind: Some(kind),
+                        randomized: Some(true),
+                        crc_parity: has_crc.then_some(rs.parity_len()),
+                        rs: Some(rs),
+                    };
+                    assert_eq!(sniff_layout(&cadus.concat()), Some(want), "{p:?}");
+                    // What the configuration makes of that, saying nothing itself.
+                    let config = crate::pure::config::Config::default();
+                    assert_eq!(config.frame_params_for(&want), p);
+
+                    // A noisy start: only one frame of those looked at is
+                    // clean, and one has its version bits hit.
+                    for (i, cadu) in cadus.iter_mut().enumerate().take(SNIFF_FRAMES) {
+                        if i != 5 {
+                            corrupt(cadu, &rs, rs.code.power() - 1, &mut seed);
+                        }
+                    }
+                    cadus[2][SYNC.len()] ^= 0xC0;
+                    let noisy = cadus.concat();
+                    // Position 0 of codeword 0 may have been hit already,
+                    // and one more error there is still within reach.
+                    assert_eq!(sniff_layout(&noisy), Some(want), "{p:?}");
+                    let (records, notices, _) = noted(&p, &noisy);
+                    assert_eq!(payloads(&records), packets());
+                    assert!(matches!(
+                        notices[..],
+                        [Notice {
+                            loss: Loss::Corrected { .. },
+                            ..
+                        }]
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Check symbols a recorder zeroed are not a code, even behind frames
+    /// that are nearly all zeros and so "correct" to the all-zero codeword.
+    #[test]
+    fn zero_filled_check_symbols_are_not_taken_for_a_code() {
+        let mut p = params(FrameKind::Tm);
+        p.randomized = false;
+        let idle = vec![(IDLE_POINTER, vec![0u8; ZONE]); 6];
+        let data = frames(&p, 0, &idle).concat();
+        let layout = sniff_layout(&data).unwrap();
+        assert_eq!(layout.rs, None);
+        assert_eq!(layout.crc_parity, Some(32));
+        let p = crate::pure::config::Config::default().frame_params_for(&layout);
+        assert_eq!((p.rs, p.rs_parity_len, p.has_crc), (None, 32, true));
+        assert_eq!(noted(&p, &data).1, []);
+    }
+
+    /// The lengths check symbols can have are 16 and 32 times a depth, and
+    /// a CRC in front of filler of any of them is found.
+    #[test]
+    fn sniffs_a_crc_before_any_length_of_filler() {
+        for parity in [0, 16, 32, 48, 64, 80, 96, 128, 160, 256] {
+            let mut p = params(FrameKind::Aos);
+            p.cadu_len = p.cadu_len - 32 + parity;
+            p.rs_parity_len = parity;
+            let data = pack(&p, &packets()).concat();
+            let layout = sniff_layout(&data).unwrap();
+            assert_eq!((layout.crc_parity, layout.rs), (Some(parity), None));
+        }
     }
 }

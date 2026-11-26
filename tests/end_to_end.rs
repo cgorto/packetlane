@@ -967,6 +967,121 @@ fn a_cadu_file_needs_no_configuration_when_its_frames_say_enough() {
     assert_eq!(count(&store, "SELECT COUNT(*) FROM findings"), 0);
 }
 
+/// A noisy downlink with its Reed-Solomon check symbols: the code is read
+/// off the file, every packet comes back whole, the damage is on record as
+/// a note, and a frame past saving is a loss.
+#[test]
+fn a_noisy_cadu_file_is_corrected_with_its_check_symbols() {
+    use packetlane::pure::config::Config;
+    use packetlane::pure::format::hex;
+    use packetlane::pure::synth::{Source, demo_cadus};
+
+    let written = "[frames]\nkind = \"aos\"\nrandomized = true\ncrc = true\nrs_interleave = 4\n";
+    let params = Config::parse(written).unwrap().frame_params(4 + 4 * 255);
+    assert_eq!(params.rs_parity_len, 128);
+    let mut a = Source::new(0x1A3, 0, 5);
+    let mut b = Source::new(0x0B0, 0, 700);
+    let packets: Vec<Vec<u8>> = (0..60).flat_map(|_| [a.emit(), b.emit()]).collect();
+    let clean = demo_cadus(&params, &packets.concat());
+    let frames = clean.len() / params.cadu_len;
+    assert!(frames > 40);
+
+    // Twelve wrong bytes in each of the four codewords of every frame but
+    // the third, anywhere after the marker: header, packets, CRC or check
+    // symbols. The code corrects sixteen.
+    let mut noisy = clean.clone();
+    let mut x = 0x2545_F491u32;
+    let mut changed = 0;
+    for frame in (0..frames).filter(|&f| f != 2) {
+        for lane in 0..4 {
+            let mut hit = Vec::new();
+            while hit.len() < 12 {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let word = x as usize % 255;
+                if !hit.contains(&word) {
+                    hit.push(word);
+                    noisy[frame * params.cadu_len + 4 + word * 4 + lane] ^= (x >> 24) as u8 | 1;
+                    changed += 1;
+                }
+            }
+        }
+    }
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("station")).unwrap();
+    // No configuration: what the file is has to come from the file.
+    fs::write(run.join("station/pass.cadu"), &noisy).unwrap();
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let file = &summary.files[0];
+    assert_eq!(file.packets, packets.len() as u64, "{}", file.note);
+    assert_eq!(
+        file.note,
+        "AOS frames in 1024-byte CADUs, randomised, CRC, RS(255,223) interleave 4"
+    );
+    let found = store
+        .query_user("SELECT kind, severity, message FROM findings", 50)
+        .unwrap();
+    assert_eq!(found.rows.len(), 1, "{:?}", found.rows);
+    assert_eq!(found.rows[0][0].text(), Some("corrected"));
+    assert_eq!(found.rows[0][1].text(), Some("info"));
+    assert_eq!(
+        found.rows[0][2].text().unwrap(),
+        format!(
+            "Reed-Solomon corrected {changed} bytes in {} frames, the first at byte 0x0",
+            frames - 1
+        )
+    );
+    let ids = store
+        .query_user("SELECT id FROM packets ORDER BY idx", 500)
+        .unwrap();
+    drop(store);
+    // The packet view shows the corrected bytes, not the ones in the file.
+    let get = serve(db, run.clone());
+    for (row, packet) in ids.rows.iter().zip(&packets).step_by(7) {
+        let body = get(&format!("/api/packet?id={}", row[0].int().unwrap()));
+        assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+        let shown = &packet[..packet.len().min(body["hex"].as_str().unwrap().len() / 2)];
+        assert_eq!(body["hex"], hex(shown));
+    }
+
+    // Seventeen wrong bytes in one codeword of one frame: that frame goes.
+    let at = 20 * params.cadu_len + 4;
+    for word in 0..17 {
+        noisy[at + word * 4] = clean[at + word * 4] ^ 0x5A;
+    }
+    fs::write(run.join("station/pass.cadu"), &noisy).unwrap();
+    let mut store = Store::open(&scratch.0.join("store.db")).unwrap();
+    ingest_targets(&mut store, &[run], None, None, None).unwrap();
+    let found = store
+        .query_user(
+            "SELECT kind, severity, message FROM findings ORDER BY id",
+            50,
+        )
+        .unwrap();
+    let bad: Vec<&str> = found
+        .rows
+        .iter()
+        .filter(|r| r[0].text() == Some("bad_frame"))
+        .map(|r| r[2].text().unwrap())
+        .collect();
+    assert_eq!(bad.len(), 1, "{:?}", found.rows);
+    assert!(
+        bad[0].contains("more errors than Reed-Solomon can correct"),
+        "{bad:?}"
+    );
+    let kinds: Vec<&str> = found.rows.iter().map(|r| r[0].text().unwrap()).collect();
+    assert!(kinds.contains(&"frame_gap") && kinds.contains(&"corrected"));
+    assert!(
+        (count(&store, "SELECT COUNT(*) FROM packets") as usize) < packets.len(),
+        "the lost frame's packets are gone"
+    );
+}
+
 fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(bytes).unwrap();

@@ -67,6 +67,31 @@ pub enum Loss {
         /// How many frames are missing, or `None` if the count went back.
         missing: Option<u32>,
     },
+    /// Not a loss: errors an error-correcting code put right, counted over
+    /// the whole file. It is said the same way as the losses because it is
+    /// the other half of the same account. `blocks` is how many frames
+    /// (Reed-Solomon) or codeblocks (BCH) needed it, `units` how many bytes
+    /// (Reed-Solomon) or bits (BCH) were changed.
+    Corrected {
+        coding: Coding,
+        blocks: u64,
+        units: u64,
+    },
+    /// Not a loss either: telecommand frames that carry a control command
+    /// for the receiving end of the link and no packets, counted over the
+    /// whole file.
+    ControlFrames {
+        unlock: u64,
+        set_vr: u64,
+        other: u64,
+    },
+}
+
+/// An error-correcting code a decoder applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Coding {
+    ReedSolomon,
+    Bch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,13 +108,20 @@ impl Notice {
             Loss::Junk { .. } => "junk",
             Loss::BadFrame { .. } => "bad_frame",
             Loss::FrameGap { .. } => "frame_gap",
+            Loss::Corrected { .. } => "corrected",
+            Loss::ControlFrames { .. } => "control_frame",
         }
     }
 
     /// False for what is normal in a healthy capture: one that starts
-    /// partway through a frame has bytes before its first sync marker.
+    /// partway through a frame has bytes before its first sync marker. And
+    /// false for what cost nothing: corrected errors, control frames.
     pub fn is_problem(&self) -> bool {
-        !(self.offset == 0 && matches!(self.loss, Loss::Junk { .. }))
+        match self.loss {
+            Loss::Junk { .. } => self.offset != 0,
+            Loss::BadFrame { .. } | Loss::FrameGap { .. } => true,
+            Loss::Corrected { .. } | Loss::ControlFrames { .. } => false,
+        }
     }
 }
 
@@ -127,6 +159,34 @@ impl fmt::Display for Notice {
                     ),
                 }
             }
+            Loss::Corrected {
+                coding,
+                blocks,
+                units,
+            } => {
+                let (name, unit, units_name, block, blocks_name) = match coding {
+                    Coding::ReedSolomon => ("Reed-Solomon", "byte", "bytes", "frame", "frames"),
+                    Coding::Bch => ("BCH", "bit", "bits", "codeblock", "codeblocks"),
+                };
+                let unit = if *units == 1 { unit } else { units_name };
+                let block = if *blocks == 1 { block } else { blocks_name };
+                write!(
+                    f,
+                    "{name} corrected {units} {unit} in {blocks} {block}, the first at byte {at:#x}"
+                )
+            }
+            Loss::ControlFrames {
+                unlock,
+                set_vr,
+                other,
+            } => {
+                let total = unlock + set_vr + other;
+                let unit = if total == 1 { "frame" } else { "frames" };
+                write!(
+                    f,
+                    "{total} control {unit} carrying no packets ({unlock} Unlock, {set_vr} Set V(R), {other} other), the first at byte {at:#x}"
+                )
+            }
         }
     }
 }
@@ -144,6 +204,13 @@ pub struct Notices {
 }
 
 impl Notices {
+    /// Adds a decoder's whole-file notices. They are few, so the limit on
+    /// the list does not apply to them.
+    pub fn with_summary(mut self, decoder: &dyn Decoder) -> Self {
+        self.list.extend(decoder.summary());
+        self
+    }
+
     pub fn push(&mut self, notice: Notice) {
         if let (Some(last), Loss::Junk { bytes: add }) = (self.list.last_mut(), &notice.loss)
             && let Loss::Junk { bytes } = &mut last.loss
@@ -194,6 +261,13 @@ pub trait Decoder {
     /// the last step. Most formats say nothing.
     fn describe(&self) -> Option<String> {
         None
+    }
+
+    /// Notices that are counts over the whole file, such as how many errors
+    /// were corrected: a `Step` has no room for them, and one per frame
+    /// would crowd out the losses. Ask after the last step.
+    fn summary(&self) -> Vec<Notice> {
+        Vec::new()
     }
 }
 
@@ -356,12 +430,18 @@ pub fn decode_all_noting(
                     offset: pos as u64,
                     available: data.len() - pos,
                 });
-                return (records, notices, end);
+                return (records, notices.with_summary(decoder), end);
             }
-            Step::Fatal(e) => return (records, notices, Some(DecodeEnd::Error(e))),
+            Step::Fatal(e) => {
+                return (
+                    records,
+                    notices.with_summary(decoder),
+                    Some(DecodeEnd::Error(e)),
+                );
+            }
         }
         if pos > data.len() {
-            return (records, notices, None);
+            return (records, notices.with_summary(decoder), None);
         }
     }
 }

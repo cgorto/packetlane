@@ -2,8 +2,9 @@
 //! link blocks and the space packets packed into them.
 //!
 //! A CADU is the four-byte sync marker followed by one frame, and possibly
-//! Reed-Solomon check symbols. Nothing here keeps state: `decode/cadu.rs`
-//! owns marker lock and packet reassembly and calls [`parse`] once per CADU.
+//! Reed-Solomon check symbols (`pure/rs.rs` uses them). Nothing here keeps
+//! state: `decode/cadu.rs` owns marker lock, error correction and packet
+//! reassembly and calls [`parse`] once per CADU.
 //!
 //! ```text
 //! CADU:  sync(4) | header | [insert zone / secondary header] | data zone | [OCF(4)] | [CRC(2)] | [RS parity]
@@ -24,10 +25,14 @@ use std::ops::Range;
 
 use serde::Deserialize;
 
+use crate::pure::rs::{Basis, Code, DEPTHS, RsCode};
+
 pub const SYNC: [u8; 4] = [0x1A, 0xCF, 0xFC, 0x1D];
 const HEADER_LEN: usize = 6;
 const OCF_LEN: usize = 4;
 const CRC_LEN: usize = 2;
+/// What [`parse`] says of a frame whose CRC does not match.
+pub const CRC_MISMATCH: &str = "frame CRC mismatch";
 /// Pointer value: no packet starts in this frame, it is all continuation.
 const NO_START: u16 = 0x7FF;
 /// Pointer value: the data zone holds only fill.
@@ -53,8 +58,12 @@ pub struct FrameParams {
     /// pseudo-random sequence.
     pub randomized: bool,
     /// Check symbols kept after each frame: 32 x interleave depth for
-    /// RS(255,223), 0 if the recorder dropped them.
+    /// RS(255,223), 16 x for RS(255,239), 0 if the recorder dropped them.
     pub rs_parity_len: usize,
+    /// The code those symbols are of, if they are to be used to correct
+    /// errors. `None` passes over them: right for a recorder that kept the
+    /// space but filled it with something else.
+    pub rs: Option<RsCode>,
     /// True if each frame ends with a 16-bit CRC.
     pub has_crc: bool,
     /// AOS only: the operational control field is present. TM frames say so
@@ -78,6 +87,68 @@ pub struct Layout {
     /// `Some(n)` if every frame looked at ends with a valid CRC followed by
     /// `n` bytes of check symbols.
     pub crc_parity: Option<usize>,
+    /// The Reed-Solomon code, if a frame was found to be a clean codeblock
+    /// of one.
+    pub rs: Option<RsCode>,
+}
+
+/// The first two bits of a frame, read as what they say about the file.
+fn kind_from_bits(bits: u8) -> (FrameKind, bool) {
+    match bits {
+        0 => (FrameKind::Tm, false),
+        1 => (FrameKind::Aos, false),
+        3 => (FrameKind::Tm, true),
+        _ => (FrameKind::Aos, true),
+    }
+}
+
+/// The first two bits of every block, if they all agree.
+fn common_bits(blocks: &[Vec<u8>]) -> Option<u8> {
+    let bits = blocks.first()?.first()? >> 6;
+    blocks
+        .iter()
+        .all(|b| b.first().map(|x| x >> 6) == Some(bits))
+        .then_some(bits)
+}
+
+/// Looks for the Reed-Solomon code `blocks` (derandomised, no sync marker)
+/// are codeblocks of. One block that is a codeword as it stands settles it:
+/// that does not happen by chance, and the two symbol representations and
+/// the different depths do not pass for each other. On success the blocks
+/// are corrected, and those past correcting are dropped.
+///
+/// A block that only decodes after correction settles nothing. A frame of
+/// mostly zeros in front of zero-filled check symbols is close enough to
+/// the all-zero codeword to be "corrected" into it.
+fn find_code(blocks: &mut Vec<Vec<u8>>) -> Option<RsCode> {
+    let len = blocks.first()?.len();
+    // The larger code first: its codewords are also codewords of the
+    // smaller one at the same depth.
+    for code in [Code::Rs223, Code::Rs239] {
+        for depth in DEPTHS {
+            for basis in [Basis::Dual, Basis::Conventional] {
+                let candidate = RsCode { code, depth, basis };
+                if !candidate.fits(len) {
+                    continue;
+                }
+                let decoded: Vec<(usize, Vec<u8>)> = blocks
+                    .iter()
+                    .filter_map(|b| {
+                        let mut b = b.clone();
+                        candidate.correct(&mut b).ok().map(|n| (n, b))
+                    })
+                    .collect();
+                if decoded
+                    .iter()
+                    .any(|(n, b)| *n == 0 && b.iter().any(|&x| x != 0))
+                {
+                    *blocks = decoded.into_iter().map(|(_, b)| b).collect();
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
 }
 
 impl Layout {
@@ -88,6 +159,7 @@ impl Layout {
             kind: None,
             randomized: None,
             crc_parity: None,
+            rs: None,
         }
     }
 
@@ -96,54 +168,84 @@ impl Layout {
     /// The first two bits after the marker are the frame version: 0 for TM,
     /// 1 for AOS. The random sequence starts with `0xFF`, so a randomised
     /// frame shows them inverted: 3 for TM, 2 for AOS. All the frames must
-    /// agree. With that known, a CRC is looked for at each place it can be:
-    /// before 0 to 8 interleaves of Reed-Solomon check symbols.
+    /// agree. If noise in those bits keeps them from agreeing, a frame that
+    /// is a Reed-Solomon codeword under one of the two readings settles it.
+    ///
+    /// With that known, the Reed-Solomon code is looked for, and then a
+    /// CRC: in front of the check symbols if the code was found, and
+    /// otherwise at each place it could be.
     pub fn detect(cadus: &[&[u8]]) -> Option<Self> {
         let cadu_len = cadus.first()?.len();
         let mut layout = Self::of_len(cadu_len);
-        let bits = cadus.first()?.get(SYNC.len())? >> 6;
         if cadus.len() < 2
             || cadus
                 .iter()
-                .any(|c| c.get(SYNC.len()).map(|b| b >> 6) != Some(bits))
+                .any(|c| c.len() != cadu_len || c.len() <= SYNC.len())
         {
             return Some(layout);
         }
-        let (kind, randomized) = match bits {
-            0 => (FrameKind::Tm, false),
-            1 => (FrameKind::Aos, false),
-            3 => (FrameKind::Tm, true),
-            _ => (FrameKind::Aos, true),
+        let plain = |randomized: bool| -> Vec<Vec<u8>> {
+            cadus
+                .iter()
+                .map(|c| {
+                    let mut block = c[SYNC.len()..].to_vec();
+                    if randomized {
+                        derandomize(&mut block);
+                    }
+                    block
+                })
+                .collect()
+        };
+        let (blocks, kind, randomized) = match common_bits(&plain(false)) {
+            Some(bits) => {
+                let (kind, randomized) = kind_from_bits(bits);
+                let mut blocks = plain(randomized);
+                layout.rs = find_code(&mut blocks);
+                (blocks, kind, randomized)
+            }
+            None => {
+                let settled = [false, true].into_iter().find_map(|randomized| {
+                    let mut blocks = plain(randomized);
+                    let rs = find_code(&mut blocks)?;
+                    // Corrected and derandomised: a plain version number.
+                    let bits = common_bits(&blocks).filter(|&bits| bits < 2)?;
+                    Some((blocks, rs, kind_from_bits(bits).0, randomized))
+                });
+                let Some((blocks, rs, kind, randomized)) = settled else {
+                    return Some(layout);
+                };
+                layout.rs = Some(rs);
+                (blocks, kind, randomized)
+            }
         };
         layout.kind = Some(kind);
         layout.randomized = Some(randomized);
 
-        let plain: Vec<Vec<u8>> = cadus
-            .iter()
-            .map(|c| {
-                let mut c = c.to_vec();
-                if randomized {
-                    derandomize(&mut c[SYNC.len()..]);
-                }
-                c
-            })
-            .collect();
-        // Longest first: a valid CRC followed by zeros still checks out when
-        // the zeros are taken for part of the frame, so a shorter guess can
-        // pass by accident where check symbols were zero-filled.
-        layout.crc_parity = (0..=8).rev().map(|depth| depth * 32).find(|parity| {
-            plain.iter().all(|c| {
-                c.len()
+        let crc_before = |parity: usize| {
+            blocks.iter().all(|b| {
+                b.len()
                     .checked_sub(parity + CRC_LEN)
-                    .filter(|&at| at >= SYNC.len() + HEADER_LEN)
-                    .is_some_and(|at| {
-                        crc16(&c[SYNC.len()..at]).to_be_bytes() == c[at..at + CRC_LEN]
-                    })
+                    .filter(|&at| at >= HEADER_LEN)
+                    .is_some_and(|at| crc16(&b[..at]).to_be_bytes() == b[at..at + CRC_LEN])
             })
-        });
+        };
+        layout.crc_parity = match layout.rs {
+            Some(rs) => Some(rs.parity_len()).filter(|&parity| crc_before(parity)),
+            // Longest first: a valid CRC followed by zeros still checks out
+            // when the zeros are taken for part of the frame, so a shorter
+            // guess can pass by accident where check symbols were
+            // zero-filled.
+            None => PARITY_LENGTHS
+                .into_iter()
+                .find(|&parity| crc_before(parity)),
+        };
         Some(layout)
     }
 }
+
+/// Every length the check symbols can have: 32 or 16 times an interleave
+/// depth, or none. Longest first.
+const PARITY_LENGTHS: [usize; 10] = [256, 160, 128, 96, 80, 64, 48, 32, 16, 0];
 
 /// Where the first packet header in a frame's data zone is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +356,7 @@ pub fn parse(params: &FrameParams, cadu: &[u8]) -> Result<Frame, &'static str> {
     if params.has_crc {
         let stored = u16::from_be_bytes([cadu[frame_end - 2], cadu[frame_end - 1]]);
         if crc16(&cadu[SYNC.len()..frame_end - CRC_LEN]) != stored {
-            return Err("frame CRC mismatch");
+            return Err(CRC_MISMATCH);
         }
     }
     let pointer = match raw_pointer {
@@ -316,6 +418,7 @@ mod tests {
             kind,
             randomized: false,
             rs_parity_len: 0,
+            rs: None,
             has_crc: false,
             aos_has_ocf: false,
             aos_has_header_check: false,

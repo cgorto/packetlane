@@ -267,9 +267,10 @@ impl<R: Read> Records<R> {
         }
     }
 
-    /// What the decoder gave up on so far to keep reading.
-    pub fn notices(&self) -> &Notices {
-        &self.notices
+    /// What the decoder gave up on to keep reading, and its counts over
+    /// the whole file. Ask once reading is done.
+    pub fn notices(&self) -> Notices {
+        self.notices.clone().with_summary(self.decoder.as_ref())
     }
 
     /// What the decoder learned about the file. Ask once reading is done.

@@ -40,6 +40,13 @@
 //! randomized = false         # frames are still XORed with the CCSDS random sequence
 //! crc = false                # each frame ends with a 16-bit CRC
 //! rs_parity_bytes = 0        # Reed-Solomon check symbols kept after each frame
+//! rs_correct = true          # use them to correct errors. The default: yes if a
+//!                            # frame in the file is a clean codeword, or if any of
+//!                            # the next three is given; otherwise they are skipped
+//! rs_code = "255,223"        # or "255,239"
+//! rs_interleave = 1          # 1, 2, 3, 4, 5 or 8
+//! rs_basis = "dual"          # how a byte stands for a symbol: "dual" (Berlekamp,
+//!                            # the CCSDS default) or "conventional"
 //! ocf = false                # aos only: operational control field present
 //! header_check = false       # aos only: 2-byte header check present
 //! insert_zone_bytes = 0      # aos only
@@ -72,6 +79,7 @@ use serde::Deserialize;
 
 use crate::pure::ccsds::{PacketType, PrimaryHeader};
 use crate::pure::frame::{FrameKind, FrameParams, Layout};
+use crate::pure::rs::{Basis, Code, DEPTHS, RsCode};
 use crate::pure::textlog::LogFormat;
 use crate::pure::time::{NS_PER_SEC, parse_iso, parse_utc_offset};
 
@@ -102,6 +110,10 @@ pub struct Frames {
     pub randomized: Option<bool>,
     pub crc: Option<bool>,
     pub rs_parity_bytes: Option<usize>,
+    pub rs_correct: Option<bool>,
+    pub rs_code: Option<Code>,
+    pub rs_interleave: Option<usize>,
+    pub rs_basis: Option<Basis>,
     pub ocf: bool,
     pub header_check: bool,
     pub insert_zone_bytes: usize,
@@ -109,6 +121,74 @@ pub struct Frames {
 
 /// More than any real link uses; keeps arithmetic on these far from overflow.
 const MAX_FRAME_EXTRA: usize = 4096;
+
+impl Frames {
+    /// True if the table names any property of the Reed-Solomon code, which
+    /// is a way of saying there is one.
+    fn names_rs(&self) -> bool {
+        self.rs_code.is_some() || self.rs_interleave.is_some() || self.rs_basis.is_some()
+    }
+
+    /// The Reed-Solomon keys must describe one code.
+    fn check_rs(&self) -> Result<(), String> {
+        if let Some(depth) = self.rs_interleave
+            && !DEPTHS.contains(&depth)
+        {
+            return Err("frames: rs_interleave must be 1, 2, 3, 4, 5 or 8".to_string());
+        }
+        if self.rs_correct == Some(false) || !(self.names_rs() || self.rs_correct == Some(true)) {
+            return Ok(());
+        }
+        let Some(parity) = self.rs_parity_bytes else {
+            return Ok(());
+        };
+        let code = self.rs_code.unwrap_or_default();
+        let per_word = code.check_len();
+        let depth = parity / per_word;
+        if parity % per_word != 0 || !DEPTHS.contains(&depth) {
+            return Err(format!(
+                "frames: rs_parity_bytes = {parity} is not {per_word} x an interleave depth \
+                 (1, 2, 3, 4, 5 or 8), as {} needs; set rs_correct = false to only skip them",
+                code.name()
+            ));
+        }
+        if self.rs_interleave.is_some_and(|given| given != depth) {
+            return Err(format!(
+                "frames: rs_parity_bytes = {parity} means an interleave depth of {depth}, \
+                 not the rs_interleave given"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The code to correct with, if any, for a file in which `seen` was
+    /// detected. What the table says wins; what neither says is the CCSDS
+    /// default: RS(255,223), dual basis.
+    fn rs_code_for(&self, seen: Option<RsCode>, crc_parity: Option<usize>) -> Option<RsCode> {
+        // A stated length that is not the detected code's says the check
+        // symbols are not what detection took them for.
+        let seen = seen.filter(|s| {
+            self.names_rs()
+                || self
+                    .rs_parity_bytes
+                    .is_none_or(|given| given == s.parity_len())
+        });
+        let wanted = self.rs_correct.unwrap_or(seen.is_some() || self.names_rs());
+        if !wanted {
+            return None;
+        }
+        let code = self.rs_code.or(seen.map(|s| s.code)).unwrap_or_default();
+        let from_len = |len: usize| Some(len / code.check_len()).filter(|d| DEPTHS.contains(d));
+        let depth = self
+            .rs_interleave
+            .or(self.rs_parity_bytes.and_then(from_len))
+            .or(seen.map(|s| s.depth))
+            .or(crc_parity.and_then(from_len))
+            .unwrap_or(1);
+        let basis = self.rs_basis.or(seen.map(|s| s.basis)).unwrap_or_default();
+        Some(RsCode { code, depth, basis })
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -423,6 +503,7 @@ impl Config {
                 "frames: rs_parity_bytes must be 0 to {MAX_FRAME_EXTRA}"
             ));
         }
+        self.frames.check_rs()?;
         if self.frames.insert_zone_bytes > MAX_FRAME_EXTRA {
             return Err(format!(
                 "frames: insert_zone_bytes must be 0 to {MAX_FRAME_EXTRA}"
@@ -578,21 +659,22 @@ impl Config {
     /// what neither settles defaults to plain TM frames with no extras.
     pub fn frame_params_for(&self, layout: &Layout) -> FrameParams {
         let f = &self.frames;
+        let rs = f.rs_code_for(layout.rs, layout.crc_parity);
+        let stated = rs.map(|rs| rs.parity_len()).or(f.rs_parity_bytes);
         // A detected CRC is tied to the check-symbol length it was found
         // with: if the configuration gives a different length, it is not there.
-        let has_crc = f
-            .crc
-            .unwrap_or(match (f.rs_parity_bytes, layout.crc_parity) {
-                (Some(given), Some(found)) => given == found,
-                (None, found) => found.is_some(),
-                (Some(_), None) => false,
-            });
+        let has_crc = f.crc.unwrap_or(match (stated, layout.crc_parity) {
+            (Some(given), Some(found)) => given == found,
+            (None, found) => found.is_some(),
+            (Some(_), None) => false,
+        });
         let detected_parity = if has_crc { layout.crc_parity } else { None };
         FrameParams {
             cadu_len: layout.cadu_len,
             kind: f.kind.or(layout.kind).unwrap_or_default(),
             randomized: f.randomized.or(layout.randomized).unwrap_or(false),
-            rs_parity_len: f.rs_parity_bytes.or(detected_parity).unwrap_or(0),
+            rs_parity_len: stated.or(detected_parity).unwrap_or(0),
+            rs,
             has_crc,
             aos_has_ocf: f.ocf,
             aos_has_header_check: f.header_check,
@@ -925,6 +1007,7 @@ mod frame_tests {
             kind: Some(FrameKind::Aos),
             randomized: Some(true),
             crc_parity: Some(160),
+            rs: None,
         };
         let p = Config::default().frame_params_for(&seen);
         assert_eq!(
@@ -953,6 +1036,92 @@ crc = false
         let err = Config::parse("[frames]\nrs_parity_bytes = 99999\n").unwrap_err();
         assert!(err.contains("rs_parity_bytes"), "{err}");
         assert!(Config::parse("[frames]\nkind = \"tc\"\n").is_err());
+    }
+
+    #[test]
+    fn reed_solomon_is_used_when_found_or_asked_for() {
+        let rs = |code, depth, basis| RsCode { code, depth, basis };
+        let of = |toml: &str, seen: &Layout| {
+            let p = Config::parse(toml).unwrap().frame_params_for(seen);
+            (p.rs, p.rs_parity_len, p.has_crc)
+        };
+        let blank = Layout::of_len(1279);
+        let found = rs(Code::Rs239, 4, Basis::Conventional);
+        let seen = Layout {
+            crc_parity: Some(64),
+            rs: Some(found),
+            ..blank
+        };
+
+        // Check symbols with nothing known about them are only skipped.
+        assert_eq!(
+            of("[frames]\nrs_parity_bytes = 160", &blank),
+            (None, 160, false)
+        );
+        // A code found in the file is used, and says how long they are.
+        assert_eq!(of("", &seen), (Some(found), 64, true));
+        assert_eq!(
+            of("[frames]\nrs_parity_bytes = 64", &seen),
+            (Some(found), 64, true)
+        );
+        // Unless the configuration says not to, or gives another length.
+        assert_eq!(of("[frames]\nrs_correct = false", &seen), (None, 64, true));
+        assert_eq!(
+            of("[frames]\nrs_parity_bytes = 32", &seen),
+            (None, 32, false)
+        );
+        // What the configuration names overrules what was found, piece by piece.
+        assert_eq!(
+            of("[frames]\nrs_basis = \"dual\"", &seen),
+            (Some(rs(Code::Rs239, 4, Basis::Dual)), 64, true)
+        );
+        assert_eq!(
+            of("[frames]\nrs_code = \"255,223\"\nrs_interleave = 5", &seen),
+            (Some(rs(Code::Rs223, 5, Basis::Conventional)), 160, false)
+        );
+        // Asked for with nothing found: the CCSDS defaults fill the gaps.
+        assert_eq!(
+            of("[frames]\nrs_correct = true\nrs_parity_bytes = 160", &blank),
+            (Some(rs(Code::Rs223, 5, Basis::Dual)), 160, false)
+        );
+        assert_eq!(
+            of(
+                "[frames]\nrs_code = \"255,239\"\nrs_parity_bytes = 32",
+                &blank
+            ),
+            (Some(rs(Code::Rs239, 2, Basis::Dual)), 32, false)
+        );
+        assert_eq!(
+            of("[frames]\nrs_interleave = 2\ncrc = true", &blank),
+            (Some(rs(Code::Rs223, 2, Basis::Dual)), 64, true)
+        );
+        // A CRC found before filler gives the depth if correction is forced.
+        let filler = Layout {
+            crc_parity: Some(128),
+            ..blank
+        };
+        assert_eq!(
+            of("[frames]\nrs_correct = true", &filler),
+            (Some(rs(Code::Rs223, 4, Basis::Dual)), 128, true)
+        );
+
+        for (toml, word) in [
+            ("rs_interleave = 6", "rs_interleave"),
+            ("rs_correct = true\nrs_parity_bytes = 40", "rs_parity_bytes"),
+            (
+                "rs_code = \"255,239\"\nrs_parity_bytes = 96",
+                "rs_parity_bytes",
+            ),
+            ("rs_interleave = 2\nrs_parity_bytes = 32", "rs_interleave"),
+            ("rs_code = \"255,200\"", "rs_code"),
+            ("rs_basis = \"other\"", "rs_basis"),
+        ] {
+            let err = Config::parse(&format!("[frames]\n{toml}\n")).unwrap_err();
+            assert!(err.contains(word), "{toml}: {err}");
+        }
+        // Odd lengths are fine for check symbols that are only skipped.
+        assert!(Config::parse("[frames]\nrs_parity_bytes = 40\n").is_ok());
+        assert!(Config::parse("[frames]\nrs_correct = false\nrs_parity_bytes = 40\n").is_ok());
     }
 }
 

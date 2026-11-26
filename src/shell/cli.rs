@@ -150,7 +150,7 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
             None => println!("  Problem: {}: {}", finding.key, finding.message),
         }
     }
-    let notices = records.notices().clone();
+    let notices = records.notices();
     drop(records);
     if let Some(why) = file.fault() {
         read_problem

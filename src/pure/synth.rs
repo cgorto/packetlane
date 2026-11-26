@@ -664,8 +664,11 @@ pub fn frame_zones(packets: &[Vec<u8>], zone_len: usize) -> Vec<(u16, Vec<u8>)> 
 }
 
 /// Wraps data zones in CADUs on one virtual channel, with whatever CRC,
-/// check symbols (zeros) and randomising `p` asks for. Frame counts start at
-/// 250 so that the TM count wraps early. No OCF, header check or insert zone.
+/// check symbols and randomising `p` asks for. The check symbols are real
+/// Reed-Solomon ones if `p.rs` names a code the frame length can have, and
+/// zeros otherwise, as a recorder that drops them leaves. Frame counts start
+/// at 250 so that the TM count wraps early. No OCF, header check or insert
+/// zone.
 pub fn cadus(p: &FrameParams, vcid: u16, zones: &[(u16, Vec<u8>)]) -> Vec<Vec<u8>> {
     zones
         .iter()
@@ -691,7 +694,11 @@ pub fn cadus(p: &FrameParams, vcid: u16, zones: &[(u16, Vec<u8>)]) -> Vec<Vec<u8
                 let crc = crc16(&cadu[SYNC.len()..]);
                 cadu.extend(crc.to_be_bytes());
             }
-            cadu.resize(cadu.len() + p.rs_parity_len, 0);
+            // Coded first and randomised second, as the sender does it.
+            match p.rs.and_then(|rs| rs.encode(&cadu[SYNC.len()..])) {
+                Some(parity) if parity.len() == p.rs_parity_len => cadu.extend(parity),
+                _ => cadu.resize(cadu.len() + p.rs_parity_len, 0),
+            }
             if p.randomized {
                 derandomize(&mut cadu[SYNC.len()..]);
             }
