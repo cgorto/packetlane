@@ -380,9 +380,40 @@ src/shell/    imperative shell: files, SQLite, sockets, command line
 web/          the page: structure, style, script (embedded at build time)
 tests/        end-to-end tests, decoders against damaged input, and the test
               that keeps I/O out of src/pure
+              load.rs measures large runs and is run only when asked for
+tools/        ui-load.js measures the page in a headless Chrome
 docs/         architecture.md, parsing.md
 container/    development container stub and editor settings
 ```
+
+## Load tests
+
+Two tests measure large runs. Neither runs with `cargo test`, because they
+take minutes and gigabytes.
+
+```
+cargo test --release --test load -- --ignored --nocapture --test-threads 1
+```
+
+generates a long run (few streams, a million packets) and a wide one (900
+lanes from three hosts, values kept and limits on every stream), ingests
+each with the built program, and prints how long ingest took, the memory it
+held, and how long the server took to answer each request the page makes,
+at four zoom levels and while another ingest is running. `LOAD_PACKETS`
+sets the size and `LOAD_DIR` keeps the stores; the top of `tests/load.rs`
+lists the other settings. It fails on what does not depend on the machine:
+packets not stored, an answer too large to send, ingest holding a run in
+memory. Times fail it only if `LOAD_BUDGET_MS` is set.
+
+```
+packetlane serve --db store.db --root <run folder>
+node tools/ui-load.js '<the URL that printed>' [--run N] [--budget ms]
+```
+
+drives the page in a headless Chrome through opening, zooming, panning,
+plots, hovering, jumping to a problem and searching, and prints for each
+how long the page took to settle and the longest it could not respond. It
+needs Node 22 or later and Chrome, and nothing else.
 
 ## Licence
 
