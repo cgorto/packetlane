@@ -1082,6 +1082,262 @@ fn a_noisy_cadu_file_is_corrected_with_its_check_symbols() {
     );
 }
 
+/// An uplink capture: CLTUs with bit errors, a control frame, a frame
+/// missing from the sequence, and a command sent in segments. The commands
+/// land in telecommand lanes like any others, what happened on the way is
+/// in the findings, and the packet view can show a command although its
+/// bytes are not together anywhere in the file.
+#[test]
+fn a_cltu_capture_is_ingested_as_its_commands() {
+    use packetlane::pure::format::hex;
+    use packetlane::pure::synth::{TcFrame, cltu, tc_packet, tc_segments};
+
+    let commands: Vec<Vec<u8>> = (0..10u16)
+        .map(|i| tc_packet(0x0C8 + i % 2, i / 2, &vec![i as u8; 3 + usize::from(i) * 4]))
+        .collect();
+    let long = tc_packet(0x0CA, 0, &[0xA5; 400]);
+    let mut n = 99u8;
+    let mut ad = |data: &[u8]| {
+        n = n.wrapping_add(1);
+        cltu(&TcFrame::ad(0x155, 1, n).build(data, true), false)
+    };
+    let whole = |pk: &Vec<u8>| tc_segments(2, pk, 1000).remove(0);
+
+    let mut file = vec![0x55u8; 24]; // idle before the first CLTU
+    file.extend(cltu(&TcFrame::bc(0x155, 1).build(&[0x00], true), false));
+    file.extend(cltu(
+        &TcFrame::bc(0x155, 1).build(&[0x82, 0x00, 100], true),
+        false,
+    ));
+    for pk in &commands[..4] {
+        file.extend(ad(&whole(pk)));
+    }
+    // One command in five segments on its own MAP, another MAP's commands
+    // in between, and an expedited frame that does not count.
+    let segments = tc_segments(7, &long, 90);
+    assert_eq!(segments.len(), 5);
+    let long_at = file.len() + 2 + 6;
+    for (i, segment) in segments.iter().enumerate() {
+        file.extend(ad(segment));
+        if i == 1 {
+            file.extend(ad(&whole(&commands[4])));
+        }
+        if i == 3 {
+            let bd = TcFrame::bd(0x155, 1, 0).build(&whole(&commands[5]), true);
+            file.extend(cltu(&bd, false));
+        }
+    }
+    file.extend(ad(&whole(&commands[6])));
+    // The frame for commands[7] never made it into the capture.
+    let _ = ad(&whole(&commands[7]));
+    let gap_at = file.len() + 2; // the frame after it, past the start sequence
+    file.extend(ad(&whole(&commands[8])));
+    file.extend(ad(&whole(&commands[9])));
+
+    // A wrong bit in every fifth codeblock. CLTUs start at different
+    // places, so find them: start sequence, 8-byte blocks, tail.
+    let mut flipped = 0;
+    let mut at = 24;
+    let mut block = 0usize;
+    while at + 2 < file.len() {
+        assert_eq!(file[at..at + 2], [0xEB, 0x90]);
+        at += 2;
+        while file[at..at + 8] != [0xC5, 0xC5, 0xC5, 0xC5, 0xC5, 0xC5, 0xC5, 0x79] {
+            if block.is_multiple_of(5) {
+                let bit = (block * 13) % 63;
+                file[at + bit / 8] ^= 0x80 >> (bit % 8);
+                flipped += 1;
+            }
+            block += 1;
+            at += 8;
+        }
+        at += 8;
+    }
+    assert!(flipped > 15);
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("uplink")).unwrap();
+    fs::write(run.join("uplink/pass.cltu"), &file).unwrap();
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let ingested = &summary.files[0];
+    assert_eq!(ingested.status, Status::Ingested);
+    assert_eq!(ingested.note, "TC frames in CLTUs, CRC, segment headers");
+    assert_eq!(
+        count(&store, "SELECT COUNT(*) FROM files WHERE format = 'cltu'"),
+        1
+    );
+
+    // Every command but the lost one, in the order their last bytes came.
+    let mut want: Vec<&Vec<u8>> = commands[..7].iter().collect();
+    want.insert(6, &long);
+    want.extend(&commands[8..]);
+    assert_eq!(ingested.packets, want.len() as u64, "{}", ingested.note);
+    let lanes = store
+        .query_user(
+            "SELECT l.apid, l.ptype, COUNT(*) FROM packets p JOIN lanes l ON l.id = p.lane_id
+             GROUP BY l.id ORDER BY l.apid",
+            10,
+        )
+        .unwrap();
+    let lanes: Vec<[i64; 3]> = lanes
+        .rows
+        .iter()
+        .map(|r| [0, 1, 2].map(|i| r[i].int().unwrap()))
+        .collect();
+    // Telecommand lanes (packet type 1), one per APID.
+    assert_eq!(lanes, [[200, 1, 5], [201, 1, 4], [202, 1, 1]]);
+
+    let found = store
+        .query_user(
+            "SELECT kind, severity, message FROM findings ORDER BY id",
+            50,
+        )
+        .unwrap();
+    let of = |kind: &str| -> Vec<(&str, &str)> {
+        found
+            .rows
+            .iter()
+            .filter(|r| r[0].text() == Some(kind))
+            .map(|r| (r[1].text().unwrap(), r[2].text().unwrap()))
+            .collect()
+    };
+    assert_eq!(
+        of("frame_gap"),
+        [(
+            "problem",
+            format!(
+                "Spacecraft 341 virtual channel 1: 1 frame missing before byte {:#x} \
+                 (expected frame count 111, got 112)",
+                gap_at
+            )
+            .as_str()
+        )]
+    );
+    assert_eq!(
+        of("corrected"),
+        [(
+            "info",
+            format!("BCH corrected {flipped} bits in {flipped} codeblocks, the first at byte 0x18")
+                .as_str()
+        )]
+    );
+    assert_eq!(
+        of("control_frame"),
+        [(
+            "info",
+            "2 control frames carrying no packets (1 Unlock, 1 Set V(R), 0 other), \
+             the first at byte 0x1a"
+        )]
+    );
+    // The sequence gap in APID 200's own counter, from the lost command.
+    assert_eq!(of("gap").len(), 1, "{:?}", found.rows);
+    assert_eq!(of("bad_frame"), []);
+    assert_eq!(found.rows.len(), 4, "{:?}", found.rows);
+
+    let ids = store
+        .query_user("SELECT id, offset FROM packets ORDER BY idx", 100)
+        .unwrap();
+    assert_eq!(ids.rows[6][1].int(), Some(long_at as i64));
+    drop(store);
+    let get = serve(db, run);
+    for (row, packet) in ids.rows.iter().zip(&want) {
+        let body = get(&format!("/api/packet?id={}", row[0].int().unwrap()));
+        assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+        let shown = &packet[..packet.len().min(body["hex"].as_str().unwrap().len() / 2)];
+        assert_eq!(body["hex"], hex(shown));
+        assert!(!shown.is_empty());
+    }
+}
+
+/// TC frames logged with nothing around them are recognised when their
+/// lengths chain and their CRCs pass, and read the same way.
+#[test]
+fn bare_tc_frames_are_ingested_and_read_back() {
+    use packetlane::pure::format::hex;
+    use packetlane::pure::synth::{TcFrame, tc_packet, tc_segments};
+
+    let commands: Vec<Vec<u8>> = (0..8u16)
+        .map(|i| tc_packet(0x0C8, i, &vec![i as u8; 5 + usize::from(i) * 9]))
+        .collect();
+    let long = tc_packet(0x0C9, 0, &[0x3C; 300]);
+    let mut file = TcFrame::bc(0x155, 0).build(&[0x00], true);
+    let mut n = 0u8;
+    let mut ad = |data: &[u8]| {
+        n += 1;
+        TcFrame::ad(0x155, 0, n).build(data, true)
+    };
+    for pk in &commands {
+        file.extend(ad(&tc_segments(1, pk, 1000)[0]));
+    }
+    for segment in tc_segments(1, &long, 128) {
+        file.extend(ad(&segment));
+    }
+
+    let scratch = Scratch::new();
+    let run = scratch.0.join("run");
+    fs::create_dir_all(run.join("mcs")).unwrap();
+    // No segment headers, says the configuration, wrongly; then rightly.
+    fs::write(
+        run.join("packetlane.toml"),
+        "[tc]\nsegment_header = false\n",
+    )
+    .unwrap();
+    fs::write(run.join("mcs/sent.tcf"), gzip(&file)).unwrap();
+    let db = scratch.0.join("store.db");
+    let mut store = Store::open(&db).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let ingested = summary
+        .files
+        .iter()
+        .find(|f| f.rel == "mcs/sent.tcf")
+        .unwrap();
+    assert_eq!(ingested.packets, 0, "{}", ingested.note);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM findings WHERE kind = 'bad_frame'"
+        ),
+        11
+    );
+
+    fs::remove_file(run.join("packetlane.toml")).unwrap();
+    let summary = ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+    let ingested = &summary.files[0];
+    assert_eq!(ingested.packets, 9, "{}", ingested.note);
+    assert_eq!(
+        ingested.note,
+        "gzip; TC frames back to back, CRC, segment headers"
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM files WHERE format = 'tc_frames'"
+        ),
+        1
+    );
+    let kinds = store
+        .query_user("SELECT kind FROM findings ORDER BY id", 10)
+        .unwrap();
+    let kinds: Vec<&str> = kinds.rows.iter().map(|r| r[0].text().unwrap()).collect();
+    assert_eq!(kinds, ["control_frame"]);
+
+    let ids = store
+        .query_user("SELECT id FROM packets ORDER BY idx", 100)
+        .unwrap();
+    drop(store);
+    let get = serve(db, run);
+    let want: Vec<&Vec<u8>> = commands.iter().chain([&long]).collect();
+    for (row, packet) in ids.rows.iter().zip(&want) {
+        let body = get(&format!("/api/packet?id={}", row[0].int().unwrap()));
+        assert_eq!(body["error"], serde_json::Value::Null, "{body}");
+        let shown = &packet[..packet.len().min(body["hex"].as_str().unwrap().len() / 2)];
+        assert_eq!(body["hex"], hex(shown));
+    }
+}
+
 fn gzip(bytes: &[u8]) -> Vec<u8> {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(bytes).unwrap();

@@ -3,6 +3,7 @@
 
 use crate::pure::ccsds::{IDLE_APID, PacketType, PrimaryHeader, SEQ_MODULUS, SeqFlags};
 use crate::pure::frame::{FrameKind, FrameParams, SYNC, crc16, derandomize};
+use crate::pure::tc;
 
 /// Builds one unsegmented telemetry packet with no secondary header.
 /// A space packet carries at least one data byte, so an empty payload is
@@ -721,6 +722,114 @@ pub fn demo_cadus(p: &FrameParams, packets: &[u8]) -> Vec<u8> {
         rest = more;
     }
     cadus(p, 1, &frame_zones(&split, zone_len)).concat()
+}
+
+/// Builds one unsegmented telecommand packet with no secondary header.
+pub fn tc_packet(apid: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = packet(apid, seq, payload);
+    out[0] |= 0x10;
+    out
+}
+
+/// The header of one TC transfer frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcFrame {
+    pub scid: u16,
+    pub vcid: u8,
+    pub bypass: bool,
+    pub control: bool,
+    /// N(S).
+    pub seq: u8,
+}
+
+impl TcFrame {
+    /// A sequence-controlled data frame.
+    pub fn ad(scid: u16, vcid: u8, seq: u8) -> Self {
+        Self {
+            scid,
+            vcid,
+            bypass: false,
+            control: false,
+            seq,
+        }
+    }
+
+    /// An expedited data frame.
+    pub fn bd(scid: u16, vcid: u8, seq: u8) -> Self {
+        Self {
+            bypass: true,
+            ..Self::ad(scid, vcid, seq)
+        }
+    }
+
+    /// A control frame. Its data is the command: `[0]` for Unlock,
+    /// `[0x82, 0, vr]` for Set V(R).
+    pub fn bc(scid: u16, vcid: u8) -> Self {
+        Self {
+            control: true,
+            ..Self::bd(scid, vcid, 0)
+        }
+    }
+
+    /// The whole frame around `data`, which includes the segment header if
+    /// the link has one. At most 1024 bytes: longer data is cut.
+    pub fn build(&self, data: &[u8], crc: bool) -> Vec<u8> {
+        let room = tc::MAX_FRAME_LEN - tc::HEADER_LEN - if crc { tc::CRC_LEN } else { 0 };
+        let data = &data[..data.len().min(room)];
+        let len = tc::HEADER_LEN + data.len() + if crc { tc::CRC_LEN } else { 0 };
+        let flags = u16::from(self.bypass) << 13 | u16::from(self.control) << 12;
+        let mut out = (flags | (self.scid & 0x3FF)).to_be_bytes().to_vec();
+        out.extend((u16::from(self.vcid & 0x3F) << 10 | (len - 1) as u16).to_be_bytes());
+        out.push(self.seq);
+        out.extend_from_slice(data);
+        if crc {
+            let crc = crc16(&out);
+            out.extend(crc.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// Cuts a packet into frame data fields for one MAP, each starting with its
+/// segment header and holding at most `max_data` packet bytes. A packet
+/// that fits in one is marked as not segmented.
+pub fn tc_segments(map: u8, packet: &[u8], max_data: usize) -> Vec<Vec<u8>> {
+    let pieces: Vec<&[u8]> = packet.chunks(max_data.max(1)).collect();
+    let last = pieces.len().saturating_sub(1);
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| {
+            let flags: u8 = match (i == 0, i == last) {
+                (true, true) => 0b11,
+                (true, false) => 0b01,
+                (false, false) => 0b00,
+                (false, true) => 0b10,
+            };
+            let mut out = vec![flags << 6 | (map & 0x3F)];
+            out.extend_from_slice(piece);
+            out
+        })
+        .collect()
+}
+
+/// Wraps `frames` (one TC frame, or several back to back) in a CLTU: start
+/// sequence, BCH codeblocks with the last one filled out, tail sequence.
+/// Randomising, if asked for, is applied to the frames and not the fill.
+pub fn cltu(frames: &[u8], randomized: bool) -> Vec<u8> {
+    let mut data = frames.to_vec();
+    if randomized {
+        tc::derandomize(&mut data);
+    }
+    let mut out = tc::START.to_vec();
+    for chunk in data.chunks(tc::INFO_LEN) {
+        let mut info = [tc::FILL; tc::INFO_LEN];
+        info[..chunk.len()].copy_from_slice(chunk);
+        out.extend(info);
+        out.push(tc::bch_parity(&info));
+    }
+    out.extend(tc::TAIL);
+    out
 }
 
 #[cfg(test)]

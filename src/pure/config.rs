@@ -51,6 +51,13 @@
 //! header_check = false       # aos only: 2-byte header check present
 //! insert_zone_bytes = 0      # aos only
 //!
+//! [tc]                       # only for telecommand captures: CLTUs, or TC transfer
+//!                            # frames back to back. All three are detected from
+//!                            # each file where its bytes allow.
+//! crc = true                 # each frame ends with a 16-bit CRC
+//! segment_header = true      # frame data starts with a segment header
+//! randomized = false         # CLTUs only: frames are XORed with the TC random sequence
+//!
 //! [[packet]]                 # name a packet type and its fields; `packetlane
 //!                            # import-cosmos` writes these from COSMOS 4 files
 //! apid = 419               # decimal or hex (0x1A3); optional if label is given
@@ -80,6 +87,7 @@ use serde::Deserialize;
 use crate::pure::ccsds::{PacketType, PrimaryHeader};
 use crate::pure::frame::{FrameKind, FrameParams, Layout};
 use crate::pure::rs::{Basis, Code, DEPTHS, RsCode};
+use crate::pure::tc::{TcLayout, TcParams};
 use crate::pure::textlog::LogFormat;
 use crate::pure::time::{NS_PER_SEC, parse_iso, parse_utc_offset};
 
@@ -99,6 +107,17 @@ pub struct Config {
     pub packets: Vec<PacketDef>,
     #[serde(default)]
     pub frames: Frames,
+    #[serde(default)]
+    pub tc: Tc,
+}
+
+/// How telecommand frames are laid out. See `pure/tc.rs`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Tc {
+    pub crc: Option<bool>,
+    pub segment_header: Option<bool>,
+    pub randomized: Option<bool>,
 }
 
 /// How transfer frames are laid out in files of CADUs. The CADU length is
@@ -682,6 +701,20 @@ impl Config {
         }
     }
 
+    /// The layout of a telecommand file, of CLTUs or of bare frames, from
+    /// what was detected in it and what this configuration says. The
+    /// configuration wins wherever it speaks. What neither settles is taken
+    /// as most links have it: a CRC, segment headers, no randomising.
+    pub fn tc_params_for(&self, layout: &TcLayout, cltu: bool) -> TcParams {
+        let tc = &self.tc;
+        TcParams {
+            cltu,
+            has_crc: tc.crc.or(layout.crc).unwrap_or(true),
+            segment_header: tc.segment_header.or(layout.segment_header).unwrap_or(true),
+            randomized: cltu && tc.randomized.or(layout.randomized).unwrap_or(false),
+        }
+    }
+
     pub fn resolved_time(&self) -> Option<ResolvedTime> {
         self.packet_time.as_ref().and_then(|t| t.resolve().ok())
     }
@@ -1036,6 +1069,36 @@ crc = false
         let err = Config::parse("[frames]\nrs_parity_bytes = 99999\n").unwrap_err();
         assert!(err.contains("rs_parity_bytes"), "{err}");
         assert!(Config::parse("[frames]\nkind = \"tc\"\n").is_err());
+    }
+
+    #[test]
+    fn tc_table_overrules_what_a_file_shows() {
+        let seen = TcLayout {
+            crc: Some(false),
+            segment_header: None,
+            randomized: Some(true),
+        };
+        let p = Config::default().tc_params_for(&seen, true);
+        assert_eq!(
+            (p.cltu, p.has_crc, p.segment_header, p.randomized),
+            (true, false, true, true)
+        );
+        // Randomising is done in the coding layer: bare frames have none.
+        assert!(!Config::default().tc_params_for(&seen, false).randomized);
+        let config =
+            Config::parse("[tc]\ncrc = true\nsegment_header = false\nrandomized = false\n")
+                .unwrap();
+        let p = config.tc_params_for(&seen, true);
+        assert_eq!(
+            (p.has_crc, p.segment_header, p.randomized),
+            (true, false, false)
+        );
+        let blank = Config::default().tc_params_for(&TcLayout::default(), true);
+        assert_eq!(
+            (blank.has_crc, blank.segment_header, blank.randomized),
+            (true, true, false)
+        );
+        assert!(Config::parse("[tc]\nmap = 3\n").is_err());
     }
 
     #[test]

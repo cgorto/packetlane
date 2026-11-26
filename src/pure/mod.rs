@@ -20,5 +20,6 @@ pub mod paths;
 pub mod rs;
 pub mod sql;
 pub mod synth;
+pub mod tc;
 pub mod textlog;
 pub mod time;

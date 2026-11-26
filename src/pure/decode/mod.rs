@@ -8,11 +8,13 @@ use std::fmt;
 
 use crate::pure::config::Config;
 use crate::pure::frame::Layout;
+use crate::pure::tc::TcLayout;
 
 pub mod cadu;
 pub mod cosmos4;
 pub mod cosmos5;
 pub mod raw;
+pub mod tc;
 
 /// No single entry in any supported format may be larger than this. A length
 /// field that says otherwise is corruption.
@@ -283,6 +285,11 @@ pub enum Format {
     Cosmos5,
     /// Sync markers at a fixed spacing, each followed by a transfer frame.
     Cadu(Layout),
+    /// Telecommand link units: a start sequence, then BCH codeblocks that
+    /// hold a TC transfer frame.
+    Cltu(TcLayout),
+    /// TC transfer frames back to back.
+    TcFrames(TcLayout),
     /// Space packets back to back with no container.
     RawCcsds,
     /// Lines of text.
@@ -301,6 +308,8 @@ impl Format {
             Format::Cosmos4 => "cosmos4",
             Format::Cosmos5 => "cosmos5",
             Format::Cadu(_) => "cadu",
+            Format::Cltu(_) => "cltu",
+            Format::TcFrames(_) => "tc_frames",
             Format::RawCcsds => "raw",
             Format::Text => "text",
             Format::Gzip => "gzip",
@@ -309,8 +318,9 @@ impl Format {
         }
     }
 
-    /// True if the format was recognised by a magic number or by sync markers
-    /// at a fixed spacing, not guessed.
+    /// True if the format was recognised by a magic number, by sync markers
+    /// at a fixed spacing or by a start sequence in front of a valid
+    /// codeblock, not guessed.
     pub fn is_certain(self) -> bool {
         matches!(
             self,
@@ -318,6 +328,7 @@ impl Format {
                 | Format::Cosmos4
                 | Format::Cosmos5
                 | Format::Cadu(_)
+                | Format::Cltu(_)
                 | Format::Gzip
                 | Format::Empty
         )
@@ -331,7 +342,11 @@ pub const SNIFF_LEN: usize = 256 * 1024;
 ///
 /// Magic numbers are certain, and so are sync markers at a fixed spacing:
 /// that check comes before the packet one because a sync marker also reads
-/// as a version-0 packet header. `RawCcsds` is a guess: every packet header
+/// as a version-0 packet header. A CLTU start sequence in front of a clean
+/// BCH codeblock that holds a frame header is as good as a magic number.
+/// TC frames with nothing around them are a guess, but one that asks for
+/// more than the packet guess does (frames that chain and pass their CRC or
+/// hold whole packets), so it is tried first. `RawCcsds` is a guess: every packet header
 /// reachable by following length fields through `prefix` has version 0, and
 /// there are at least three of them or they end exactly where `prefix` does.
 /// `Text` is a guess too: valid UTF-8 with almost no control characters.
@@ -350,6 +365,10 @@ pub fn sniff(prefix: &[u8]) -> Format {
         Format::Gzip
     } else if let Some(layout) = cadu::sniff_layout(prefix) {
         Format::Cadu(layout)
+    } else if let Some(layout) = crate::pure::tc::sniff_cltus(prefix) {
+        Format::Cltu(layout)
+    } else if let Some(layout) = crate::pure::tc::sniff_frames(prefix) {
+        Format::TcFrames(layout)
     } else if raw::chains_as_packets(prefix) {
         Format::RawCcsds
     } else if looks_like_text(prefix) {
@@ -380,8 +399,8 @@ fn looks_like_text(prefix: &[u8]) -> bool {
 }
 
 /// The decoder for a packet format, or `None` if the format holds no packets
-/// or has no decoder. Only CADU files need anything from `config`: how their
-/// frames are laid out is not written in the file.
+/// or has no decoder. Only the frame formats need anything from `config`:
+/// how their frames are laid out is not written in the file.
 pub fn decoder_for(format: Format, config: &Config) -> Option<Box<dyn Decoder>> {
     match format {
         // One decoder: it tells the two layouts apart by the file header.
@@ -393,6 +412,12 @@ pub fn decoder_for(format: Format, config: &Config) -> Option<Box<dyn Decoder>> 
             let decoder = cadu::CaduDecoder::new(config.frame_params_for(&layout))?;
             Some(Box::new(decoder))
         }
+        Format::Cltu(layout) => Some(Box::new(tc::TcDecoder::new(
+            config.tc_params_for(&layout, true),
+        ))),
+        Format::TcFrames(layout) => Some(Box::new(tc::TcDecoder::new(
+            config.tc_params_for(&layout, false),
+        ))),
         Format::RawCcsds => Some(Box::new(raw::RawDecoder::new())),
         _ => None,
     }
