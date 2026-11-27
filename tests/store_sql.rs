@@ -824,6 +824,21 @@ fn a_file_read_again_takes_only_its_own_rows_with_it() {
     assert_eq!(count(2), two);
     check_lanes(&store.conn);
 
+    // Counting a run's lanes reads that run's packets, from an index that
+    // holds all it needs.
+    let steps = plan(
+        &store.conn,
+        &Query {
+            sql: sql::REFRESH_PACKET_LANES[1].to_string(),
+            params: vec![1i64.into()],
+        },
+    );
+    assert_eq!(
+        step(&steps, "packets"),
+        "SEARCH packets USING COVERING INDEX packets_lane_receive (lane_id=?)",
+        "{steps:#?}"
+    );
+
     // And the rows are found by id, not by reading every packet.
     for statement in sql::delete_file_packets() {
         let steps = plan(

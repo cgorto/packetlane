@@ -710,8 +710,8 @@ pub const DELETE_CROSS_FINDINGS: &str = "DELETE FROM findings WHERE run_id = ? A
 /// Sets each packet lane's count and time ranges from its packets, in two
 /// statements run in this order: the first clears them, so that a lane
 /// whose packets are all gone reads as empty; the second fills them in from
-/// one pass over the packets. Asking lane by lane instead reads every
-/// packet once per lane.
+/// one pass over the run's packets, lane by lane in the lane-first index,
+/// which holds everything asked for. No other run's packets are read.
 pub const REFRESH_PACKET_LANES: [&str; 2] = [
     "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count,
@@ -726,8 +726,10 @@ pub const REFRESH_PACKET_LANES: [&str; 2] = [
                   MIN(receive_ns) AS r_min, MAX(receive_ns) AS r_max, COUNT(receive_ns) AS r_n,
                   MIN(packet_ns) AS p_min, MAX(packet_ns) AS p_max, COUNT(packet_ns) AS p_n,
                   MIN(id) AS o_min, MAX(id) AS o_max
-           FROM packets GROUP BY lane_id) AS s
-     WHERE lanes.id = s.lane_id AND lanes.run_id = ? AND lanes.kind != 'log'",
+           FROM packets INDEXED BY packets_lane_receive
+           WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?1)
+           GROUP BY lane_id) AS s
+     WHERE lanes.id = s.lane_id AND lanes.run_id = ?1 AND lanes.kind != 'log'",
 ];
 pub const REFRESH_LOG_LANES: &str = "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count, packet_min, packet_max, packet_count) =

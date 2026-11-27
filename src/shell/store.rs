@@ -145,6 +145,16 @@ impl Phases {
 /// See where it is set, in [`Store::open`].
 const WRITE_CACHE_KIB: i64 = 32 * 1024;
 
+/// The page cache to write with: [`WRITE_CACHE_KIB`], or as many megabytes
+/// as the environment variable `PACKETLANE_CACHE_MB` says (1 to 4096).
+fn write_cache_kib() -> i64 {
+    std::env::var("PACKETLANE_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|mb| (1..=4096).contains(mb))
+        .map_or(WRITE_CACHE_KIB, |mb| mb * 1024)
+}
+
 fn run_query(conn: &Connection, q: &Query, limit: usize) -> Result<Table> {
     let mut stmt = conn.prepare_cached(&q.sql)?;
     collect(&mut stmt, &q.params, limit)
@@ -162,7 +172,7 @@ impl Store {
         // means a size, not a page count). SQLite's own 2 MB is less than
         // one index of a large run, and a run with many lanes writes all
         // over its lane-first indexes.
-        conn.pragma_update(None, "cache_size", -WRITE_CACHE_KIB)?;
+        conn.pragma_update(None, "cache_size", -write_cache_kib())?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 0 && version != sql::SCHEMA_VERSION {
             return Err(format!(
