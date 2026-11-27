@@ -248,7 +248,12 @@ fn sources_are_compared_in_two_passes_over_the_packets() {
     // Comparing.
     let steps = plan(&store.conn, &sql::hop_compare_all(1));
     let scans: Vec<&String> = steps.iter().filter(|s| s.starts_with("SCAN")).collect();
-    assert_eq!(scans, ["SCAN p"; 2], "{steps:#?}");
+    // In checksum order, from the index alone: each lookup below then
+    // lands beside the last.
+    assert_eq!(
+        scans, ["SCAN p USING COVERING INDEX hop_sum"; 2],
+        "{steps:#?}"
+    );
     let lookups = steps
         .iter()
         .filter(|s| s.ends_with("USING COVERING INDEX hop_sum (sum=? AND lane_id=?)"))

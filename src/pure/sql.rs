@@ -121,7 +121,6 @@ CREATE TABLE IF NOT EXISTS field_values (
   text TEXT
 );
 CREATE INDEX IF NOT EXISTS field_values_field ON field_values (field, num);
-CREATE INDEX IF NOT EXISTS field_values_file ON field_values (file_id);
 CREATE INDEX IF NOT EXISTS field_values_packet ON field_values (packet_id);
 CREATE TABLE IF NOT EXISTS file_series (
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -790,7 +789,13 @@ pub fn hop_stage(run: i64) -> Vec<Query> {
              ORDER BY p.id",
             vec![run.into()],
         ),
-        Query::new("CREATE INDEX temp.hop_sum ON hop (sum, lane_id)", vec![]),
+        // With the id, so that the comparison reads this index alone, in
+        // checksum order: each packet it asks about is then beside the
+        // last, and little of the index need be in memory at once.
+        Query::new(
+            "CREATE INDEX temp.hop_sum ON hop (sum, lane_id, id)",
+            vec![],
+        ),
     ]
 }
 
@@ -817,12 +822,12 @@ pub fn hop_compare_all(run: i64) -> Query {
            WHERE a.run_id = ?1 AND a.kind = 'packet'),
          shared AS MATERIALIZED (
            SELECT pair.a AS a, pair.b AS b, COUNT(*) AS n, MIN(p.id) AS lo, MAX(p.id) AS hi
-           FROM temp.hop p CROSS JOIN pair ON pair.a = p.lane_id
+           FROM temp.hop p INDEXED BY hop_sum CROSS JOIN pair ON pair.a = p.lane_id
            WHERE EXISTS (SELECT 1 FROM temp.hop q
                          WHERE q.sum = p.sum AND q.lane_id = pair.b)
            GROUP BY pair.a, pair.b)
          SELECT shared.a, shared.b, shared.n, COUNT(*), MIN(p.id)
-         FROM temp.hop p CROSS JOIN shared ON shared.a = p.lane_id
+         FROM temp.hop p INDEXED BY hop_sum CROSS JOIN shared ON shared.a = p.lane_id
          WHERE p.id BETWEEN shared.lo AND shared.hi
            AND NOT EXISTS (SELECT 1 FROM temp.hop q
                            WHERE q.sum = p.sum AND q.lane_id = shared.b)
