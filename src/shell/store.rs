@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rusqlite::limits::Limit;
@@ -25,6 +26,7 @@ use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::cross;
 use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
 use crate::shell::segment::{self, Writer, Written};
+use crate::shell::vtab;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -43,6 +45,8 @@ pub struct Store {
     /// Whether every packet and kept value is also written to the oracle
     /// tables of `pure::oracle`; only tests ask for it.
     oracle: bool,
+    /// What the tables `packets` and `field_values` on this connection read.
+    shared: Arc<vtab::Shared>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -193,15 +197,18 @@ impl Store {
             )
             .into());
         }
+        let segments = segment::folder_for(path);
+        let shared = vtab::Shared::new(segments.clone());
+        vtab::register(&conn, &shared)?;
         conn.execute_batch(sql::SCHEMA)?;
         conn.pragma_update(None, "user_version", sql::SCHEMA_VERSION)?;
-        let segments = segment::folder_for(path);
         fs::create_dir_all(&segments)?;
         remove_orphans(&conn, &segments)?;
         Ok(Store {
             conn,
             segments,
             oracle: false,
+            shared,
         })
     }
 
@@ -233,16 +240,68 @@ impl Store {
         conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)?;
         let deadline = Instant::now() + budget;
         conn.progress_handler(10_000, Some(move || Instant::now() > deadline))?;
+        let segments = segment::folder_for(path);
+        // The progress handler does not run inside a long read of the
+        // segment files; the tables look at the clock themselves.
+        let shared = vtab::Shared::new(segments.clone());
+        shared.set_deadline(deadline);
+        vtab::register(&conn, &shared)?;
         Ok(Store {
             conn,
-            segments: segment::folder_for(path),
+            segments,
             oracle: false,
+            shared,
         })
     }
 
     /// Runs one of the tool's own statements.
     pub fn query(&self, q: &Query, limit: usize) -> Result<Table> {
-        run_query(&self.conn, q, limit)
+        self.with_segments(|| {
+            let mut stmt = self.conn.prepare_cached(&q.sql)?;
+            if self.shared.used() && !self.shared.loaded() {
+                self.shared.load(&self.conn)?;
+            }
+            collect(&mut stmt, &q.params, limit)
+        })
+    }
+
+    /// Runs a statement that may read `packets` or `field_values`: in a
+    /// read transaction of its own (unless one is open), with the list of
+    /// segments read in that transaction first. If a listed segment turns
+    /// out to have been replaced meanwhile, which only a statement that
+    /// started before the replacement was committed can see, the statement
+    /// is run once more on a fresh transaction and list. `run` must prepare
+    /// its statement, and read the list if it is not read yet and the
+    /// statement names a table that needs it, before stepping it.
+    fn with_segments<T>(&self, run: impl Fn() -> Result<T>) -> Result<T> {
+        let mut retried = false;
+        loop {
+            self.shared.forget();
+            let own = self.conn.is_autocommit();
+            if own {
+                self.conn.execute_batch("BEGIN")?;
+            }
+            let result = (|| {
+                if self.shared.used() {
+                    self.shared.load(&self.conn)?;
+                }
+                run()
+            })();
+            let stale = self.shared.take_stale();
+            self.shared.forget();
+            if own && !self.conn.is_autocommit() {
+                let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+                if let Err(e) = self.conn.execute_batch(end)
+                    && result.is_ok()
+                {
+                    return Err(e.into());
+                }
+            }
+            match result {
+                Err(_) if stale && !retried => retried = true,
+                other => return other,
+            }
+        }
     }
 
     /// Packet counts per lane and bucket over a window, from the segment
@@ -603,11 +662,19 @@ impl Store {
     /// Runs a statement typed by the user. It is refused unless SQLite
     /// itself reports that it cannot write.
     pub fn query_user(&self, sql_text: &str, limit: usize) -> Result<Table> {
-        let mut stmt = self.conn.prepare(sql_text)?;
-        if !stmt.readonly() {
-            return Err("Only read-only statements are allowed".into());
-        }
-        collect(&mut stmt, &[], limit)
+        self.with_segments(|| {
+            let mut stmt = self.conn.prepare(sql_text)?;
+            if !stmt.readonly() {
+                return Err("Only read-only statements are allowed".into());
+            }
+            if self.shared.used() && !self.shared.loaded() {
+                // The first statement on this connection to name the
+                // tables: planned again now that their sizes are known.
+                self.shared.load(&self.conn)?;
+                stmt = self.conn.prepare(sql_text)?;
+            }
+            collect(&mut stmt, &[], limit)
+        })
     }
 
     /// Ingests files that all lie under `root` into the run for that root.
@@ -650,15 +717,12 @@ impl Store {
                     }
                 }
             }
-            let file_ids: Vec<i64> = tx
-                .prepare(sql::RUN_FILE_IDS)?
-                .query_map(params![run_id], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            for file_id in file_ids {
-                for statement in sql::delete_file_packets() {
-                    tx.execute(&statement, params![file_id])?;
-                }
-                if self.oracle {
+            if self.oracle {
+                let file_ids: Vec<i64> = tx
+                    .prepare(sql::RUN_FILE_IDS)?
+                    .query_map(params![run_id], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                for file_id in file_ids {
                     for statement in oracle::delete_file_packets() {
                         tx.execute(&statement, params![file_id])?;
                     }
@@ -801,9 +865,6 @@ impl Store {
             old_segment = tx
                 .query_row(sql::FILE_SEGMENT, params![file_id], |r| r.get(0))
                 .optional()?;
-            for statement in sql::delete_file_packets() {
-                tx.execute(&statement, params![file_id])?;
-            }
             if self.oracle {
                 for statement in oracle::delete_file_packets() {
                     tx.execute(&statement, params![file_id])?;
@@ -1075,8 +1136,6 @@ fn ingest_packets(
     // Whether each packet and value also goes to the oracle tables.
     oracle: bool,
 ) -> Result<(u64, String)> {
-    let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
-    let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut oracle_inserts = if oracle {
         Some((
             conn.prepare_cached(oracle::INSERT_PACKET)?,
@@ -1104,32 +1163,29 @@ fn ingest_packets(
         let Seen { row, values } = check.observe(&record);
         let packet_id = base_id + row.idx;
         let lane_id = lanes.id(conn, row.lane())?;
-        let packet = params![
-            packet_id,
-            file_id,
-            lane_id,
-            row.idx,
-            row.offset,
-            row.length,
-            row.receive_ns,
-            row.packet_ns,
-            row.header.map(|h| i64::from(h.apid)),
-            row.header.map(|h| ptype_code(h.packet_type)),
-            row.header.map(|h| i64::from(h.seq_count)),
-            row.sum,
-            record.label,
-        ];
-        insert.execute(packet)?;
         if let Some((insert, _)) = &mut oracle_inserts {
-            insert.execute(packet)?;
+            insert.execute(params![
+                packet_id,
+                file_id,
+                lane_id,
+                row.idx,
+                row.offset,
+                row.length,
+                row.receive_ns,
+                row.packet_ns,
+                row.header.map(|h| i64::from(h.apid)),
+                row.header.map(|h| ptype_code(h.packet_type)),
+                row.header.map(|h| i64::from(h.seq_count)),
+                row.sum,
+                record.label,
+            ])?;
         }
         segment.push(lane_id, &row, record.label.as_deref())?;
-        // After the packet's own row, which these rows point at.
         for v in values {
-            let value = params![packet_id, file_id, v.packet, v.field, v.num, v.text];
-            insert_value.execute(value)?;
             if let Some((_, insert)) = &mut oracle_inserts {
-                insert.execute(value)?;
+                insert.execute(params![
+                    packet_id, file_id, v.packet, v.field, v.num, v.text
+                ])?;
             }
             segment.push_value(v.packet, v.field, v.num, v.text.as_deref())?;
             if v.num.is_some() {

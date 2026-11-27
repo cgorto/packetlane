@@ -10,3 +10,4 @@ pub mod ingest;
 pub mod segment;
 pub mod server;
 pub mod store;
+pub mod vtab;

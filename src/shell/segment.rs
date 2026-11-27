@@ -1051,6 +1051,31 @@ impl Segment {
         self.packets
     }
 
+    /// Where a section lies in the file: its offset and length in bytes.
+    pub fn section_bytes(&self, kind: u16, clock: Clock) -> Result<(u64, u64)> {
+        let e = self.section(kind, layout::clock_code(clock))?;
+        Ok((e.offset, e.length))
+    }
+
+    /// Reads bytes at an offset, for a reader that keeps its own buffer.
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        self.file.read_exact_at(buf, offset)
+    }
+
+    /// The position of the first record of a time clock's time order whose
+    /// time is at least `at_least`.
+    pub fn time_position(&self, clock: Clock, at_least: i64) -> Result<u64> {
+        let e = self.section(KIND_TIME, layout::clock_code(clock))?;
+        self.lower_bound(&e, at_least)
+    }
+
+    /// The position of the first kept value of the packet at `index` or of
+    /// a later one.
+    pub fn value_position(&self, index: u64) -> Result<u64> {
+        let e = self.section(KIND_VALUES, 0)?;
+        self.search(&e, (0, e.records()), 4, |b| u64::from(u32_le(b)) < index)
+    }
+
     fn section(&self, kind: u16, clock: u8) -> Result<Entry> {
         self.entries
             .iter()

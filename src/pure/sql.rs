@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde::ser::Serializer;
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -49,25 +49,9 @@ CREATE TABLE IF NOT EXISTS lanes (
   order_max INTEGER,
   UNIQUE (run_id, source, kind, apid, ptype, file_id)
 );
-CREATE TABLE IF NOT EXISTS packets (
-  id INTEGER PRIMARY KEY,
-  file_id INTEGER NOT NULL REFERENCES files(id),
-  lane_id INTEGER NOT NULL REFERENCES lanes(id),
-  idx INTEGER NOT NULL,
-  offset INTEGER NOT NULL,
-  length INTEGER NOT NULL,
-  receive_ns INTEGER,
-  packet_ns INTEGER,
-  apid INTEGER,
-  ptype INTEGER,
-  seq INTEGER,
-  sum INTEGER NOT NULL,
-  label TEXT
-);
-CREATE INDEX IF NOT EXISTS packets_receive ON packets (receive_ns, lane_id);
-CREATE INDEX IF NOT EXISTS packets_packet ON packets (packet_ns, lane_id);
-CREATE INDEX IF NOT EXISTS packets_lane_receive ON packets (lane_id, receive_ns, packet_ns);
-CREATE INDEX IF NOT EXISTS packets_lane_packet ON packets (lane_id, packet_ns, receive_ns);
+-- The tables `packets` and `field_values` are not in the file: they are
+-- served from the segment files, on every connection the store opens (see
+-- shell::vtab).
 CREATE TABLE IF NOT EXISTS logs (
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -101,16 +85,6 @@ CREATE TABLE IF NOT EXISTS coarse_meta (
   width INTEGER NOT NULL,
   PRIMARY KEY (run_id, clock)
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS field_values (
-  packet_id INTEGER NOT NULL REFERENCES packets(id),
-  file_id INTEGER NOT NULL REFERENCES files(id),
-  packet TEXT NOT NULL,
-  field TEXT NOT NULL,
-  num REAL,
-  text TEXT
-);
-CREATE INDEX IF NOT EXISTS field_values_field ON field_values (field, num);
-CREATE INDEX IF NOT EXISTS field_values_packet ON field_values (packet_id);
 CREATE TABLE IF NOT EXISTS file_series (
   file_id INTEGER NOT NULL REFERENCES files(id),
   lane_id INTEGER NOT NULL REFERENCES lanes(id),
@@ -521,32 +495,13 @@ pub fn files_under(prefix: &str) -> Query {
 pub const RUN_BY_ROOT: &str = "SELECT id, config FROM runs WHERE root = ?";
 /// Files a run holds. Columns: path, rel.
 pub const RUN_FILE_PATHS: &str = "SELECT path, rel FROM files WHERE run_id = ? ORDER BY rel";
-/// Statements that empty a run, each taking the run id. Used when its
-/// configuration changes, because names, clocks and time formats are
-/// applied as files are read.
-/// The ids of a file's packets, as `BETWEEN` wants them. A file's packets
-/// are numbered in one unbroken run as it is read, and the file's row keeps
-/// the first and last (`first_packet`, `last_packet`; null if it held
-/// none). What was read from a file is found by that range, which the
-/// tables are already in order of, and so needs no index by file.
-const FILE_PACKETS: &str = "(SELECT first_packet FROM files WHERE id = ?1)
-                                AND (SELECT last_packet FROM files WHERE id = ?1)";
-
-/// Removes the packets of one file and their kept values. Takes the file
-/// id; the file's row must still be there.
-pub fn delete_file_packets() -> [String; 2] {
-    [
-        format!("DELETE FROM field_values WHERE packet_id BETWEEN {FILE_PACKETS}"),
-        format!("DELETE FROM packets WHERE id BETWEEN {FILE_PACKETS}"),
-    ]
-}
-
 /// The files of a run. Columns: id.
 pub const RUN_FILE_IDS: &str = "SELECT id FROM files WHERE run_id = ?";
 
-/// Removes everything read for a run but the run itself, each taking the
-/// run id. The packets and kept values go first, file by file, with
-/// [`delete_file_packets`].
+/// Statements that empty a run, each taking the run id. Used when its
+/// configuration changes, because names, clocks and time formats are
+/// applied as files are read. The run's segment files are removed after
+/// the transaction commits.
 pub const RESET_RUN: [&str; 9] = [
     "DELETE FROM segments WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM segment_lanes WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
@@ -564,8 +519,7 @@ pub const RUN_ID: &str = "SELECT id FROM runs WHERE root = ?";
 /// A file of a run by its path within the run. Columns: id, size, checksum.
 pub const FILE_BY_REL: &str = "SELECT id, size, checksum FROM files WHERE run_id = ? AND rel = ?";
 /// Statements that remove one file and what was read from it, each taking
-/// the file id. Its packets and kept values go first, with
-/// [`delete_file_packets`].
+/// the file id. Its segment file is removed after the transaction commits.
 pub const DELETE_FILE: [&str; 7] = [
     "DELETE FROM segments WHERE file_id = ?",
     "DELETE FROM segment_lanes WHERE file_id = ?",
@@ -590,13 +544,8 @@ pub const LANE_ID: &str = "SELECT id FROM lanes
 /// The id the next file's first packet gets: one more than the highest any
 /// segment holds. A file's packets are numbered from there with no gaps.
 pub const NEXT_PACKET_ID: &str = "SELECT COALESCE(MAX(last_packet), 0) + 1 FROM segments";
-pub const INSERT_PACKET: &str = "INSERT INTO packets
-     (id, file_id, lane_id, idx, offset, length, receive_ns, packet_ns, apid, ptype, seq, sum, label)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
 pub const INSERT_LOG: &str =
     "INSERT INTO logs (file_id, lane_id, offset, log_ns, text) VALUES (?, ?, ?, ?, ?)";
-/// One kept field value of one packet: the number, the text, or both.
-pub const INSERT_VALUE: &str = "INSERT INTO field_values (packet_id, file_id, packet, field, num, text) VALUES (?, ?, ?, ?, ?, ?)";
 /// How many numbers one file holds of one kept field of one lane.
 pub const INSERT_FILE_SERIES: &str =
     "INSERT INTO file_series (file_id, lane_id, packet, field, count) VALUES (?, ?, ?, ?, ?)";
@@ -622,6 +571,19 @@ pub const RUN_SEGMENTS: &str =
     "SELECT name FROM segments WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)";
 /// Every segment the store lists. Columns: name.
 pub const ALL_SEGMENTS: &str = "SELECT name FROM segments";
+
+/// The segments a statement over `packets` or `field_values` reads, in id
+/// order. Columns: file id, name, first and last packet id, lowest and
+/// highest receive time, lowest and highest packet time.
+pub const MANIFEST_SEGMENTS: &str = "SELECT file_id, name, first_packet, last_packet,
+            receive_min, receive_max, packet_min, packet_max
+     FROM segments ORDER BY first_packet";
+/// What each segment holds of each lane. Columns: file id, lane id, how
+/// many have a receive time, how many a packet time.
+pub const MANIFEST_LANES: &str =
+    "SELECT file_id, lane_id, receive_count, packet_count FROM segment_lanes";
+/// How many numbers are kept, about, for the planner. Columns: count.
+pub const MANIFEST_VALUES: &str = "SELECT COALESCE(SUM(count), 0) FROM file_series";
 
 /// The segments of a run holding packets whose time on `clock` may lie in
 /// `from..=to`, in id order. Columns: name, first packet id, lowest and
