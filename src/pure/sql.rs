@@ -759,7 +759,9 @@ pub const INSERT_LANE: &str =
      VALUES (?, ?, ?, ?, ?, ?)";
 pub const LANE_ID: &str = "SELECT id FROM lanes
      WHERE run_id = ? AND source = ? AND kind = ? AND apid = ? AND ptype = ? AND file_id = ?";
-pub const NEXT_PACKET_ID: &str = "SELECT COALESCE(MAX(id), 0) + 1 FROM packets";
+/// The id the next file's first packet gets: one more than the highest any
+/// segment holds. A file's packets are numbered from there with no gaps.
+pub const NEXT_PACKET_ID: &str = "SELECT COALESCE(MAX(last_packet), 0) + 1 FROM segments";
 pub const INSERT_PACKET: &str = "INSERT INTO packets
      (id, file_id, lane_id, idx, offset, length, receive_ns, packet_ns, apid, ptype, seq, sum, label)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";

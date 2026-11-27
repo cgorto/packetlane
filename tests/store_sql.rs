@@ -988,6 +988,15 @@ fn lanes_match_the_old_counts(db: &Path) -> usize {
     let old = all();
     conn.execute_batch("ROLLBACK").unwrap();
     assert_eq!(stored, old);
+    // And the next file's packets are numbered as when the next id was
+    // asked of the packets, and every file's packets are where its row
+    // says.
+    let next = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+    assert_eq!(
+        next(sql::NEXT_PACKET_ID),
+        next("SELECT COALESCE(MAX(id), 0) + 1 FROM packets")
+    );
+    check_files(&conn);
     stored
         .iter()
         .filter(|r| r[3] != "log" && r[7] != "0")
