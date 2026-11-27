@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde::ser::Serializer;
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -130,6 +130,20 @@ CREATE TABLE IF NOT EXISTS file_series (
   count INTEGER NOT NULL,
   PRIMARY KEY (file_id, lane_id, packet, field)
 ) WITHOUT ROWID;
+-- One row per segment file of packets; see pure::segment.
+CREATE TABLE IF NOT EXISTS segments (
+  file_id INTEGER PRIMARY KEY REFERENCES files(id),
+  name TEXT NOT NULL UNIQUE,
+  first_packet INTEGER NOT NULL,
+  last_packet INTEGER NOT NULL,
+  receive_min INTEGER,
+  receive_max INTEGER,
+  receive_shift INTEGER,
+  packet_min INTEGER,
+  packet_max INTEGER,
+  packet_shift INTEGER,
+  order_shift INTEGER NOT NULL
+);
 DROP VIEW IF EXISTS value_view;
 CREATE VIEW value_view AS
   SELECT v.packet_id AS id, r.root AS run, l.source, f.rel AS file, p.apid, v.packet, v.field,
@@ -653,7 +667,8 @@ pub const RUN_FILE_IDS: &str = "SELECT id FROM files WHERE run_id = ?";
 /// Removes everything read for a run but the run itself, each taking the
 /// run id. The packets and kept values go first, file by file, with
 /// [`delete_file_packets`].
-pub const RESET_RUN: [&str; 8] = [
+pub const RESET_RUN: [&str; 9] = [
+    "DELETE FROM segments WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM file_series WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM logs WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM findings WHERE run_id = ?",
@@ -671,7 +686,8 @@ pub const FILE_BY_REL: &str = "SELECT id, size, checksum FROM files WHERE run_id
 /// Statements that remove one file and what was read from it, each taking
 /// the file id. Its packets and kept values go first, with
 /// [`delete_file_packets`].
-pub const DELETE_FILE: [&str; 5] = [
+pub const DELETE_FILE: [&str; 6] = [
+    "DELETE FROM segments WHERE file_id = ?",
     "DELETE FROM file_series WHERE file_id = ?",
     "DELETE FROM logs WHERE file_id = ?",
     "DELETE FROM findings WHERE file_id = ?",
@@ -704,6 +720,45 @@ pub const INSERT_FILE_SERIES: &str =
 pub const INSERT_FINDING: &str = "INSERT INTO findings
      (run_id, file_id, lane_id, packet_id, severity, kind, message) VALUES (?, ?, ?, ?, ?, ?, ?)";
 pub const DELETE_CROSS_FINDINGS: &str = "DELETE FROM findings WHERE run_id = ? AND file_id IS NULL";
+
+// ---- segments ------------------------------------------------------------------
+//
+// Each packet file's packets are also written to a segment file beside the
+// store (see `pure::segment`); the `segments` table lists them.
+
+/// Takes file id, name, first and last packet id, receive min, max and
+/// shift, packet min, max and shift, order shift.
+pub const INSERT_SEGMENT: &str = "INSERT INTO segments
+     (file_id, name, first_packet, last_packet, receive_min, receive_max, receive_shift,
+      packet_min, packet_max, packet_shift, order_shift)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+/// The segment of one file, if it has one. Columns: name.
+pub const FILE_SEGMENT: &str = "SELECT name FROM segments WHERE file_id = ?";
+/// The segments of a run's files. Columns: name.
+pub const RUN_SEGMENTS: &str =
+    "SELECT name FROM segments WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)";
+/// Every segment the store lists. Columns: name.
+pub const ALL_SEGMENTS: &str = "SELECT name FROM segments";
+
+/// The segments of a run holding packets whose time on `clock` may lie in
+/// `from..=to`, in id order. Columns: name, first packet id, lowest and
+/// highest value on the clock.
+pub fn segments_in_window(run: i64, clock: Clock, from: i64, to: i64) -> Query {
+    let (min, max) = match clock {
+        Clock::Receive => ("receive_min", "receive_max"),
+        Clock::Packet => ("packet_min", "packet_max"),
+        Clock::Order => ("first_packet", "last_packet"),
+    };
+    Query::new(
+        format!(
+            "SELECT name, first_packet, {min}, {max} FROM segments
+             WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)
+               AND {min} <= ? AND {max} >= ?
+             ORDER BY first_packet"
+        ),
+        vec![run.into(), to.into(), from.into()],
+    )
+}
 
 /// Recomputes the per-lane totals and time ranges for a run.
 /// Sets each packet lane's count and time ranges from its packets, in two
@@ -1002,17 +1057,50 @@ pub fn density(
     buckets: i64,
     coarse: Option<(i64, i64)>,
 ) -> Vec<Query> {
+    density_of(run, clock, from, to, buckets, coarse, false)
+}
+
+/// As [`density`], for text log entries only: the statements that count a
+/// window's log entries, from the pre-counted buckets of log lanes where
+/// they cover it whole. None on a clock with no place for text logs.
+pub fn log_density_stored(
+    run: i64,
+    clock: Clock,
+    from: i64,
+    to: i64,
+    buckets: i64,
+    coarse: Option<(i64, i64)>,
+) -> Vec<Query> {
+    if clock.log_column().is_none() {
+        return Vec::new();
+    }
+    density_of(run, clock, from, to, buckets, coarse, true)
+}
+
+fn density_of(
+    run: i64,
+    clock: Clock,
+    from: i64,
+    to: i64,
+    buckets: i64,
+    coarse: Option<(i64, i64)>,
+    logs_only: bool,
+) -> Vec<Query> {
     let width = bucket_width(from, to, buckets);
+    let lanes = if logs_only { " AND kind = 'log'" } else { "" };
     let direct = |lo: i64, hi: i64| -> Vec<Query> {
-        let mut out = vec![range_density(
-            &format!("packets {}", clock.all_lanes()),
-            clock.packet_column(),
-            run,
-            lo,
-            hi,
-            from,
-            width,
-        )];
+        let mut out = Vec::new();
+        if !logs_only {
+            out.push(range_density(
+                &format!("packets {}", clock.all_lanes()),
+                clock.packet_column(),
+                run,
+                lo,
+                hi,
+                from,
+                width,
+            ));
+        }
         if let Some(column) = clock.log_column() {
             out.push(range_density("logs", column, run, lo, hi, from, width));
         }
@@ -1029,10 +1117,12 @@ pub fn density(
         return direct(from, to);
     };
     let mut out = vec![Query::new(
-        "SELECT lane_id, (?1 + bucket * ?2 - ?3) / ?4 AS b, SUM(count) FROM coarse
-         WHERE clock = ?5 AND bucket BETWEEN ?6 AND ?7
-           AND lane_id IN (SELECT id FROM lanes WHERE run_id = ?8)
-         GROUP BY lane_id, b",
+        format!(
+            "SELECT lane_id, (?1 + bucket * ?2 - ?3) / ?4 AS b, SUM(count) FROM coarse
+             WHERE clock = ?5 AND bucket BETWEEN ?6 AND ?7
+               AND lane_id IN (SELECT id FROM lanes WHERE run_id = ?8{lanes})
+             GROUP BY lane_id, b"
+        ),
         vec![
             origin.into(),
             coarse_width.into(),

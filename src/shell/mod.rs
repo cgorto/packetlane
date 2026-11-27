@@ -6,5 +6,6 @@ pub mod browse;
 pub mod cli;
 pub mod files;
 pub mod ingest;
+pub mod segment;
 pub mod server;
 pub mod store;

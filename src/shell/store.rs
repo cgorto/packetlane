@@ -2,10 +2,10 @@
 //! what the statements are, and what their results mean, is decided in
 //! `pure::sql`, `pure::ingest` and `pure::cross`.
 
-use std::collections::HashMap;
-use std::fs::File;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rusqlite::limits::Limit;
@@ -22,6 +22,7 @@ use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
+use crate::shell::segment::{self, Writer, Written};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -35,6 +36,8 @@ const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct Store {
     conn: Connection,
+    /// The folder of segment files beside the store.
+    segments: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -187,7 +190,10 @@ impl Store {
         }
         conn.execute_batch(sql::SCHEMA)?;
         conn.pragma_update(None, "user_version", sql::SCHEMA_VERSION)?;
-        Ok(Store { conn })
+        let segments = segment::folder_for(path);
+        fs::create_dir_all(&segments)?;
+        remove_orphans(&conn, &segments)?;
+        Ok(Store { conn, segments })
     }
 
     /// Opens the store so that nothing run on this connection can change it
@@ -205,12 +211,53 @@ impl Store {
         conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)?;
         let deadline = Instant::now() + budget;
         conn.progress_handler(10_000, Some(move || Instant::now() > deadline))?;
-        Ok(Store { conn })
+        Ok(Store {
+            conn,
+            segments: segment::folder_for(path),
+        })
     }
 
     /// Runs one of the tool's own statements.
     pub fn query(&self, q: &Query, limit: usize) -> Result<Table> {
         run_query(&self.conn, q, limit)
+    }
+
+    /// Packet counts per lane and bucket over a window, from the segment
+    /// files, by the rule in `pure::segment::plan`. Columns: lane, bucket,
+    /// count; one row per lane and bucket.
+    pub fn packet_density(
+        &self,
+        run: i64,
+        clock: sql::Clock,
+        from: i64,
+        to: i64,
+        buckets: i64,
+    ) -> Result<Table> {
+        let listed = self.query(&sql::segments_in_window(run, clock, from, to), usize::MAX)?;
+        let listed: Vec<segment::Listed> = listed
+            .rows
+            .iter()
+            .filter_map(|r| {
+                Some(segment::Listed {
+                    name: r[0].text()?.to_string(),
+                    first_packet: r[1].int()?,
+                    min: r[2].int()?,
+                    max: r[3].int()?,
+                })
+            })
+            .collect();
+        let width = sql::bucket_width(from, to, buckets);
+        let rows = segment::density(&self.segments, &listed, clock, from, to, width)?;
+        Ok(Table {
+            columns: ["lane", "bucket", "count"].map(str::to_string).to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|(lane, bucket, count)| {
+                    vec![Cell::Int(lane), Cell::Int(bucket), Cell::Int(count)]
+                })
+                .collect(),
+            truncated: false,
+        })
     }
 
     /// Runs a statement typed by the user. It is refused unless SQLite
@@ -272,10 +319,17 @@ impl Store {
                     tx.execute(&statement, params![file_id])?;
                 }
             }
+            let old_segments: Vec<String> = tx
+                .prepare(sql::RUN_SEGMENTS)?
+                .query_map(params![run_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
             for statement in sql::RESET_RUN {
                 tx.execute(statement, params![run_id])?;
             }
             tx.commit()?;
+            for name in old_segments {
+                segment::remove(&self.segments, &name)?;
+            }
             files.sort();
         }
         let files = &files;
@@ -413,10 +467,15 @@ impl Store {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()?;
+        // The earlier version's segment, removed once its row is gone for good.
+        let mut old_segment: Option<String> = None;
         if let Some((file_id, old_size, old_checksum)) = known {
             if (old_size, old_checksum) == (size, checksum) {
                 return Ok(outcome(Status::AlreadyIngested, "", 0, 0, String::new()));
             }
+            old_segment = tx
+                .query_row(sql::FILE_SEGMENT, params![file_id], |r| r.get(0))
+                .optional()?;
             for statement in sql::delete_file_packets() {
                 tx.execute(&statement, params![file_id])?;
             }
@@ -430,6 +489,9 @@ impl Store {
         if format != Format::Text && decoder.is_none() {
             // Nothing to store. Keep the removal of an earlier version, if any.
             tx.commit()?;
+            if let Some(name) = &old_segment {
+                segment::remove(&self.segments, name)?;
+            }
             let note = match format {
                 Format::Gzip => "Compressed file that cannot be read, or holds another one",
                 Format::Empty => "Empty file",
@@ -457,9 +519,13 @@ impl Store {
         let mut lanes = Lanes::new(run_id, &source.name);
         // The file's packets are numbered from here, with no gaps.
         let first_packet: i64 = tx.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
+        let mut written: Option<Written> = None;
 
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
+                // Created after the file's row, inside its transaction, so
+                // that no other writer can be sweeping the folder meanwhile.
+                let mut writer = Writer::create(&self.segments, file_id, first_packet)?;
                 let (packets, note) = ingest_packets(
                     &tx,
                     &mut file,
@@ -470,7 +536,9 @@ impl Store {
                     &source,
                     &mut lanes,
                     first_packet,
+                    &mut writer,
                 )?;
+                written = writer.finish()?;
                 (packets, 0, note)
             }
             None => {
@@ -518,7 +586,39 @@ impl Store {
                 file_id
             ],
         )?;
-        tx.commit()?;
+        if let Some(w) = &written {
+            if w.last_packet - w.first_packet + 1 != packets as i64 {
+                segment::remove(&self.segments, &w.name)?;
+                return Err("the segment and the stored rows disagree".into());
+            }
+            let time = |c: usize| w.times[c].map(|(lo, hi, shift)| (lo, hi, i64::from(shift)));
+            let (r, p) = (time(0), time(1));
+            tx.execute(
+                sql::INSERT_SEGMENT,
+                params![
+                    file_id,
+                    w.name,
+                    w.first_packet,
+                    w.last_packet,
+                    r.map(|t| t.0),
+                    r.map(|t| t.1),
+                    r.map(|t| t.2),
+                    p.map(|t| t.0),
+                    p.map(|t| t.1),
+                    p.map(|t| t.2),
+                    i64::from(w.order_shift)
+                ],
+            )?;
+        }
+        if let Err(e) = tx.commit() {
+            if let Some(w) = &written {
+                let _ = segment::remove(&self.segments, &w.name);
+            }
+            return Err(e.into());
+        }
+        if let Some(name) = &old_segment {
+            segment::remove(&self.segments, name)?;
+        }
         Ok(outcome(
             Status::Ingested,
             format.name(),
@@ -527,6 +627,43 @@ impl Store {
             note,
         ))
     }
+}
+
+/// Removes the segment and temporary files the store does not list: left by
+/// a crash, or by an ingest that did not commit. Every writer creates such
+/// files only while it holds the store's write lock, so this takes that lock
+/// first; if another writer holds it, the sweep waits for another time.
+fn remove_orphans(conn: &Connection, folder: &Path) -> Result<()> {
+    conn.busy_timeout(Duration::ZERO)?;
+    let locked = conn.execute_batch("BEGIN IMMEDIATE");
+    conn.busy_timeout(Duration::from_secs(5))?;
+    match locked {
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+        {
+            return Ok(());
+        }
+        other => other?,
+    }
+    let swept = (|| -> Result<()> {
+        let listed: HashSet<String> = conn
+            .prepare(sql::ALL_SEGMENTS)?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for entry in fs::read_dir(folder)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if segment::is_ours(name) && !listed.contains(name) && entry.file_type()?.is_file() {
+                segment::remove(folder, name)?;
+            }
+        }
+        Ok(())
+    })();
+    conn.execute_batch("COMMIT")?;
+    swept
 }
 
 /// Looks up or creates lane ids for one file's source.
@@ -578,6 +715,8 @@ fn ingest_packets(
     lanes: &mut Lanes<'_>,
     // The id of the file's first packet; the rest follow with no gaps.
     base_id: i64,
+    // Where each packet is also written.
+    segment: &mut Writer,
 ) -> Result<(u64, String)> {
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
@@ -615,6 +754,7 @@ fn ingest_packets(
             row.sum,
             record.label,
         ])?;
+        segment.push(lane_id, &row, record.label.as_deref())?;
         // After the packet's own row, which these rows point at.
         for v in values {
             insert_value.execute(params![
