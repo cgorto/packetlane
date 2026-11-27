@@ -229,17 +229,19 @@ impl<const N: usize> Sorter<N> {
         Ok(())
     }
 
-    /// Hands every record to `out`, in order.
-    pub fn finish(mut self, mut out: impl FnMut([u8; N]) -> Result<()>) -> Result<()> {
+    /// Hands every record to `out`, in order. Returns the most sorted runs
+    /// that were merged at once.
+    pub fn finish(mut self, mut out: impl FnMut([u8; N]) -> Result<()>) -> Result<usize> {
         if self.runs.is_empty() {
             self.buf.sort_unstable();
             for record in std::mem::take(&mut self.buf) {
                 out(record)?;
             }
-            return Ok(());
+            return Ok(0);
         }
         self.spill()?;
         self.buf = Vec::new();
+        let mut widest = 0;
         // Merge groups of runs into longer runs until few enough are left.
         while self.runs.len() > self.fan_in {
             let Some(from) = self.spill.take() else {
@@ -250,6 +252,7 @@ impl<const N: usize> Sorter<N> {
             let mut writer = BufWriter::with_capacity(IO_BUFFER, &to.file);
             let mut at = 0u64;
             for group in self.runs.chunks(self.fan_in) {
+                widest = widest.max(group.len());
                 let mut merge = Merger::<N>::new(&from.file, group)?;
                 let start = at;
                 while let Some(record) = merge.next()? {
@@ -267,11 +270,12 @@ impl<const N: usize> Sorter<N> {
         let Some(file) = &self.spill else {
             return Err("sorter has no file".into());
         };
+        widest = widest.max(self.runs.len());
         let mut merge = Merger::<N>::new(&file.file, &self.runs)?;
         while let Some(record) = merge.next()? {
             out(record)?;
         }
-        Ok(())
+        Ok(widest)
     }
 }
 
@@ -836,19 +840,30 @@ mod tests {
         }
     }
 
-    fn sort_all(scratch: &Scratch, input: &[u64], chunk: usize, fan_in: usize) -> Vec<u64> {
+    /// The sorted output, the most runs merged at once, and how many files
+    /// were in the folder while the last merge ran.
+    fn sort_all(
+        scratch: &Scratch,
+        input: &[u64],
+        chunk: usize,
+        fan_in: usize,
+    ) -> (Vec<u64>, usize, usize) {
         let mut sorter = Sorter::<8>::new(scratch.0.join("t"), chunk, fan_in);
         for v in input {
             sorter.push(v.to_be_bytes()).unwrap();
         }
         let mut out = Vec::new();
-        sorter
+        let mut files = 0;
+        let widest = sorter
             .finish(|b| {
+                if out.is_empty() {
+                    files = fs::read_dir(&scratch.0).unwrap().count();
+                }
                 out.push(u64::from_be_bytes(b));
                 Ok(())
             })
             .unwrap();
-        out
+        (out, widest, files)
     }
 
     #[test]
@@ -859,10 +874,17 @@ mod tests {
         let input: Vec<u64> = (0..5_000u64).map(|i| (i * 7_919) % 1_009).collect();
         let mut expected = input.clone();
         expected.sort_unstable();
-        assert_eq!(sort_all(&scratch, &input, 7, 4), expected);
-        assert_eq!(sort_all(&scratch, &input, 7, 32), expected);
-        assert_eq!(sort_all(&scratch, &input, 100_000, 4), expected);
-        assert_eq!(sort_all(&scratch, &[], 7, 4), Vec::<u64>::new());
+        // Never more runs at once than allowed, and only the last pass's
+        // file is left by the time the output is handed out.
+        assert_eq!(sort_all(&scratch, &input, 7, 4), (expected.clone(), 4, 1));
+        assert_eq!(sort_all(&scratch, &input, 7, 32), (expected.clone(), 32, 1));
+        // Few enough runs to merge in one go; one chunk, sorted in memory.
+        assert_eq!(
+            sort_all(&scratch, &input, 1_000, 32),
+            (expected.clone(), 5, 1)
+        );
+        assert_eq!(sort_all(&scratch, &input, 100_000, 4), (expected, 0, 0));
+        assert_eq!(sort_all(&scratch, &[], 7, 4), (Vec::new(), 0, 0));
         // Its temporary files are gone.
         assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
@@ -876,6 +898,106 @@ mod tests {
         }
         assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 1);
         drop(sorter);
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    fn row(i: i64, receive_ns: Option<i64>, packet_ns: Option<i64>) -> PacketRow {
+        PacketRow {
+            idx: i,
+            offset: i * 10,
+            length: 10,
+            receive_ns,
+            packet_ns,
+            header: None,
+            length_ok: true,
+            sum: i ^ 0x5555,
+        }
+    }
+
+    #[test]
+    fn a_segment_written_through_spilled_runs_is_in_order_and_complete() {
+        let scratch = Scratch::new();
+        // Sorters of three records: 2,000 packets spill hundreds of runs.
+        let mut writer = Writer::with_chunk(&scratch.0, 7, 1_000, 3).unwrap();
+        let mut expected: [Vec<(i64, u32, u32)>; 2] = [Vec::new(), Vec::new()];
+        for i in 0..2_000i64 {
+            let lane = (i % 5) as u32 + 1;
+            // Scrambled times with ties; some packets lack one time or both.
+            let r = (i % 7 != 0).then_some((i * 7_919) % 1_009 - 500);
+            let p = (i % 3 != 0).then_some(-(i * 31) % 97);
+            writer
+                .push(i64::from(lane), &row(i, r, p), (i % 4 == 0).then_some("A"))
+                .unwrap();
+            for (c, t) in [r, p].into_iter().enumerate() {
+                if let Some(t) = t {
+                    expected[c].push((t, i as u32, lane));
+                }
+            }
+        }
+        let written = writer.finish().unwrap().unwrap();
+        assert_eq!((written.first_packet, written.last_packet), (1_000, 2_999));
+        // Only the segment is left: no temporary files.
+        let names: Vec<_> = fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("7.seg")]);
+
+        let seg = Segment::open(&scratch.0.join(&written.name)).unwrap();
+        for (c, clock) in [Clock::Receive, Clock::Packet].into_iter().enumerate() {
+            expected[c].sort_by_key(|&(t, index, _)| (t, index));
+            let mut got = Vec::new();
+            seg.points(clock, i64::MIN, i64::MAX, |lane, t| got.push((t, lane)))
+                .unwrap();
+            let want: Vec<(i64, u32)> = expected[c].iter().map(|&(t, _, lane)| (t, lane)).collect();
+            assert_eq!(got, want, "{clock:?}");
+            let (lo, hi, shift) = written.times[c].unwrap();
+            assert_eq!((lo, hi), (want[0].0, want[want.len() - 1].0));
+            assert_eq!(seg.shift(clock).unwrap(), shift);
+            // The buckets hold every packet once, in order.
+            let mut buckets = Vec::new();
+            seg.buckets(clock, i64::MIN, i64::MAX, |b| buckets.push(b))
+                .unwrap();
+            assert!(
+                buckets
+                    .windows(2)
+                    .all(|w| (w[0].bucket, w[0].lane) < (w[1].bucket, w[1].lane))
+            );
+            let mut per_lane = std::collections::BTreeMap::new();
+            for b in &buckets {
+                *per_lane.entry(b.lane).or_insert(0u32) += b.count;
+            }
+            let mut want_lane = std::collections::BTreeMap::new();
+            for &(_, lane) in &want {
+                *want_lane.entry(lane).or_insert(0u32) += 1;
+            }
+            assert_eq!(per_lane, want_lane);
+        }
+        let mut ids = Vec::new();
+        seg.points(Clock::Order, 1_500, 1_502, |lane, id| ids.push((id, lane)))
+            .unwrap();
+        assert_eq!(ids, vec![(1_500, 1), (1_501, 2), (1_502, 3)]);
+        let p = seg.packet(4).unwrap();
+        assert_eq!(
+            (p.offset, p.sum, p.label, p.lane),
+            (40, 4 ^ 0x5555, Some(0), 5)
+        );
+        assert_eq!(seg.labels().unwrap(), ["A"]);
+    }
+
+    #[test]
+    fn a_writer_dropped_unfinished_leaves_nothing() {
+        let scratch = Scratch::new();
+        let mut writer = Writer::with_chunk(&scratch.0, 7, 1, 3).unwrap();
+        for i in 0..100 {
+            writer.push(1, &row(i, Some(100 - i), None), None).unwrap();
+        }
+        assert!(fs::read_dir(&scratch.0).unwrap().count() > 1);
+        drop(writer);
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
+        // No packets: nothing written.
+        let writer = Writer::create(&scratch.0, 8, 1).unwrap();
+        assert_eq!(writer.finish().unwrap(), None);
         assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
