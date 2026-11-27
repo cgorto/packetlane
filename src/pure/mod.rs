@@ -20,6 +20,7 @@ pub mod order;
 pub mod paths;
 pub mod pipeline;
 pub mod rs;
+pub mod segment;
 pub mod sql;
 pub mod synth;
 pub mod tc;
