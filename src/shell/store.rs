@@ -148,7 +148,7 @@ impl Phases {
 /// was enough for a file of 300 lanes, measured, and this leaves room for
 /// about twice that. With less, each packet pushes out a page another lane
 /// is about to need. With more, nothing is gained. Peak memory while
-/// writing is about four times this.
+/// writing was 16, 22, 35, 61 and 81 MB at 2, 4, 8, 16 and 32 MB of cache.
 const WRITE_CACHE_KIB: i64 = 8 * 1024;
 
 /// The page cache to write with: [`WRITE_CACHE_KIB`], or as many megabytes

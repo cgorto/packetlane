@@ -766,8 +766,8 @@ pub fn lane_pairs(run: i64) -> Query {
 pub const HOP_UNSTAGE: &str = "DROP TABLE IF EXISTS temp.hop";
 
 /// The statements that make `temp.hop`: the packets of a run's lanes that
-/// have a counterpart from another source, in id order, and an index of
-/// them by checksum and lane. The run's packets are found by its files'
+/// have a counterpart from another source, and an index of them by
+/// checksum and lane. The run's packets are found by its files'
 /// id ranges, so no other run is read.
 pub fn hop_stage(run: i64) -> Vec<Query> {
     vec![
@@ -785,15 +785,16 @@ pub fn hop_stage(run: i64) -> Vec<Query> {
                SELECT a.id FROM lanes a JOIN lanes b
                  ON b.run_id = a.run_id AND b.kind = 'packet' AND b.apid = a.apid
                 AND b.ptype = a.ptype AND b.source != a.source
-               WHERE a.run_id = ?1 AND a.kind = 'packet')
-             ORDER BY p.id",
+               WHERE a.run_id = ?1 AND a.kind = 'packet')",
             vec![run.into()],
         ),
         // With the id, so that the comparison reads this index alone, in
         // checksum order: each packet it asks about is then beside the
         // last, and little of the index need be in memory at once.
         Query::new(
-            "CREATE INDEX temp.hop_sum ON hop (sum, lane_id, id)",
+            // The sequence count and length are there for the tracing of
+            // interleaved streams, which matches on them too.
+            "CREATE INDEX temp.hop_sum ON hop (sum, lane_id, seq, length, id)",
             vec![],
         ),
     ]
@@ -848,13 +849,14 @@ pub fn lanes_with_finding(run: i64, kind: &str) -> Query {
     )
 }
 
-/// Which other sources hold copies of a lane's packets. Reads `temp.hop`,
-/// which [`hop_stage`] must have made.
+/// Which other sources hold copies of a lane's packets. The lane's own
+/// packets are read from the store, by lane, and each is looked for in
+/// `temp.hop`, which [`hop_stage`] must have made.
 /// Columns: source, number of the lane's packets found there.
 pub fn lane_origins(run: i64, lane: i64, apid: i64, ptype: i64) -> Query {
     Query::new(
         "SELECT l.source,
-                SUM((SELECT COUNT(*) FROM temp.hop p
+                SUM((SELECT COUNT(*) FROM packets p INDEXED BY packets_lane_receive
                      WHERE p.lane_id = ?1 AND EXISTS (
                        SELECT 1 FROM temp.hop q
                        WHERE q.sum = p.sum AND q.lane_id = l.id

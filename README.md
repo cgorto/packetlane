@@ -155,6 +155,12 @@ Limits of working from counters alone are listed at the top of
   hundred streams each). Set `PACKETLANE_CACHE_MB` to change it: a file
   with more streams than that ingests faster with more, and 2 is enough
   for files of a few dozen.
+- An ingest of a run that more than one source logged also writes
+  temporary files, removed when it ends, of up to about 40% of the size the
+  store will be (750 MB for ten million packets). They go where SQLite
+  puts temporary files: the folder named by `SQLITE_TMPDIR` or `TMPDIR`,
+  else the system's. If that folder is kept in memory, as `/tmp` is on some
+  systems, this is memory: point `SQLITE_TMPDIR` at a disk.
 
 ### Timeline
 

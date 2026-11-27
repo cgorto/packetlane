@@ -259,12 +259,24 @@ fn sources_are_compared_in_two_passes_over_the_packets() {
         .filter(|s| s.ends_with("USING COVERING INDEX hop_sum (sum=? AND lane_id=?)"))
         .count();
     assert_eq!(lookups, 2, "{steps:#?}");
-    // Tracing an interleaved stream asks the same index.
+    // Tracing an interleaved stream reads that lane's packets by lane, and
+    // asks the same index about each.
     let steps = plan(&store.conn, &sql::lane_origins(1, 2, 100, 0));
+    let reads: Vec<&String> = steps
+        .iter()
+        .filter(|s| s.split_whitespace().nth(1) == Some("p"))
+        .collect();
     assert!(
-        steps
-            .iter()
-            .any(|s| s.contains("USING INDEX hop_sum (sum=? AND lane_id=?)")),
+        !reads.is_empty()
+            && reads
+                .iter()
+                .all(|s| *s == "SEARCH p USING INDEX packets_lane_receive (lane_id=?)"),
+        "{steps:#?}"
+    );
+    assert!(
+        steps.iter().any(|s| s.ends_with(
+            "USING COVERING INDEX hop_sum (sum=? AND lane_id=? AND seq=? AND length=?)"
+        )),
         "{steps:#?}"
     );
 }
