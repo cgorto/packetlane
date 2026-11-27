@@ -328,7 +328,7 @@ impl Store {
             }
             tx.commit()?;
             for name in old_segments {
-                segment::remove(&self.segments, &name)?;
+                discard_segment(&self.segments, &name);
             }
             files.sort();
         }
@@ -490,7 +490,7 @@ impl Store {
             // Nothing to store. Keep the removal of an earlier version, if any.
             tx.commit()?;
             if let Some(name) = &old_segment {
-                segment::remove(&self.segments, name)?;
+                discard_segment(&self.segments, name);
             }
             let note = match format {
                 Format::Gzip => "Compressed file that cannot be read, or holds another one",
@@ -588,7 +588,7 @@ impl Store {
         )?;
         if let Some(w) = &written {
             if w.last_packet - w.first_packet + 1 != packets as i64 {
-                segment::remove(&self.segments, &w.name)?;
+                discard_segment(&self.segments, &w.name);
                 return Err("the segment and the stored rows disagree".into());
             }
             let time = |c: usize| w.times[c].map(|(lo, hi, shift)| (lo, hi, i64::from(shift)));
@@ -612,12 +612,12 @@ impl Store {
         }
         if let Err(e) = tx.commit() {
             if let Some(w) = &written {
-                let _ = segment::remove(&self.segments, &w.name);
+                discard_segment(&self.segments, &w.name);
             }
             return Err(e.into());
         }
         if let Some(name) = &old_segment {
-            segment::remove(&self.segments, name)?;
+            discard_segment(&self.segments, name);
         }
         Ok(outcome(
             Status::Ingested,
@@ -627,6 +627,13 @@ impl Store {
             note,
         ))
     }
+}
+
+/// Removes a segment the store does not list. If that fails nothing is
+/// wrong with what was committed, so the ingest goes on; the sweep the next
+/// time the store is opened for writing removes what is left.
+fn discard_segment(folder: &Path, name: &str) {
+    let _ = segment::remove(folder, name);
 }
 
 /// Removes the segment and temporary files the store does not list: left by

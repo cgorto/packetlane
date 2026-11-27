@@ -389,7 +389,7 @@ fn density_timing() {
         times.sort_by(f64::total_cmp);
         (times[3], total)
     };
-    for clock in [Clock::Receive, Clock::Order] {
+    for clock in Clock::ALL {
         let c = clock.packet_column();
         let r = ask(
             &store,
