@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::pure::config::{Config, PacketDef, ResolvedTime, SourceInfo};
+use crate::pure::config::{Config, Dispatch, PacketDef, ResolvedTime, SourceInfo};
 use crate::pure::continuity::{Checker, Report, StreamKey};
 use crate::pure::decode::{DecodeEnd, Notices, Record};
 use crate::pure::finding::FileFinding;
@@ -42,12 +42,11 @@ pub struct Seen<'a> {
 
 /// The checks on one file, in progress.
 pub struct FileCheck<'a> {
-    config: &'a Config,
     time: Option<ResolvedTime>,
     clock_offset_ns: i64,
-    /// False if no definition has limits or kept fields. Most runs have
+    /// `None` if no definition has limits or kept fields. Most runs have
     /// none; then there is no need to look one up for every packet.
-    watched: bool,
+    watched: Option<Dispatch<'a>>,
     continuity: Checker,
     order: OrderChecker,
     limits: LimitChecker<LaneKey>,
@@ -76,13 +75,13 @@ impl<'a> FileCheck<'a> {
     /// the file: its clock correction applies to receive times.
     pub fn new(config: &'a Config, source: &SourceInfo) -> Self {
         Self {
-            config,
             time: config.resolved_time(),
             clock_offset_ns: source.clock_offset_ns,
             watched: config
                 .packets
                 .iter()
-                .any(|d| d.fields.iter().any(|f| f.limits.is_some() || f.keep)),
+                .any(|d| d.fields.iter().any(|f| f.limits.is_some() || f.keep))
+                .then(|| config.dispatch()),
             continuity: Checker::new(),
             order: OrderChecker::new(),
             limits: LimitChecker::default(),
@@ -98,12 +97,10 @@ impl<'a> FileCheck<'a> {
         let index = self.records;
         self.records += 1;
         let row = packet_row(index, record, self.time.as_ref(), self.clock_offset_ns);
-        let def: Option<&'a PacketDef> = match self.watched {
-            true => self
-                .config
-                .packet_for(record.label.as_deref(), row.header.as_ref()),
-            false => None,
-        };
+        let def: Option<&'a PacketDef> = self
+            .watched
+            .as_ref()
+            .and_then(|d| d.packet_for(record.label.as_deref(), row.header.as_ref()));
         if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.limits.is_some())) {
             // The definition's address tells it apart from the others.
             let id = std::ptr::from_ref(def) as usize;

@@ -80,7 +80,7 @@
 //!   labels = { "0" = "IDLE", "1" = "OBSERVE" }
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Deserialize;
 
@@ -487,6 +487,64 @@ pub struct SourceInfo {
     pub clock_offset_ns: i64,
 }
 
+/// Which definition a packet is decoded with, from [`Config::dispatch`].
+pub struct Dispatch<'a> {
+    by_label: HashMap<&'a str, Named<'a>>,
+    /// What [`Config::packet_def`] gives for each stream that has one.
+    by_stream: HashMap<(u16, PacketType), &'a PacketDef>,
+}
+
+/// The definitions that share a label, or an APID and type.
+#[derive(Default)]
+struct Named<'a> {
+    telemetry: Option<&'a PacketDef>,
+    command: Option<&'a PacketDef>,
+    first: Option<&'a PacketDef>,
+    unlabelled: Option<&'a PacketDef>,
+    count: usize,
+}
+
+impl<'a> Named<'a> {
+    /// Takes the next definition, in the order of the configuration.
+    fn add(&mut self, def: &'a PacketDef) {
+        let first_of_type = match def.kind.packet_type() {
+            PacketType::Telemetry => &mut self.telemetry,
+            PacketType::Command => &mut self.command,
+        };
+        first_of_type.get_or_insert(def);
+        self.first.get_or_insert(def);
+        self.count += 1;
+    }
+
+    fn only(&self) -> Option<&'a PacketDef> {
+        self.first.filter(|_| self.count == 1)
+    }
+}
+
+impl<'a> Dispatch<'a> {
+    /// The same as [`Config::packet_for`].
+    pub fn packet_for(
+        &self,
+        label: Option<&str>,
+        header: Option<&PrimaryHeader>,
+    ) -> Option<&'a PacketDef> {
+        let labelled = label
+            .and_then(|l| self.by_label.get(l))
+            .and_then(|named| match header {
+                Some(h) => match h.packet_type {
+                    PacketType::Telemetry => named.telemetry,
+                    PacketType::Command => named.command,
+                },
+                None => named.only(),
+            });
+        labelled.or_else(|| {
+            let h = header?;
+            let def = *self.by_stream.get(&(h.apid, h.packet_type))?;
+            (label.is_none() || def.label.is_none()).then_some(def)
+        })
+    }
+}
+
 impl Config {
     /// Parses and validates a configuration file. The error is a sentence
     /// that says which entry is wrong.
@@ -628,6 +686,33 @@ impl Config {
             let def = self.packet_def(header?.apid, header?.packet_type)?;
             (label.is_none() || def.label.is_none()).then_some(def)
         })
+    }
+
+    /// What [`Config::packet_for`] answers, worked out ahead for every name
+    /// and stream, so that asking for each packet of a file is cheap.
+    pub fn dispatch(&self) -> Dispatch<'_> {
+        let mut by_label: HashMap<&str, Named<'_>> = HashMap::new();
+        let mut streams: HashMap<(u16, PacketType), Named<'_>> = HashMap::new();
+        for def in &self.packets {
+            if let Some(label) = &def.label {
+                by_label.entry(label).or_default().add(def);
+            }
+            if let Some(apid) = def.apid {
+                let stream = streams.entry((apid, def.kind.packet_type())).or_default();
+                stream.add(def);
+                if def.label.is_none() {
+                    stream.unlabelled.get_or_insert(def);
+                }
+            }
+        }
+        let by_stream = streams
+            .into_iter()
+            .filter_map(|(key, s)| Some((key, s.unlabelled.or(s.only())?)))
+            .collect();
+        Dispatch {
+            by_label,
+            by_stream,
+        }
     }
 
     /// Source name and clock corrections for a file, from its path within
@@ -1313,6 +1398,70 @@ name = "Ping reply"
             Some("Ping reply")
         );
         assert_eq!(name(Some("INST PING"), None), None);
+    }
+
+    /// Every name and header the definitions could meet, and some they do
+    /// not know: the dispatch worked out ahead must answer as the search does.
+    fn dispatch_agrees(config: &Config) {
+        let mut labels: Vec<Option<&str>> = vec![None, Some("NOBODY KNOWS")];
+        labels.extend(config.packets.iter().map(|d| d.label.as_deref()));
+        let mut headers = vec![None];
+        for apid in config
+            .packets
+            .iter()
+            .filter_map(|d| d.apid)
+            .chain([0, 2047])
+        {
+            headers.push(Some(header(apid, false)));
+            headers.push(Some(header(apid, true)));
+        }
+        let dispatch = config.dispatch();
+        let name = |d: Option<&PacketDef>| d.map(|d| d.name.clone());
+        for label in &labels {
+            for h in &headers {
+                assert_eq!(
+                    name(dispatch.packet_for(*label, h.as_ref())),
+                    name(config.packet_for(*label, h.as_ref())),
+                    "{label:?} {h:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_answers_as_the_search_does() {
+        dispatch_agrees(&Config::parse(TWO_ON_ONE_APID).unwrap());
+        dispatch_agrees(&Config::default());
+        // Definitions validation would refuse, so that even those agree:
+        // a label twice for one type, an APID twice with no label, several
+        // labels and no label on one APID, a label on two APIDs.
+        let def = |apid: Option<u16>, label: Option<&str>, kind: Kind, name: &str| PacketDef {
+            apid,
+            label: label.map(str::to_string),
+            kind,
+            name: name.to_string(),
+            description: String::new(),
+            fields: Vec::new(),
+        };
+        let config = Config {
+            packets: vec![
+                def(Some(5), Some("A X"), Kind::Tm, "a1"),
+                def(Some(5), Some("A X"), Kind::Tm, "a2"),
+                def(Some(5), Some("B X"), Kind::Tc, "b"),
+                def(Some(5), None, Kind::Tm, "plain5"),
+                def(Some(5), None, Kind::Tm, "plain5 again"),
+                def(Some(6), None, Kind::Tc, "plain6"),
+                def(Some(6), Some("A X"), Kind::Tc, "a on 6"),
+                def(Some(7), Some("C X"), Kind::Tm, "c"),
+                def(None, Some("D X"), Kind::Tc, "d"),
+                def(None, Some("D X"), Kind::Tc, "d again"),
+                def(None, Some("E X"), Kind::Tm, "e"),
+                def(Some(9), Some("F X"), Kind::Tm, "f1"),
+                def(Some(9), Some("G X"), Kind::Tm, "g"),
+            ],
+            ..Config::default()
+        };
+        dispatch_agrees(&config);
     }
 
     #[test]
