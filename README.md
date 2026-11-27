@@ -150,8 +150,17 @@ Limits of working from counters alone are listed at the top of
   reads. The connection they use cannot write.
 - A store made by an earlier build with a different layout is refused, and
   says so: delete it and ingest again. Nothing in it is not in the logs.
-- Writing uses up to about 80 MB of memory whatever the size of the run,
-  most of it the store's page cache.
+- Writing uses about 35 MB of memory whatever the size of the run, most of
+  it the store's page cache (8 MB, which is enough for files of several
+  hundred streams each). Set `PACKETLANE_CACHE_MB` to change it: a file
+  with more streams than that ingests faster with more, and 2 is enough
+  for files of a few dozen.
+- An ingest of a run that more than one source logged also writes
+  temporary files, removed when it ends, of up to about a quarter of the
+  size the store will be (460 MB for ten million packets). They go where SQLite
+  puts temporary files: the folder named by `SQLITE_TMPDIR` or `TMPDIR`,
+  else the system's. If that folder is kept in memory, as `/tmp` is on some
+  systems, this is memory: point `SQLITE_TMPDIR` at a disk.
 
 ### Timeline
 
@@ -342,6 +351,11 @@ been built here.
 - **Compare two runs** of the same scenario on a shared time axis.
 - **Live tail** of a log that is still being written, and **live ingest**
   from a TCP or UDP port a simulator sends telemetry on.
+- **A watch panel**: choose a packet (or APID) and see its fields as a
+  table that follows the cursor or the newest packet, each value coloured
+  by how it changed from the packet before: green for up, red for down,
+  stronger for a bigger change as a percentage of the value (with another
+  measure for values at or near zero). Most useful with live ingest.
 - **Problem report export** to attach to a ticket.
 - Other channel codes: convolutional, turbo and LDPC (a file must hold hard
   decisions that are already frame-aligned; Reed-Solomon and BCH are the only

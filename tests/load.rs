@@ -21,7 +21,7 @@
 //! - `LOAD_BUDGET_MS`: fail if the median answer to any request the page
 //!   makes while panning or zooming takes longer. Default: no limit, the
 //!   times are only printed, because they depend on the machine.
-//! - `LOAD_MAX_RSS_MB`: fail if ingest uses more memory. Default 128: what
+//! - `LOAD_MAX_RSS_MB`: fail if ingest uses more memory. Default 64: what
 //!   it uses is set by the store's page cache, not by the size of the run.
 //!
 //! To try a change, keep it short: `LOAD_PACKETS=300000` takes under a
@@ -94,6 +94,8 @@ fn run(args: &[&str]) -> (Duration, u64, String) {
     let started = Instant::now();
     let mut child = Command::new(BIN)
         .args(args)
+        // Ingest then says how long each of its parts took.
+        .env("PACKETLANE_TIMING", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
@@ -334,7 +336,7 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
     let (took, peak_mb, out) = run(&["ingest", "--db", db_text, run_text]);
     println!("\n== {name} ==");
     println!("  {}", out.lines().last().unwrap_or(""));
-    let max_rss = setting("LOAD_MAX_RSS_MB").unwrap_or(128);
+    let max_rss = setting("LOAD_MAX_RSS_MB").unwrap_or(64);
     assert!(
         peak_mb <= max_rss,
         "ingest held {peak_mb} MB, more than {max_rss} MB"
@@ -537,6 +539,14 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
     table.time("search of text logs", false, 3, || {
         sized(client.get(&format!("/api/search?run={run_id}&origin={origin}&q=a")))
     });
+    let largest_values = format!(
+        "SELECT * FROM value_view WHERE field = '{}' ORDER BY value DESC LIMIT 100",
+        series
+            .iter()
+            .find(|s| s["kind"] == "value")
+            .and_then(|s| s["field"].as_str())
+            .unwrap_or("none")
+    );
     for (what, sql) in [
         ("count packets", "SELECT COUNT(*) FROM packets"),
         (
@@ -548,6 +558,9 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
             "SELECT * FROM packet_view ORDER BY receive_time DESC LIMIT 100",
         ),
         ("problems", "SELECT * FROM finding_view LIMIT 500"),
+        // What the query builder's Values table asks: this is what the
+        // index of kept values by field and number is kept for.
+        ("largest values of a field", largest_values.as_str()),
     ] {
         table.time(&format!("query: {what}"), false, 3, || {
             sized(client.query(sql))
@@ -581,6 +594,10 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
     // Left beside the store for a later run to compare with.
     let mut times = serde_json::Map::new();
     times.insert("ingest, seconds".to_string(), secs.into());
+    times.insert(
+        "ingest of another run, seconds".to_string(),
+        ingest_took.as_secs_f64().into(),
+    );
     times.insert(
         "one view during another ingest".to_string(),
         during_median.into(),

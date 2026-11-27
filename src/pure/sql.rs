@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde::ser::Serializer;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS files (
   packets INTEGER NOT NULL DEFAULT 0,
   entries INTEGER NOT NULL DEFAULT 0,
   note TEXT NOT NULL DEFAULT '',
+  first_packet INTEGER,
+  last_packet INTEGER,
   UNIQUE (run_id, rel)
 );
 CREATE TABLE IF NOT EXISTS lanes (
@@ -64,7 +66,6 @@ CREATE TABLE IF NOT EXISTS packets (
 );
 CREATE INDEX IF NOT EXISTS packets_receive ON packets (receive_ns, lane_id);
 CREATE INDEX IF NOT EXISTS packets_packet ON packets (packet_ns, lane_id);
-CREATE INDEX IF NOT EXISTS packets_sum ON packets (sum, lane_id);
 CREATE INDEX IF NOT EXISTS packets_lane_receive ON packets (lane_id, receive_ns, packet_ns);
 CREATE INDEX IF NOT EXISTS packets_lane_packet ON packets (lane_id, packet_ns, receive_ns);
 CREATE TABLE IF NOT EXISTS logs (
@@ -120,7 +121,6 @@ CREATE TABLE IF NOT EXISTS field_values (
   text TEXT
 );
 CREATE INDEX IF NOT EXISTS field_values_field ON field_values (field, num);
-CREATE INDEX IF NOT EXISTS field_values_file ON field_values (file_id);
 CREATE INDEX IF NOT EXISTS field_values_packet ON field_values (packet_id);
 CREATE TABLE IF NOT EXISTS file_series (
   file_id INTEGER NOT NULL REFERENCES files(id),
@@ -630,13 +630,34 @@ pub const RUN_FILE_PATHS: &str = "SELECT path, rel FROM files WHERE run_id = ? O
 /// Statements that empty a run, each taking the run id. Used when its
 /// configuration changes, because names, clocks and time formats are
 /// applied as files are read.
-pub const RESET_RUN: [&str; 10] = [
-    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
-    "DELETE FROM field_values WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
+/// The ids of a file's packets, as `BETWEEN` wants them. A file's packets
+/// are numbered in one unbroken run as it is read, and the file's row keeps
+/// the first and last (`first_packet`, `last_packet`; null if it held
+/// none). What was read from a file is found by that range, which the
+/// tables are already in order of, and so needs no index by file.
+const FILE_PACKETS: &str = "(SELECT first_packet FROM files WHERE id = ?1)
+                                AND (SELECT last_packet FROM files WHERE id = ?1)";
+
+/// Removes the packets of one file and their kept values. Takes the file
+/// id; the file's row must still be there.
+pub fn delete_file_packets() -> [String; 2] {
+    [
+        format!("DELETE FROM field_values WHERE packet_id BETWEEN {FILE_PACKETS}"),
+        format!("DELETE FROM packets WHERE id BETWEEN {FILE_PACKETS}"),
+    ]
+}
+
+/// The files of a run. Columns: id.
+pub const RUN_FILE_IDS: &str = "SELECT id FROM files WHERE run_id = ?";
+
+/// Removes everything read for a run but the run itself, each taking the
+/// run id. The packets and kept values go first, file by file, with
+/// [`delete_file_packets`].
+pub const RESET_RUN: [&str; 8] = [
     "DELETE FROM file_series WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
-    "DELETE FROM packets WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM logs WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM findings WHERE run_id = ?",
+    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
     "DELETE FROM coarse WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
     "DELETE FROM coarse_meta WHERE run_id = ?",
     "DELETE FROM lanes WHERE run_id = ?",
@@ -648,11 +669,10 @@ pub const RUN_ID: &str = "SELECT id FROM runs WHERE root = ?";
 /// A file of a run by its path within the run. Columns: id, size, checksum.
 pub const FILE_BY_REL: &str = "SELECT id, size, checksum FROM files WHERE run_id = ? AND rel = ?";
 /// Statements that remove one file and what was read from it, each taking
-/// the file id.
-pub const DELETE_FILE: [&str; 7] = [
-    "DELETE FROM field_values WHERE file_id = ?",
+/// the file id. Its packets and kept values go first, with
+/// [`delete_file_packets`].
+pub const DELETE_FILE: [&str; 5] = [
     "DELETE FROM file_series WHERE file_id = ?",
-    "DELETE FROM packets WHERE file_id = ?",
     "DELETE FROM logs WHERE file_id = ?",
     "DELETE FROM findings WHERE file_id = ?",
     "DELETE FROM lanes WHERE kind = 'log' AND file_id = ?",
@@ -661,7 +681,10 @@ pub const DELETE_FILE: [&str; 7] = [
 pub const INSERT_FILE: &str =
     "INSERT INTO files (run_id, path, rel, source, format, size, checksum)
      VALUES (?, ?, ?, ?, ?, ?, ?)";
-pub const FINISH_FILE: &str = "UPDATE files SET packets = ?, entries = ?, note = ? WHERE id = ?";
+/// Takes packets, entries, note, first packet id, last packet id, file id.
+pub const FINISH_FILE: &str = "UPDATE files
+     SET packets = ?, entries = ?, note = ?, first_packet = ?, last_packet = ?
+     WHERE id = ?";
 pub const INSERT_LANE: &str =
     "INSERT OR IGNORE INTO lanes (run_id, source, kind, apid, ptype, file_id)
      VALUES (?, ?, ?, ?, ?, ?)";
@@ -686,8 +709,8 @@ pub const DELETE_CROSS_FINDINGS: &str = "DELETE FROM findings WHERE run_id = ? A
 /// Sets each packet lane's count and time ranges from its packets, in two
 /// statements run in this order: the first clears them, so that a lane
 /// whose packets are all gone reads as empty; the second fills them in from
-/// one pass over the packets. Asking lane by lane instead reads every
-/// packet once per lane.
+/// one pass over the run's packets, lane by lane in the lane-first index,
+/// which holds everything asked for. No other run's packets are read.
 pub const REFRESH_PACKET_LANES: [&str; 2] = [
     "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count,
@@ -702,8 +725,10 @@ pub const REFRESH_PACKET_LANES: [&str; 2] = [
                   MIN(receive_ns) AS r_min, MAX(receive_ns) AS r_max, COUNT(receive_ns) AS r_n,
                   MIN(packet_ns) AS p_min, MAX(packet_ns) AS p_max, COUNT(packet_ns) AS p_n,
                   MIN(id) AS o_min, MAX(id) AS o_max
-           FROM packets GROUP BY lane_id) AS s
-     WHERE lanes.id = s.lane_id AND lanes.run_id = ? AND lanes.kind != 'log'",
+           FROM packets INDEXED BY packets_lane_receive
+           WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?1)
+           GROUP BY lane_id) AS s
+     WHERE lanes.id = s.lane_id AND lanes.run_id = ?1 AND lanes.kind != 'log'",
 ];
 pub const REFRESH_LOG_LANES: &str = "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count, packet_min, packet_max, packet_count) =
@@ -728,9 +753,57 @@ pub fn lane_pairs(run: i64) -> Query {
     )
 }
 
+// Whether a packet of one lane is also in another is asked by the checksum
+// of its bytes. An index of every packet by checksum would answer that, but
+// checksums come in no order, so keeping one up to date touches a different
+// page for every packet read: it was most of the time an ingest took, and
+// what made ingest need a large page cache. Instead, once the files are
+// read, the packets of the streams that more than one source logged are
+// copied to a temporary table, sorted by checksum as they are written. The
+// comparisons below read that table, and it is dropped when they are done.
+
+/// Drops the temporary table of [`hop_stage`], if a failed ingest left one.
+pub const HOP_UNSTAGE: &str = "DROP TABLE IF EXISTS temp.hop";
+
+/// The statements that make `temp.hop`: the packets of a run's lanes that
+/// have a counterpart from another source, kept in order of checksum and
+/// lane. The run's packets are found by its files' id ranges, so no other
+/// run is read.
+///
+/// The table is its own index (`WITHOUT ROWID`) and is filled in its own
+/// order, from one sort: nothing is written twice, and reading it from end
+/// to end asks about each checksum beside the last. The sequence count and
+/// length are there for the tracing of interleaved streams, which matches
+/// on them too.
+pub fn hop_stage(run: i64) -> Vec<Query> {
+    vec![
+        Query::new(
+            "CREATE TEMP TABLE hop (
+               sum INTEGER NOT NULL, lane_id INTEGER NOT NULL, id INTEGER NOT NULL,
+               seq INTEGER, length INTEGER,
+               PRIMARY KEY (sum, lane_id, id)
+             ) WITHOUT ROWID",
+            vec![],
+        ),
+        Query::new(
+            "INSERT INTO temp.hop (sum, lane_id, id, seq, length)
+             SELECT p.sum, p.lane_id, p.id, p.seq, p.length
+             FROM files f CROSS JOIN packets p NOT INDEXED
+               ON p.id BETWEEN f.first_packet AND f.last_packet
+             WHERE f.run_id = ?1 AND p.lane_id IN (
+               SELECT a.id FROM lanes a JOIN lanes b
+                 ON b.run_id = a.run_id AND b.kind = 'packet' AND b.apid = a.apid
+                AND b.ptype = a.ptype AND b.source != a.source
+               WHERE a.run_id = ?1 AND a.kind = 'packet')
+             ORDER BY p.sum, p.lane_id, p.id",
+            vec![run.into()],
+        ),
+    ]
+}
+
 /// How every lane of a run compares with each lane that carries the same
 /// stream from another source, matching packets by the checksum of their
-/// bytes, which the `(sum, lane_id)` index answers without a row read.
+/// bytes. Reads `temp.hop`, which [`hop_stage`] must have made.
 ///
 /// One row for each pair (`a`, `b`) where `a` has packets that `b` lacks
 /// between the first and last packet they share. Columns: lane `a`, lane
@@ -740,8 +813,7 @@ pub fn lane_pairs(run: i64) -> Query {
 /// The packets are read twice in all, however many pairs there are: once
 /// to find what each pair shares and once to count what is missing.
 /// `CROSS JOIN` keeps SQLite to that order. Asking pair by pair instead
-/// reads every packet once per pair, which for hundreds of streams from
-/// several sources is most of the time an ingest takes.
+/// reads every packet once per pair.
 pub fn hop_compare_all(run: i64) -> Query {
     Query::new(
         "WITH pair AS MATERIALIZED (
@@ -752,14 +824,14 @@ pub fn hop_compare_all(run: i64) -> Query {
            WHERE a.run_id = ?1 AND a.kind = 'packet'),
          shared AS MATERIALIZED (
            SELECT pair.a AS a, pair.b AS b, COUNT(*) AS n, MIN(p.id) AS lo, MAX(p.id) AS hi
-           FROM packets p CROSS JOIN pair ON pair.a = p.lane_id
-           WHERE EXISTS (SELECT 1 FROM packets q
+           FROM temp.hop p CROSS JOIN pair ON pair.a = p.lane_id
+           WHERE EXISTS (SELECT 1 FROM temp.hop q
                          WHERE q.sum = p.sum AND q.lane_id = pair.b)
            GROUP BY pair.a, pair.b)
          SELECT shared.a, shared.b, shared.n, COUNT(*), MIN(p.id)
-         FROM packets p CROSS JOIN shared ON shared.a = p.lane_id
+         FROM temp.hop p CROSS JOIN shared ON shared.a = p.lane_id
          WHERE p.id BETWEEN shared.lo AND shared.hi
-           AND NOT EXISTS (SELECT 1 FROM packets q
+           AND NOT EXISTS (SELECT 1 FROM temp.hop q
                            WHERE q.sum = p.sum AND q.lane_id = shared.b)
          GROUP BY shared.a, shared.b",
         vec![run.into()],
@@ -778,14 +850,16 @@ pub fn lanes_with_finding(run: i64, kind: &str) -> Query {
     )
 }
 
-/// Which other sources hold copies of a lane's packets.
+/// Which other sources hold copies of a lane's packets. The lane's own
+/// packets are read from the store, by lane, and each is looked for in
+/// `temp.hop`, which [`hop_stage`] must have made.
 /// Columns: source, number of the lane's packets found there.
 pub fn lane_origins(run: i64, lane: i64, apid: i64, ptype: i64) -> Query {
     Query::new(
         "SELECT l.source,
-                SUM((SELECT COUNT(*) FROM packets p
+                SUM((SELECT COUNT(*) FROM packets p INDEXED BY packets_lane_receive
                      WHERE p.lane_id = ?1 AND EXISTS (
-                       SELECT 1 FROM packets q
+                       SELECT 1 FROM temp.hop q
                        WHERE q.sum = p.sum AND q.lane_id = l.id
                          AND q.seq = p.seq AND q.length = p.length))) AS n
          FROM lanes l

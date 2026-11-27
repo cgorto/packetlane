@@ -113,8 +113,53 @@ fn collect(stmt: &mut rusqlite::Statement<'_>, params: &[Param], limit: usize) -
     })
 }
 
-/// See where it is set, in [`Store::open`].
-const WRITE_CACHE_KIB: i64 = 32 * 1024;
+/// Says how long each part of an ingest took, on standard error, when the
+/// environment variable `PACKETLANE_TIMING` is set. For measuring; the
+/// load tests set it.
+struct Phases {
+    on: bool,
+    last: Instant,
+}
+
+impl Phases {
+    fn start() -> Phases {
+        Phases {
+            on: std::env::var_os("PACKETLANE_TIMING").is_some(),
+            last: Instant::now(),
+        }
+    }
+
+    /// The part that has just ended.
+    fn mark(&mut self, name: &str) {
+        self.say(name, self.last.elapsed());
+        self.last = Instant::now();
+    }
+
+    fn say(&self, name: &str, took: Duration) {
+        if self.on {
+            eprintln!("  phase {name}: {:.2} s", took.as_secs_f64());
+        }
+    }
+}
+
+/// The page cache to write with, in KiB. A file's packets are written to
+/// the end of each lane's part of the two lane-first indexes, so what must
+/// stay in memory is a couple of pages for every lane the file holds: 4 MB
+/// was enough for a file of 300 lanes, measured, and this leaves room for
+/// about twice that. With less, each packet pushes out a page another lane
+/// is about to need. With more, nothing is gained. Peak memory while
+/// writing was 16, 22, 35, 61 and 81 MB at 2, 4, 8, 16 and 32 MB of cache.
+const WRITE_CACHE_KIB: i64 = 8 * 1024;
+
+/// The page cache to write with: [`WRITE_CACHE_KIB`], or as many megabytes
+/// as the environment variable `PACKETLANE_CACHE_MB` says (1 to 4096).
+fn write_cache_kib() -> i64 {
+    std::env::var("PACKETLANE_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|mb| (1..=4096).contains(mb))
+        .map_or(WRITE_CACHE_KIB, |mb| mb * 1024)
+}
 
 fn run_query(conn: &Connection, q: &Query, limit: usize) -> Result<Table> {
     let mut stmt = conn.prepare_cached(&q.sql)?;
@@ -127,11 +172,10 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // Pages of the store held in memory while writing, in KiB (negative
-        // means a size, not a page count). SQLite's own 2 MB is less than
-        // one index of a large run, and a run with many lanes writes all
-        // over its lane-first indexes.
-        conn.pragma_update(None, "cache_size", -WRITE_CACHE_KIB)?;
+        // Sorting and temporary tables go to a file, not to memory.
+        conn.pragma_update(None, "temp_store", "FILE")?;
+        // Negative means a size in KiB, not a count of pages.
+        conn.pragma_update(None, "cache_size", -write_cache_kib())?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 0 && version != sql::SCHEMA_VERSION {
             return Err(format!(
@@ -219,6 +263,15 @@ impl Store {
                     }
                 }
             }
+            let file_ids: Vec<i64> = tx
+                .prepare(sql::RUN_FILE_IDS)?
+                .query_map(params![run_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for file_id in file_ids {
+                for statement in sql::delete_file_packets() {
+                    tx.execute(&statement, params![file_id])?;
+                }
+            }
             for statement in sql::RESET_RUN {
                 tx.execute(statement, params![run_id])?;
             }
@@ -233,6 +286,7 @@ impl Store {
             .conn
             .query_row(sql::RUN_ID, params![root_text], |r| r.get(0))?;
 
+        let mut phases = Phases::start();
         let mut outcomes = Vec::with_capacity(files.len());
         let mut changed = false;
         for (path, rel) in files {
@@ -252,12 +306,15 @@ impl Store {
             outcomes.push(outcome);
         }
 
+        phases.mark("reading files");
         if changed {
             let tx = self.conn.transaction()?;
             for statement in sql::REFRESH_PACKET_LANES {
                 tx.execute(statement, params![run_id])?;
             }
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
+            phases.mark("lane counts");
+            let mut series_took = Duration::ZERO;
             tx.execute(sql::CLEAR_COARSE, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_META, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_SERIES, params![run_id])?;
@@ -277,17 +334,25 @@ impl Store {
                             width,
                             sql::SERIES_MIN_PACKETS,
                         );
-                        for q in sql::build_coarse(run_id, clock, min, max)
-                            .iter()
-                            .chain(&series)
-                        {
+                        for q in sql::build_coarse(run_id, clock, min, max) {
                             tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
                         }
+                        let started = Instant::now();
+                        for q in series {
+                            tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
+                        }
+                        series_took += started.elapsed();
                     }
                 }
             }
+            phases.say("series buckets", series_took);
+            phases.say(
+                "density buckets",
+                phases.last.elapsed().saturating_sub(series_took),
+            );
+            phases.last = Instant::now();
             tx.execute(sql::DELETE_CROSS_FINDINGS, params![run_id])?;
-            for finding in cross_findings(&tx, run_id)? {
+            for finding in cross_findings(&tx, run_id, &mut phases)? {
                 tx.execute(
                     sql::INSERT_FINDING,
                     params![
@@ -302,6 +367,7 @@ impl Store {
                 )?;
             }
             tx.commit()?;
+            phases.mark("writing it down");
         }
 
         let problems: i64 = self.conn.query_row(
@@ -351,6 +417,9 @@ impl Store {
             if (old_size, old_checksum) == (size, checksum) {
                 return Ok(outcome(Status::AlreadyIngested, "", 0, 0, String::new()));
             }
+            for statement in sql::delete_file_packets() {
+                tx.execute(&statement, params![file_id])?;
+            }
             for statement in sql::DELETE_FILE {
                 tx.execute(statement, params![file_id])?;
             }
@@ -386,11 +455,21 @@ impl Store {
         )?;
         let file_id = tx.last_insert_rowid();
         let mut lanes = Lanes::new(run_id, &source.name);
+        // The file's packets are numbered from here, with no gaps.
+        let first_packet: i64 = tx.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
 
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
                 let (packets, note) = ingest_packets(
-                    &tx, &mut file, decoder, config, file_id, run_id, &source, &mut lanes,
+                    &tx,
+                    &mut file,
+                    decoder,
+                    config,
+                    file_id,
+                    run_id,
+                    &source,
+                    &mut lanes,
+                    first_packet,
                 )?;
                 (packets, 0, note)
             }
@@ -430,7 +509,14 @@ impl Store {
 
         tx.execute(
             sql::FINISH_FILE,
-            params![packets as i64, entries as i64, note, file_id],
+            params![
+                packets as i64,
+                entries as i64,
+                note,
+                (packets > 0).then_some(first_packet),
+                (packets > 0).then(|| first_packet + packets as i64 - 1),
+                file_id
+            ],
         )?;
         tx.commit()?;
         Ok(outcome(
@@ -490,8 +576,9 @@ fn ingest_packets(
     run_id: i64,
     source: &SourceInfo,
     lanes: &mut Lanes<'_>,
+    // The id of the file's first packet; the rest follow with no gaps.
+    base_id: i64,
 ) -> Result<(u64, String)> {
-    let base_id: i64 = conn.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut check = FileCheck::new(config, source);
@@ -650,18 +737,26 @@ fn ingest_text(
     Ok(count)
 }
 
-fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
+fn cross_findings(
+    conn: &Connection,
+    run_id: i64,
+    phases: &mut Phases,
+) -> Result<Vec<CrossFinding>> {
     let mut out = Vec::new();
 
     // Every pair is compared in one query; the findings are then made in
     // the order the pairs are listed, which is the order they are stored in.
     // A run from one source has no pairs, and its packets are not read.
     let pairs = run_query(conn, &sql::lane_pairs(run_id), usize::MAX)?;
-    let compared = if pairs.rows.is_empty() {
-        Vec::new()
-    } else {
-        run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?.rows
-    };
+    if pairs.rows.is_empty() {
+        return Ok(out);
+    }
+    conn.execute_batch(sql::HOP_UNSTAGE)?;
+    for q in sql::hop_stage(run_id) {
+        conn.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
+    }
+    phases.mark("indexing packets by content");
+    let compared = run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?.rows;
     let compared: HashMap<(i64, i64), &Vec<Cell>> = compared
         .iter()
         .filter_map(|r| Some(((r[0].int()?, r[1].int()?), r)))
@@ -686,6 +781,7 @@ fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
         }
     }
 
+    phases.mark("comparing sources");
     let mixed = run_query(
         conn,
         &sql::lanes_with_finding(run_id, Kind::Interleaved.name()),
@@ -708,5 +804,7 @@ fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
             .collect();
         out.extend(origin_finding(lane, row[4].int(), &list));
     }
+    phases.mark("tracing interleaved streams");
+    conn.execute_batch(sql::HOP_UNSTAGE)?;
     Ok(out)
 }
