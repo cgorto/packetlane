@@ -15,7 +15,7 @@ use crate::pure::config::{Config, Dispatch, PacketDef, ResolvedTime, SourceInfo}
 use crate::pure::continuity::{Checker, Report, StreamKey};
 use crate::pure::decode::{DecodeEnd, Notices, Record};
 use crate::pure::finding::FileFinding;
-use crate::pure::format::kept_values;
+use crate::pure::format::read_field;
 use crate::pure::ingest::{LaneKey, PacketRow, file_findings, packet_row};
 use crate::pure::limits::{LimitChecker, LimitFinding};
 use crate::pure::order::{OrderChecker, OrderFinding};
@@ -46,13 +46,54 @@ pub struct FileCheck<'a> {
     clock_offset_ns: i64,
     /// `None` if no definition has limits or kept fields. Most runs have
     /// none; then there is no need to look one up for every packet.
-    watched: Option<Dispatch<'a>>,
+    watched: Option<Watched<'a>>,
     continuity: Checker,
     order: OrderChecker,
     limits: LimitChecker<LaneKey>,
     records: u64,
     packets: u64,
     wrong_length: BTreeMap<StreamKey, u64>,
+}
+
+/// The definitions, and what to read from packets of each.
+struct Watched<'a> {
+    dispatch: Dispatch<'a>,
+    packets: &'a [PacketDef],
+    /// By place in `packets`: the fields that are kept or have limits,
+    /// as (place in the definition, kept, has limits).
+    fields: Vec<Vec<(usize, bool, bool)>>,
+    /// By place in `packets`: how many fields are kept.
+    kept: Vec<usize>,
+}
+
+impl<'a> Watched<'a> {
+    fn new(config: &'a Config) -> Option<Self> {
+        let fields: Vec<Vec<(usize, bool, bool)>> = config
+            .packets
+            .iter()
+            .map(|d| {
+                d.fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f.keep || f.limits.is_some())
+                    .map(|(i, f)| (i, f.keep, f.limits.is_some()))
+                    .collect()
+            })
+            .collect();
+        if fields.iter().all(Vec::is_empty) {
+            return None;
+        }
+        let kept = fields
+            .iter()
+            .map(|f| f.iter().filter(|(_, keep, _)| *keep).count())
+            .collect();
+        Some(Self {
+            dispatch: config.dispatch(),
+            packets: &config.packets,
+            fields,
+            kept,
+        })
+    }
 }
 
 /// What was found in one file, once all of it has been seen.
@@ -77,11 +118,7 @@ impl<'a> FileCheck<'a> {
         Self {
             time: config.resolved_time(),
             clock_offset_ns: source.clock_offset_ns,
-            watched: config
-                .packets
-                .iter()
-                .any(|d| d.fields.iter().any(|f| f.limits.is_some() || f.keep))
-                .then(|| config.dispatch()),
+            watched: Watched::new(config),
             continuity: Checker::new(),
             order: OrderChecker::new(),
             limits: LimitChecker::default(),
@@ -97,15 +134,30 @@ impl<'a> FileCheck<'a> {
         let index = self.records;
         self.records += 1;
         let row = packet_row(index, record, self.time.as_ref(), self.clock_offset_ns);
-        let def: Option<&'a PacketDef> = self
-            .watched
-            .as_ref()
-            .and_then(|d| d.packet_for(record.label.as_deref(), row.header.as_ref()));
-        if let Some(def) = def.filter(|d| d.fields.iter().any(|f| f.limits.is_some())) {
-            // The definition's address tells it apart from the others.
-            let id = std::ptr::from_ref(def) as usize;
-            self.limits
-                .observe(index, id, def, &record.payload, &row.lane());
+        let mut values = Vec::new();
+        if let Some(w) = &self.watched
+            && let Some(d) = w
+                .dispatch
+                .index_for(record.label.as_deref(), row.header.as_ref())
+        {
+            let def: &'a PacketDef = &w.packets[d];
+            let lane = row.lane();
+            values.reserve_exact(w.kept[d]);
+            for &(i, keep, limited) in &w.fields[d] {
+                let field = &def.fields[i];
+                let reading = read_field(field, &record.payload, keep);
+                if limited && let Some(value) = reading.num {
+                    self.limits.observe_value(index, d, def, i, value, &lane);
+                }
+                if let Some(text) = reading.kept {
+                    values.push(KeptValue {
+                        packet: &def.name,
+                        field: &field.name,
+                        num: reading.num,
+                        text,
+                    });
+                }
+            }
         }
         if let Some(header) = &row.header {
             self.packets += 1;
@@ -119,18 +171,6 @@ impl<'a> FileCheck<'a> {
                 *self.wrong_length.entry(key).or_default() += 1;
             }
         }
-        let values = match def.filter(|d| d.fields.iter().any(|f| f.keep)) {
-            Some(def) => kept_values(def, &record.payload)
-                .into_iter()
-                .map(|(field, num, text)| KeptValue {
-                    packet: &def.name,
-                    field,
-                    num,
-                    text,
-                })
-                .collect(),
-            None => Vec::new(),
-        };
         Seen { row, values }
     }
 

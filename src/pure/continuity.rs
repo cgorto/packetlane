@@ -26,7 +26,6 @@
 //! Feed one `Checker` per source file. Spotting one APID arriving from two
 //! different files is a query over the store, not this module's job.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::pure::ccsds::{IDLE_APID, PacketType, PrimaryHeader, SEQ_MODULUS};
@@ -54,6 +53,69 @@ const MAX_LISTED: u64 = 20;
 pub struct StreamKey {
     pub apid: u16,
     pub packet_type: PacketType,
+}
+
+/// Something kept per stream: found without a search for every packet,
+/// and handed back at the end in stream order, as a `BTreeMap` would.
+#[derive(Debug)]
+pub struct StreamTable<V> {
+    /// By APID and type, the place in `entries` plus one; 0 for none.
+    /// Made on first use.
+    slots: Vec<u32>,
+    entries: Vec<(StreamKey, V)>,
+}
+
+impl<V> Default for StreamTable<V> {
+    fn default() -> Self {
+        Self {
+            slots: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<V> StreamTable<V> {
+    /// Room for every 11-bit APID of both types.
+    const SLOTS: usize = 2 << 11;
+
+    pub fn get_or_insert_with(&mut self, key: StreamKey, new: impl FnOnce() -> V) -> &mut V {
+        let slot = (key.apid <= 0x7FF).then(|| {
+            let ptype = match key.packet_type {
+                PacketType::Telemetry => 0,
+                PacketType::Command => 1,
+            };
+            usize::from(key.apid) * 2 + ptype
+        });
+        let found = match slot {
+            Some(slot) => self.slots.get(slot).and_then(|&n| n.checked_sub(1)),
+            // Not from a header; a search will do.
+            None => self
+                .entries
+                .iter()
+                .position(|(k, _)| *k == key)
+                .map(|i| i as u32),
+        };
+        let i = match found {
+            Some(i) => i as usize,
+            None => {
+                self.entries.push((key, new()));
+                if let Some(slot) = slot {
+                    if self.slots.is_empty() {
+                        self.slots = vec![0; Self::SLOTS];
+                    }
+                    self.slots[slot] = self.entries.len() as u32;
+                }
+                self.entries.len() - 1
+            }
+        };
+        &mut self.entries[i].1
+    }
+
+    /// Every stream's value, in stream order.
+    pub fn into_sorted(mut self) -> Vec<(StreamKey, V)> {
+        self.entries.sort_unstable_by_key(|(k, _)| *k);
+        self.entries
+    }
 }
 
 impl fmt::Display for StreamKey {
@@ -262,7 +324,7 @@ struct Stream {
 
 #[derive(Debug, Default)]
 pub struct Checker {
-    streams: BTreeMap<StreamKey, Stream>,
+    streams: StreamTable<Stream>,
     findings: Vec<SeqFinding>,
     /// Findings withdrawn after the fact, by position.
     retracted: Vec<usize>,
@@ -313,7 +375,7 @@ impl Checker {
             packet_type: header.packet_type,
         };
         let seq = header.seq_count % SEQ_MODULUS;
-        let stream = self.streams.entry(key).or_default();
+        let stream = self.streams.get_or_insert_with(key, Stream::default);
         stream.packets += 1;
         let pos = stream.packets;
         match stream.first {
@@ -470,7 +532,7 @@ impl Checker {
 
     pub fn finish(mut self) -> Report {
         let mut streams = Vec::new();
-        for (key, stream) in self.streams {
+        for (key, stream) in self.streams.into_sorted() {
             let Stream {
                 active,
                 retired,

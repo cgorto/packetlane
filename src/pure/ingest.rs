@@ -69,7 +69,8 @@ pub fn ptype_from_code(code: i64) -> Option<PacketType> {
     }
 }
 
-/// One row of the `packets` table, minus the ids the store assigns.
+/// One row of the `packets` table, minus the ids the store assigns and the
+/// label, which the record already holds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PacketRow {
     pub idx: i64,
@@ -83,7 +84,6 @@ pub struct PacketRow {
     /// does not give its size: see [`logged_header`].
     pub length_ok: bool,
     pub sum: i64,
-    pub label: Option<String>,
 }
 
 impl PacketRow {
@@ -167,7 +167,6 @@ pub fn packet_row(
         length_ok: found.is_none_or(|(_, ok)| ok),
         // Stored as the same 64 bits, reinterpreted as signed.
         sum: fnv1a(&record.payload) as i64,
-        label: record.label.clone(),
     }
 }
 

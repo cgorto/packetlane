@@ -6,10 +6,8 @@
 //! after a jump in the sequence count there is nothing to compare with, and
 //! the jump is already reported by `continuity`.
 
-use std::collections::BTreeMap;
-
 use crate::pure::ccsds::{IDLE_APID, PrimaryHeader, SEQ_MODULUS, SeqFlags};
-use crate::pure::continuity::StreamKey;
+use crate::pure::continuity::{StreamKey, StreamTable};
 use crate::pure::finding::{Finding, Kind, Severity};
 
 /// Findings of one kind listed per stream; the rest are counted.
@@ -38,7 +36,7 @@ struct Stream {
 
 #[derive(Default)]
 pub struct OrderChecker {
-    streams: BTreeMap<StreamKey, Stream>,
+    streams: StreamTable<Stream>,
     findings: Vec<OrderFinding>,
 }
 
@@ -57,7 +55,7 @@ impl OrderChecker {
             apid: header.apid,
             packet_type: header.packet_type,
         };
-        let stream = self.streams.entry(key).or_insert(Stream {
+        let stream = self.streams.get_or_insert_with(key, || Stream {
             last_seq: None,
             segments: Segments::Unknown,
             last_time: None,
@@ -124,14 +122,14 @@ impl OrderChecker {
     }
 
     pub fn finish(mut self) -> Vec<OrderFinding> {
-        for (key, stream) in &self.streams {
+        for (key, stream) in self.streams.into_sorted() {
             for (slot, kind, what) in [
                 (0, Kind::Segment, "segment order faults"),
                 (1, Kind::TimeBack, "steps back in packet time"),
             ] {
                 if stream.unlisted[slot] > 0 {
                     self.findings.push(Finding {
-                        lane: *key,
+                        lane: key,
                         packet: None,
                         severity: Severity::Info,
                         kind,

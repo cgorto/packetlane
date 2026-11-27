@@ -230,11 +230,12 @@ impl Decoder for Cosmos4Decoder {
         }
 
         let receive_time_ns = i64::from(secs) * 1_000_000_000 + i64::from(usecs) * 1_000;
-        let label = format!(
-            "{} {}",
-            String::from_utf8_lossy(target_bytes),
-            String::from_utf8_lossy(packet_bytes)
-        );
+        let target = String::from_utf8_lossy(target_bytes);
+        let packet = String::from_utf8_lossy(packet_bytes);
+        let mut label = String::with_capacity(target.len() + 1 + packet.len());
+        label.push_str(&target);
+        label.push(' ');
+        label.push_str(&packet);
 
         Step::Record {
             consumed: entry_end,

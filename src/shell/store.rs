@@ -613,7 +613,7 @@ fn ingest_packets(
             row.header.map(|h| ptype_code(h.packet_type)),
             row.header.map(|h| i64::from(h.seq_count)),
             row.sum,
-            row.label,
+            record.label,
         ])?;
         // After the packet's own row, which these rows point at.
         for v in values {

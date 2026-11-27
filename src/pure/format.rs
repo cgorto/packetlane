@@ -1,6 +1,8 @@
 //! Turning packet bytes into named values, using definitions from the
 //! configuration file.
 
+use std::fmt;
+
 use serde::Serialize;
 
 use crate::pure::config::{
@@ -92,7 +94,15 @@ pub fn engineering(field: &FieldDef, packet: &[u8]) -> Option<f64> {
     if field.count != 1 {
         return None;
     }
-    let raw = match number(field, packet, u64::from(field.bit_offset)).ok()? {
+    engineering_of(
+        field,
+        &number(field, packet, u64::from(field.bit_offset)).ok()?,
+    )
+}
+
+/// [`engineering`] for a number already read from the packet.
+fn engineering_of(field: &FieldDef, value: &Value) -> Option<f64> {
+    let raw = match *value {
         Value::UInt(v) => v as f64,
         Value::Int(v) => v as f64,
         Value::Float(v) => v,
@@ -108,6 +118,53 @@ pub fn engineering(field: &FieldDef, packet: &[u8]) -> Option<f64> {
         power *= raw;
     }
     sum.is_finite().then_some(sum)
+}
+
+/// Text written to the stack: a number only formatted to be looked at
+/// again need not be put on the heap.
+struct Digits {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl Digits {
+    /// `None` if the text does not fit.
+    fn of(value: impl fmt::Display) -> Option<Digits> {
+        let mut out = Digits {
+            bytes: [0; 64],
+            len: 0,
+        };
+        fmt::write(&mut out, format_args!("{value}")).ok()?;
+        Some(out)
+    }
+
+    fn as_str(&self) -> &str {
+        // Only whole `str`s are ever copied in.
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
+    }
+}
+
+impl fmt::Write for Digits {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        let to = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        to.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// The configured name for an integer value, if there is one.
+fn label_of(field: &FieldDef, value: &Value) -> Option<String> {
+    if field.labels.is_empty() {
+        return None;
+    }
+    let digits = match *value {
+        Value::UInt(v) => Digits::of(v),
+        Value::Int(v) => Digits::of(v),
+        _ => return None,
+    }?;
+    field.labels.get(digits.as_str()).cloned()
 }
 
 const PAST_END: &str = "Past end of packet";
@@ -130,7 +187,11 @@ fn number(field: &FieldDef, packet: &[u8], bit_offset: u64) -> Result<Value, &'s
                 // nearest 64-bit number to it, 28.049999237060547.
                 32 => {
                     let v = f32::from_bits(raw as u32);
-                    v.to_string().parse().unwrap_or(f64::from(v))
+                    match Digits::of(v) {
+                        Some(text) => text.as_str().parse(),
+                        None => v.to_string().parse(),
+                    }
+                    .unwrap_or(f64::from(v))
                 }
                 64 => f64::from_bits(raw),
                 _ => return Err("Float must be 32 or 64 bits"),
@@ -159,11 +220,7 @@ fn decode_field(field: &FieldDef, packet: &[u8]) -> Result<(Value, Option<String
         }
         FieldKind::Uint | FieldKind::Int | FieldKind::Float => {
             let value = number(field, packet, u64::from(field.bit_offset))?;
-            let label = match &value {
-                Value::UInt(v) => field.labels.get(&v.to_string()).cloned(),
-                Value::Int(v) => field.labels.get(&v.to_string()).cloned(),
-                _ => None,
-            };
+            let label = label_of(field, &value);
             Ok((value, label))
         }
         FieldKind::Hex | FieldKind::Ascii => {
@@ -207,27 +264,67 @@ pub fn kept_values<'a>(
         .iter()
         .filter(|field| field.keep)
         .filter_map(|field| {
-            let (value, label) = decode_field(field, packet).ok()?;
-            let text = match value {
-                Value::Text(text) => Some(text),
-                Value::List(items) => Some(
-                    items
-                        .iter()
-                        .map(|v| match v {
-                            Value::UInt(n) => n.to_string(),
-                            Value::Int(n) => n.to_string(),
-                            Value::Float(n) => n.to_string(),
-                            Value::Text(t) => t.clone(),
-                            Value::List(_) => String::new(),
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-                _ => label,
-            };
-            Some((field.name.as_str(), engineering(field, packet), text))
+            let reading = read_field(field, packet, true);
+            Some((field.name.as_str(), reading.num, reading.kept?))
         })
         .collect()
+}
+
+/// What the checks need of one field of one packet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reading {
+    /// The same as [`engineering`].
+    pub num: Option<f64>,
+    /// Only if asked for: the text [`kept_values`] gives the field, or
+    /// `None` if it would leave the field out.
+    pub kept: Option<Option<String>>,
+}
+
+/// Reads a field's engineering value and, if `keep`, what is kept of it,
+/// decoding a single number once for both.
+pub fn read_field(field: &FieldDef, packet: &[u8], keep: bool) -> Reading {
+    let single_number = matches!(
+        field.kind,
+        FieldKind::Uint | FieldKind::Int | FieldKind::Float
+    ) && field.count == 1;
+    if single_number {
+        let Ok(value) = number(field, packet, u64::from(field.bit_offset)) else {
+            return Reading {
+                num: None,
+                kept: None,
+            };
+        };
+        let num = engineering_of(field, &value);
+        let kept = keep.then(|| match value {
+            Value::Text(text) => Some(text),
+            _ => label_of(field, &value),
+        });
+        return Reading { num, kept };
+    }
+    // Arrays and text: what is kept is decoded on its own terms, and the
+    // number, if any, is read as `engineering` reads it.
+    let num = engineering(field, packet);
+    let kept = keep
+        .then(|| decode_field(field, packet).ok())
+        .flatten()
+        .map(|(value, label)| match value {
+            Value::Text(text) => Some(text),
+            Value::List(items) => Some(
+                items
+                    .iter()
+                    .map(|v| match v {
+                        Value::UInt(n) => n.to_string(),
+                        Value::Int(n) => n.to_string(),
+                        Value::Float(n) => n.to_string(),
+                        Value::Text(t) => t.clone(),
+                        Value::List(_) => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            _ => label,
+        });
+    Reading { num, kept }
 }
 
 /// Decodes every field of a definition against one packet. A field that
@@ -447,6 +544,141 @@ bit_length = 8
         assert_eq!(out[4].value, Some(Value::Text("6f6b".to_string())));
         assert_eq!(out[5].value, None);
         assert!(out[5].error.is_some());
+    }
+
+    /// What was kept of a field before a single number was decoded once:
+    /// the field decoded, its label looked up by its value as text, and the
+    /// engineering value read again.
+    fn kept_as_before(field: &FieldDef, packet: &[u8]) -> Reading {
+        let kept = decode_field(field, packet).ok().map(|(value, _)| {
+            let label = match &value {
+                Value::UInt(v) => field.labels.get(&v.to_string()).cloned(),
+                Value::Int(v) => field.labels.get(&v.to_string()).cloned(),
+                _ => None,
+            };
+            match value {
+                Value::Text(text) => Some(text),
+                Value::List(items) => Some(
+                    items
+                        .iter()
+                        .map(|v| match v {
+                            Value::UInt(n) => n.to_string(),
+                            Value::Int(n) => n.to_string(),
+                            Value::Float(n) => n.to_string(),
+                            Value::Text(t) => t.clone(),
+                            Value::List(_) => String::new(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+                _ => label,
+            }
+        });
+        Reading {
+            num: engineering(field, packet),
+            kept,
+        }
+    }
+
+    #[test]
+    fn a_field_read_once_reads_as_before() {
+        let base =
+            def("[[packet.field]]\nname = \"X\"\nbit_offset = 0\nbit_length = 8").fields[0].clone();
+        let kinds = [
+            FieldKind::Uint,
+            FieldKind::Int,
+            FieldKind::Float,
+            FieldKind::Hex,
+            FieldKind::Ascii,
+        ];
+        let mut fields = Vec::new();
+        for kind in kinds {
+            for bit_length in [1, 4, 8, 12, 16, 24, 32, 64] {
+                for bit_offset in [0, 3, 8, 16] {
+                    for count in [1, 3] {
+                        for byte_order in [ByteOrder::Big, ByteOrder::Little] {
+                            for poly in [vec![], vec![-100.0, 0.5], vec![1e308, 1e308]] {
+                                let mut f = base.clone();
+                                f.kind = kind;
+                                f.bit_length = bit_length;
+                                f.bit_offset = bit_offset;
+                                f.count = count;
+                                f.byte_order = byte_order;
+                                f.poly = poly;
+                                fields.push(f.clone());
+                                f.labels.insert("5".to_string(), "FIVE".to_string());
+                                f.labels.insert("-1".to_string(), "MINUS ONE".to_string());
+                                fields.push(f);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut packets: Vec<Vec<u8>> = vec![vec![], vec![5], vec![0xFF; 3]];
+        packets.push([&f32::NAN.to_be_bytes()[..], &[0; 20]].concat());
+        packets.push([&[5u8, 0, 0, 0][..], &28.05f32.to_be_bytes(), &[0; 20]].concat());
+        packets.push([&1e-45f32.to_be_bytes()[..], &[0xFF; 20]].concat());
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..40 {
+            packets.push(
+                (0..24)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x as u8
+                    })
+                    .collect(),
+            );
+        }
+        for field in &fields {
+            for packet in &packets {
+                let before = kept_as_before(field, packet);
+                for keep in [true, false] {
+                    let now = read_field(field, packet, keep);
+                    let want = if keep {
+                        before.clone()
+                    } else {
+                        Reading {
+                            num: before.num,
+                            kept: None,
+                        }
+                    };
+                    // Compared as bits, so that NaN equals NaN.
+                    assert_eq!(
+                        (now.num.map(f64::to_bits), &now.kept),
+                        (want.num.map(f64::to_bits), &want.kept),
+                        "{field:?} {packet:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn floats_written_on_the_stack_read_as_from_the_heap() {
+        let specials = [
+            0.0f32,
+            -0.0,
+            1e-45,
+            -1e-45,
+            f32::MIN_POSITIVE,
+            f32::MAX,
+            f32::MIN,
+            f32::NAN,
+            f32::INFINITY,
+            28.05,
+        ];
+        let stepped = (0..=u32::MAX).step_by(65_537).map(f32::from_bits);
+        for v in specials.into_iter().chain(stepped) {
+            assert_eq!(Digits::of(v).unwrap().as_str(), v.to_string());
+        }
+        for v in [0u64, 7, u64::MAX] {
+            assert_eq!(Digits::of(v).unwrap().as_str(), v.to_string());
+        }
+        assert_eq!(Digits::of(i64::MIN).unwrap().as_str(), i64::MIN.to_string());
+        assert!(Digits::of("x".repeat(65)).is_none());
     }
 
     #[test]

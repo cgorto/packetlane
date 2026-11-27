@@ -488,35 +488,37 @@ pub struct SourceInfo {
 }
 
 /// Which definition a packet is decoded with, from [`Config::dispatch`].
+/// Definitions are given by their place in [`Config::packets`].
 pub struct Dispatch<'a> {
-    by_label: HashMap<&'a str, Named<'a>>,
+    packets: &'a [PacketDef],
+    by_label: HashMap<&'a str, Named>,
     /// What [`Config::packet_def`] gives for each stream that has one.
-    by_stream: HashMap<(u16, PacketType), &'a PacketDef>,
+    by_stream: HashMap<(u16, PacketType), usize>,
 }
 
 /// The definitions that share a label, or an APID and type.
 #[derive(Default)]
-struct Named<'a> {
-    telemetry: Option<&'a PacketDef>,
-    command: Option<&'a PacketDef>,
-    first: Option<&'a PacketDef>,
-    unlabelled: Option<&'a PacketDef>,
+struct Named {
+    telemetry: Option<usize>,
+    command: Option<usize>,
+    first: Option<usize>,
+    unlabelled: Option<usize>,
     count: usize,
 }
 
-impl<'a> Named<'a> {
+impl Named {
     /// Takes the next definition, in the order of the configuration.
-    fn add(&mut self, def: &'a PacketDef) {
+    fn add(&mut self, i: usize, def: &PacketDef) {
         let first_of_type = match def.kind.packet_type() {
             PacketType::Telemetry => &mut self.telemetry,
             PacketType::Command => &mut self.command,
         };
-        first_of_type.get_or_insert(def);
-        self.first.get_or_insert(def);
+        first_of_type.get_or_insert(i);
+        self.first.get_or_insert(i);
         self.count += 1;
     }
 
-    fn only(&self) -> Option<&'a PacketDef> {
+    fn only(&self) -> Option<usize> {
         self.first.filter(|_| self.count == 1)
     }
 }
@@ -528,6 +530,11 @@ impl<'a> Dispatch<'a> {
         label: Option<&str>,
         header: Option<&PrimaryHeader>,
     ) -> Option<&'a PacketDef> {
+        self.index_for(label, header).map(|i| &self.packets[i])
+    }
+
+    /// Where in [`Config::packets`] the answer to [`Config::packet_for`] is.
+    pub fn index_for(&self, label: Option<&str>, header: Option<&PrimaryHeader>) -> Option<usize> {
         let labelled = label
             .and_then(|l| self.by_label.get(l))
             .and_then(|named| match header {
@@ -539,8 +546,8 @@ impl<'a> Dispatch<'a> {
             });
         labelled.or_else(|| {
             let h = header?;
-            let def = *self.by_stream.get(&(h.apid, h.packet_type))?;
-            (label.is_none() || def.label.is_none()).then_some(def)
+            let i = *self.by_stream.get(&(h.apid, h.packet_type))?;
+            (label.is_none() || self.packets[i].label.is_none()).then_some(i)
         })
     }
 }
@@ -691,17 +698,17 @@ impl Config {
     /// What [`Config::packet_for`] answers, worked out ahead for every name
     /// and stream, so that asking for each packet of a file is cheap.
     pub fn dispatch(&self) -> Dispatch<'_> {
-        let mut by_label: HashMap<&str, Named<'_>> = HashMap::new();
-        let mut streams: HashMap<(u16, PacketType), Named<'_>> = HashMap::new();
-        for def in &self.packets {
+        let mut by_label: HashMap<&str, Named> = HashMap::new();
+        let mut streams: HashMap<(u16, PacketType), Named> = HashMap::new();
+        for (i, def) in self.packets.iter().enumerate() {
             if let Some(label) = &def.label {
-                by_label.entry(label).or_default().add(def);
+                by_label.entry(label).or_default().add(i, def);
             }
             if let Some(apid) = def.apid {
                 let stream = streams.entry((apid, def.kind.packet_type())).or_default();
-                stream.add(def);
+                stream.add(i, def);
                 if def.label.is_none() {
-                    stream.unlabelled.get_or_insert(def);
+                    stream.unlabelled.get_or_insert(i);
                 }
             }
         }
@@ -710,6 +717,7 @@ impl Config {
             .filter_map(|(key, s)| Some((key, s.unlabelled.or(s.only())?)))
             .collect();
         Dispatch {
+            packets: &self.packets,
             by_label,
             by_stream,
         }

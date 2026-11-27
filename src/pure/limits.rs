@@ -57,60 +57,77 @@ impl<L: Clone> LimitChecker<L> {
         lane: &L,
     ) {
         for (i, field) in def.fields.iter().enumerate() {
-            let Some(limits) = field.limits else { continue };
-            let Some(value) = engineering(field, packet) else {
-                continue;
-            };
-            let watch = self.watches.entry((def_id, i)).or_insert_with(|| Watch {
-                state: LimitState::Green,
-                disagreeing: 0,
-                reported: 0,
-                unlisted: 0,
-                name: format!("{} {}", def.name, field.name),
-                lane: lane.clone(),
-            });
-            let now = limits.state(value);
-            if now == watch.state {
-                watch.disagreeing = 0;
+            if field.limits.is_none() {
                 continue;
             }
-            watch.disagreeing += 1;
-            if watch.disagreeing < limits.persistence {
-                continue;
+            if let Some(value) = engineering(field, packet) {
+                self.observe_value(packet_index, def_id, def, i, value, lane);
             }
-            watch.state = now;
-            watch.disagreeing = 0;
-            if now == LimitState::Green {
-                continue;
-            }
-            if watch.reported >= MAX_PER_FIELD {
-                watch.unlisted += 1;
-                continue;
-            }
-            watch.reported += 1;
-            let limit = match now {
-                LimitState::RedLow => limits.red_low,
-                LimitState::YellowLow => limits.yellow_low,
-                LimitState::YellowHigh => limits.yellow_high,
-                _ => limits.red_high,
-            };
-            let unit = if field.unit.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", field.unit)
-            };
-            self.findings.push(Finding {
-                lane: lane.clone(),
-                packet: Some(packet_index),
-                severity: Severity::problem_if(now.is_red()),
-                kind: Kind::Limit,
-                message: format!(
-                    "{} went {}: {value}{unit} (limit {limit})",
-                    watch.name,
-                    now.name()
-                ),
-            });
         }
+    }
+
+    /// Takes the engineering value of field `i` of `def`, already read
+    /// from the packet. A field with no limits is passed over.
+    pub fn observe_value(
+        &mut self,
+        packet_index: u64,
+        def_id: usize,
+        def: &PacketDef,
+        i: usize,
+        value: f64,
+        lane: &L,
+    ) {
+        let field = &def.fields[i];
+        let Some(limits) = field.limits else { return };
+        let watch = self.watches.entry((def_id, i)).or_insert_with(|| Watch {
+            state: LimitState::Green,
+            disagreeing: 0,
+            reported: 0,
+            unlisted: 0,
+            name: format!("{} {}", def.name, field.name),
+            lane: lane.clone(),
+        });
+        let now = limits.state(value);
+        if now == watch.state {
+            watch.disagreeing = 0;
+            return;
+        }
+        watch.disagreeing += 1;
+        if watch.disagreeing < limits.persistence {
+            return;
+        }
+        watch.state = now;
+        watch.disagreeing = 0;
+        if now == LimitState::Green {
+            return;
+        }
+        if watch.reported >= MAX_PER_FIELD {
+            watch.unlisted += 1;
+            return;
+        }
+        watch.reported += 1;
+        let limit = match now {
+            LimitState::RedLow => limits.red_low,
+            LimitState::YellowLow => limits.yellow_low,
+            LimitState::YellowHigh => limits.yellow_high,
+            _ => limits.red_high,
+        };
+        let unit = if field.unit.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", field.unit)
+        };
+        self.findings.push(Finding {
+            lane: lane.clone(),
+            packet: Some(packet_index),
+            severity: Severity::problem_if(now.is_red()),
+            kind: Kind::Limit,
+            message: format!(
+                "{} went {}: {value}{unit} (limit {limit})",
+                watch.name,
+                now.name()
+            ),
+        });
     }
 
     /// The findings in the order they arose, then one line per field for
