@@ -546,6 +546,15 @@ name = "HK"
   keep = true
 
 [[packet]]
+apid = 18
+name = "RARE"
+  [[packet.field]]
+  name = "V"
+  bit_offset = 112
+  bit_length = 16
+  keep = true
+
+[[packet]]
 apid = 17
 name = "TINY"
   [[packet.field]]
@@ -584,8 +593,11 @@ fn kept_run(scratch: &Scratch) {
     let mut dense = cosmos4_header(true, "kept", "bench");
     for i in 0..100_000u32 {
         let r = t0 + i64::from(i) * 30_000;
+        // One packet in a hundred is of a rarer stream, whose few values
+        // lie among many packets.
+        let apid = if i % 100 == 50 { 18 } else { 16 };
         dense.extend(kept_entry(
-            16,
+            apid,
             i,
             r,
             r - 40_000_000 - i64::from(i % 13) * 1_000,
