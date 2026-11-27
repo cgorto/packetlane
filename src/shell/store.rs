@@ -260,6 +260,11 @@ impl Store {
         })
     }
 
+    /// The folder of segment files beside the store.
+    pub fn segment_folder(&self) -> &Path {
+        &self.segments
+    }
+
     /// Runs a statement typed by the user. It is refused unless SQLite
     /// itself reports that it cannot write.
     pub fn query_user(&self, sql_text: &str, limit: usize) -> Result<Table> {

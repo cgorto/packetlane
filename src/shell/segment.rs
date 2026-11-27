@@ -450,22 +450,27 @@ impl Writer {
         }
         // The buckets are counted from the sections just written, read back
         // in their order: time order for the time clocks, id order for the
-        // order clock.
+        // order clock. First how many records each level would hold, then
+        // the levels worth keeping.
         self.out.flush()?;
         let last_packet = self.first_packet + self.count as i64 - 1;
         let order_shift = layout::grid_shift(self.first_packet, last_packet);
         let mut times = [None, None];
+        let mut grids = Vec::new();
         for c in 0..2 {
-            let Some((lo, hi)) = self.ranges[c] else {
-                entries.push(self.bucket_section(c as u8, 0, None)?);
-                continue;
-            };
-            let shift = layout::grid_shift(lo, hi);
-            times[c] = Some((lo, hi, shift));
-            let source = entries[2 + c];
-            entries.push(self.bucket_section(c as u8, shift, Some(source))?);
+            if let Some((lo, hi)) = self.ranges[c] {
+                let shift = layout::grid_shift(lo, hi);
+                times[c] = Some((lo, hi, shift));
+                grids.push((c as u8, shift, entries[2 + c]));
+            }
         }
-        entries.push(self.bucket_section(2, order_shift, Some(entries[0]))?);
+        grids.push((2, order_shift, entries[0]));
+        for (clock, base, source) in grids {
+            let (records, values) = self.level_records(clock, base, source)?;
+            for shift in layout::choose_levels(base, &records, values) {
+                entries.push(self.bucket_section(clock, shift, source)?);
+            }
+        }
 
         let tail = Tail {
             first_packet: self.first_packet,
@@ -501,11 +506,47 @@ impl Writer {
         }))
     }
 
-    /// Counts one clock's buckets by reading `source` (a time-order
-    /// section, or the packets section for the order clock) from end to end
-    /// and appends them. No source, no packets with that time: an empty
-    /// section.
-    fn bucket_section(&mut self, clock: u8, shift: u32, source: Option<Entry>) -> Result<Entry> {
+    /// How many bucket records each level from `base` up would hold, and
+    /// how many values the clock has, in one pass. A record is a lane and a
+    /// bucket with packets; values come in order, so a lane starts a new
+    /// record at a level when its bucket there differs from its last one.
+    fn level_records(&self, clock: u8, base: u32, source: Entry) -> Result<(Vec<u64>, u64)> {
+        let levels = (64 - base.min(63)).min(layout::MAX_LEVELS) as usize;
+        let mut records = vec![0u64; levels];
+        let mut slots: HashMap<u32, usize, BuildHasherDefault<MixHasher>> = HashMap::default();
+        // The last bucket of each lane at each level, lane after lane.
+        let mut last: Vec<i64> = Vec::new();
+        let mut values = 0u64;
+        let file = self.temp.file.try_clone()?;
+        each_value(&file, self.first_packet, clock, source, |t, lane| {
+            values += 1;
+            let slot = match slots.get(&lane) {
+                Some(&slot) => slot,
+                None => {
+                    slots.insert(lane, slots.len());
+                    for (i, n) in records.iter_mut().enumerate() {
+                        last.push(layout::bucket_of(t, base + i as u32));
+                        *n += 1;
+                    }
+                    return Ok(());
+                }
+            };
+            let last = &mut last[slot * levels..(slot + 1) * levels];
+            for (i, n) in records.iter_mut().enumerate() {
+                let bucket = layout::bucket_of(t, base + i as u32);
+                if last[i] != bucket {
+                    last[i] = bucket;
+                    *n += 1;
+                }
+            }
+            Ok(())
+        })?;
+        Ok((records, values))
+    }
+
+    /// Counts one clock's buckets on the grid of `shift` by reading
+    /// `source` from end to end, and appends them.
+    fn bucket_section(&mut self, clock: u8, shift: u32, source: Entry) -> Result<Entry> {
         let start = self.at;
         let mut tally = Tally {
             shift,
@@ -513,25 +554,12 @@ impl Writer {
             lanes: HashMap::default(),
             written: 0,
         };
-        if let Some(source) = source {
-            let file = self.temp.file.try_clone()?;
-            let end = source.offset + source.length;
-            if clock == 2 {
-                let mut r = RangeReader::<PACKET_BYTES>::new(&file, source.offset, end, IO_BUFFER);
-                let mut id = self.first_packet;
-                while let Some(rec) = r.read()? {
-                    tally.add(id, PacketRecord::lane_of(&rec), &mut self.out)?;
-                    id += 1;
-                }
-            } else {
-                let mut r = RangeReader::<TIME_BYTES>::new(&file, source.offset, end, IO_BUFFER);
-                while let Some(rec) = r.read()? {
-                    let rec = TimeRecord::decode(&rec);
-                    tally.add(rec.ns, rec.lane, &mut self.out)?;
-                }
-            }
-            tally.flush(&mut self.out)?;
-        }
+        let file = self.temp.file.try_clone()?;
+        let out = &mut self.out;
+        each_value(&file, self.first_packet, clock, source, |t, lane| {
+            tally.add(t, lane, out)
+        })?;
+        tally.flush(out)?;
         self.at += tally.written;
         Ok(Entry {
             kind: KIND_BUCKETS,
@@ -542,6 +570,34 @@ impl Writer {
             param: i64::from(shift),
         })
     }
+}
+
+/// Hands each (value, lane) of a clock to `f`, in ascending order of value,
+/// by reading `source` from end to end: a time-order section, or for the
+/// order clock (2) the packets section, whose first packet has id `first`.
+fn each_value(
+    file: &File,
+    first: i64,
+    clock: u8,
+    source: Entry,
+    mut f: impl FnMut(i64, u32) -> Result<()>,
+) -> Result<()> {
+    let end = source.offset + source.length;
+    if clock == 2 {
+        let mut r = RangeReader::<PACKET_BYTES>::new(file, source.offset, end, IO_BUFFER);
+        let mut id = first;
+        while let Some(rec) = r.read()? {
+            f(id, PacketRecord::lane_of(&rec))?;
+            id += 1;
+        }
+    } else {
+        let mut r = RangeReader::<TIME_BYTES>::new(file, source.offset, end, IO_BUFFER);
+        while let Some(rec) = r.read()? {
+            let rec = TimeRecord::decode(&rec);
+            f(rec.ns, rec.lane)?;
+        }
+    }
+    Ok(())
 }
 
 /// Counts packets per lane in one bucket at a time, from values that come
@@ -727,21 +783,37 @@ impl Segment {
         }
     }
 
-    /// The grid shift of a clock's buckets.
-    pub fn shift(&self, clock: Clock) -> Result<u32> {
-        let e = self.section(KIND_BUCKETS, layout::clock_code(clock))?;
-        Ok(e.param as u32)
+    /// The shifts of the bucket levels stored for a clock, finest first;
+    /// empty if no level was worth storing.
+    pub fn levels(&self, clock: Clock) -> Vec<u32> {
+        let code = layout::clock_code(clock);
+        let mut out: Vec<u32> = self
+            .entries
+            .iter()
+            .filter(|e| e.kind == KIND_BUCKETS && e.clock == code)
+            .map(|e| e.param as u32)
+            .collect();
+        out.sort_unstable();
+        out
     }
 
-    /// Each stored bucket from `first` to `last` on `clock`.
+    /// Each stored bucket from `first` to `last` of the level of `shift`
+    /// on `clock`.
     pub fn buckets(
         &self,
         clock: Clock,
+        shift: u32,
         first: i64,
         last: i64,
         mut f: impl FnMut(BucketRecord),
     ) -> Result<()> {
-        let e = self.section(KIND_BUCKETS, layout::clock_code(clock))?;
+        let code = layout::clock_code(clock);
+        let e = self
+            .entries
+            .iter()
+            .find(|e| e.kind == KIND_BUCKETS && e.clock == code && e.param == i64::from(shift))
+            .copied()
+            .ok_or_else(|| format!("segment has no bucket level of shift {shift}"))?;
         self.scan::<BUCKET_BYTES>(&e, first, last, |rec| f(BucketRecord::decode(rec)))
     }
 
@@ -799,10 +871,18 @@ pub fn density(
         if segment.first_packet() != s.first_packet {
             return Err(format!("{}: replaced since it was listed", s.name).into());
         }
-        let shift = segment.shift(clock)?;
-        let plan = layout::plan(from, to, width, shift);
-        if let Some((first, last)) = plan.whole {
-            segment.buckets(clock, first, last, |b| {
+        // The coarsest level the view's buckets are wide enough for; with
+        // none, every packet in the window is counted.
+        let shift = layout::level_for(&segment.levels(clock), width);
+        let plan = match shift {
+            Some(shift) => layout::plan(from, to, width, shift),
+            None => layout::Plan {
+                whole: None,
+                direct: vec![(from, to)],
+            },
+        };
+        if let (Some((first, last)), Some(shift)) = (plan.whole, shift) {
+            segment.buckets(clock, shift, first, last, |b| {
                 counts.bucket(b.lane, b.bucket, shift, b.count);
             })?;
         }
@@ -951,27 +1031,37 @@ mod tests {
                 .unwrap();
             let want: Vec<(i64, u32)> = expected[c].iter().map(|&(t, _, lane)| (t, lane)).collect();
             assert_eq!(got, want, "{clock:?}");
-            let (lo, hi, shift) = written.times[c].unwrap();
+            let (lo, hi, base) = written.times[c].unwrap();
             assert_eq!((lo, hi), (want[0].0, want[want.len() - 1].0));
-            assert_eq!(seg.shift(clock).unwrap(), shift);
-            // The buckets hold every packet once, in order.
-            let mut buckets = Vec::new();
-            seg.buckets(clock, i64::MIN, i64::MAX, |b| buckets.push(b))
-                .unwrap();
-            assert!(
-                buckets
-                    .windows(2)
-                    .all(|w| (w[0].bucket, w[0].lane) < (w[1].bucket, w[1].lane))
-            );
-            let mut per_lane = std::collections::BTreeMap::new();
-            for b in &buckets {
-                *per_lane.entry(b.lane).or_insert(0u32) += b.count;
+            // Levels on the base grid or coarser, each with at most half the
+            // records of the one before.
+            let levels = seg.levels(clock);
+            assert!(!levels.is_empty() && levels[0] >= base, "{levels:?}");
+            let mut before = want.len();
+            for &shift in &levels {
+                // Each level holds every packet once, in order.
+                let mut buckets = Vec::new();
+                seg.buckets(clock, shift, i64::MIN, i64::MAX, |b| buckets.push(b))
+                    .unwrap();
+                assert!(
+                    buckets
+                        .windows(2)
+                        .all(|w| (w[0].bucket, w[0].lane) < (w[1].bucket, w[1].lane))
+                );
+                assert!(buckets.len() * 2 <= before, "{shift}");
+                before = buckets.len();
+                let mut per_lane = std::collections::BTreeMap::new();
+                for b in &buckets {
+                    *per_lane.entry(b.lane).or_insert(0u32) += b.count;
+                }
+                let mut want_lane = std::collections::BTreeMap::new();
+                for &(_, lane) in &want {
+                    *want_lane.entry(lane).or_insert(0u32) += 1;
+                }
+                assert_eq!(per_lane, want_lane);
             }
-            let mut want_lane = std::collections::BTreeMap::new();
-            for &(_, lane) in &want {
-                *want_lane.entry(lane).or_insert(0u32) += 1;
-            }
-            assert_eq!(per_lane, want_lane);
+            // A level that is not stored is refused.
+            assert!(seg.buckets(clock, 63, 0, 0, |_| ()).is_err());
         }
         let mut ids = Vec::new();
         seg.points(Clock::Order, 1_500, 1_502, |lane, id| ids.push((id, lane)))

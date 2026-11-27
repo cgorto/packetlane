@@ -56,7 +56,7 @@
 //!
 //! Clocks are numbered 0 receive, 1 packet, 2 order.
 //!
-//! Sections in version 1:
+//! Sections in version 2:
 //!
 //! - kind 1, packets: one 56-byte record per logged item, in id order;
 //!   packet id = first packet id + index. Record: receive time (i64), packet
@@ -73,13 +73,23 @@
 //!   time, sorted by time and then index. It is time-first across all lanes
 //!   so that reading a window costs what the window holds, not lanes times
 //!   segments.
-//! - kind 4, density buckets, one per clock (receive, packet, order): a
-//!   16-byte record (bucket i64, lane u32, count u32) per lane and bucket that
-//!   holds packets, sorted by bucket and then lane. Buckets lie on a fixed
-//!   grid, bucket = `t >> shift` (an arithmetic shift, so negative and
-//!   enormous times are fine), with `t` the packet id on the order clock.
-//!   `shift` is the entry's parameter: the smallest for which the segment's
-//!   values span at most [`GRID_BUCKETS`] buckets.
+//! - kind 4, density buckets, none or more per clock (receive, packet,
+//!   order), one per level: a 16-byte record (bucket i64, lane u32, count
+//!   u32) per lane and bucket that holds packets, sorted by bucket and then
+//!   lane. Buckets lie on a grid, bucket = `t >> shift` (an arithmetic
+//!   shift, so negative and enormous times are fine), with `t` the packet id
+//!   on the order clock; `shift` is the entry's parameter, and tells the
+//!   levels of a clock apart. The finest possible level is the clock's base
+//!   grid, the smallest shift for which the segment's values span at most
+//!   [`GRID_BUCKETS`] buckets (the shift the store's `segments` row keeps);
+//!   the others are each twice as wide as the one before, up to
+//!   [`MAX_LEVELS`] in all. A level is stored only if it pays, by
+//!   [`choose_levels`]: with at most half the records of the finer level
+//!   stored before it, or of the clock's packets. A segment of many lanes
+//!   has about a record a packet at its base grid and keeps only coarser
+//!   levels; one of a few lanes keeps them all. A view reads the coarsest
+//!   level no wider than its own buckets ([`level_for`]), or with none
+//!   counts every packet.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -89,7 +99,7 @@ use crate::pure::sql::Clock;
 
 pub const MAGIC: [u8; 8] = *b"PLSEGMNT";
 pub const TAIL_MAGIC: [u8; 8] = *b"PLSEGEND";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 pub const PACKET_BYTES: usize = 56;
 pub const TIME_BYTES: usize = 16;
@@ -440,7 +450,7 @@ impl Tail {
 /// Known sections appear once each and do not overlap.
 pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<(), FormatError> {
     let mut packets = None;
-    let mut known: Vec<(u64, u64, u16, u8)> = Vec::new();
+    let mut known: Vec<(u64, u64, u16, u8, i64)> = Vec::new();
     for e in entries {
         let end = e.offset.checked_add(e.length);
         if e.offset < MAGIC.len() as u64 || end.is_none_or(|end| end > dir_at) {
@@ -466,12 +476,14 @@ pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<()
         if e.kind == KIND_PACKETS {
             packets = Some(e.records());
         }
-        known.push((e.offset, e.offset + e.length, e.kind, e.clock));
+        // Bucket levels of one clock are told apart by their shift.
+        let level = if e.kind == KIND_BUCKETS { e.param } else { 0 };
+        known.push((e.offset, e.offset + e.length, e.kind, e.clock, level));
     }
     if packets != Some(tail.packets) {
         return bad("packet count does not match the packets section");
     }
-    let mut kinds: Vec<(u16, u8)> = known.iter().map(|k| (k.2, k.3)).collect();
+    let mut kinds: Vec<(u16, u8, i64)> = known.iter().map(|k| (k.2, k.3, k.4)).collect();
     kinds.sort_unstable();
     kinds.dedup();
     known.sort_unstable();
@@ -502,6 +514,44 @@ pub fn grid_shift(min: i64, max: i64) -> u32 {
     (0..63u32)
         .find(|&s| i128::from(hi >> s) - i128::from(lo >> s) < GRID_BUCKETS)
         .unwrap_or(63)
+}
+
+/// The most bucket levels a clock may have: the base grid and twelve
+/// coarser ones, each twice as wide as the one before; the twelfth holds
+/// the whole span in one or two buckets.
+pub const MAX_LEVELS: u32 = 13;
+
+/// Which levels of bucket counts are worth storing. `records[i]` is how
+/// many (bucket, lane) records the grid of shift `base + i` would hold and
+/// `packets` how many packets have the clock's value. Going from the base
+/// grid to coarser ones, a level is kept if it holds at most half as many
+/// records as the finer level kept before it, or, for the first kept, half
+/// as many as there are packets: reading it must cost at most half of what
+/// a view would read without it. Returns the kept shifts, finest first.
+pub fn choose_levels(base: u32, records: &[u64], packets: u64) -> Vec<u32> {
+    let mut kept = Vec::new();
+    let mut reference = packets;
+    for (i, &n) in records.iter().enumerate() {
+        let shift = base + i as u32;
+        if shift > 63 {
+            break;
+        }
+        if n > 0 && n.saturating_mul(2) <= reference {
+            kept.push(shift);
+            reference = n;
+        }
+    }
+    kept
+}
+
+/// The level a view with buckets `width` wide reads: the coarsest stored
+/// level whose buckets are no wider than the view's, if any.
+pub fn level_for(levels: &[u32], width: i64) -> Option<u32> {
+    levels
+        .iter()
+        .copied()
+        .filter(|&s| (1i128 << s.min(63)) <= i128::from(width))
+        .max()
 }
 
 /// How a window `from..=to` with view buckets `width` wide is counted from
@@ -578,6 +628,10 @@ impl Hasher for MixHasher {
         }
     }
 
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(u64::from(v));
+    }
+
     fn write_u64(&mut self, v: u64) {
         self.0 = (self.0 ^ v)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -585,30 +639,152 @@ impl Hasher for MixHasher {
     }
 }
 
+/// Most cells, lanes times view buckets, that [`Counts`] keeps in a table;
+/// a window needing more is counted in a map. 32 MB.
+const TABLE_CELLS: u64 = 1 << 22;
+
+/// Lane ids below this find their row in a table by index.
+const SMALL_LANES: u32 = 1 << 16;
+
+type Map<K, V> = HashMap<K, V, BuildHasherDefault<MixHasher>>;
+
 /// Packet counts per lane and view bucket over a window, gathered from
-/// stored buckets and single packets. Its cost follows what is added, not
-/// lanes times buckets.
+/// stored buckets and single packets. Counts go to a map, whose cost
+/// follows what is added; once the map holds at least a sixteenth of the
+/// cells a table of every view bucket of the lanes seen would have, and
+/// that table is small enough, to that table, which is quicker to add to.
 pub struct Counts {
     from: i64,
     to: i64,
     width: i64,
-    counts: HashMap<u64, i64, BuildHasherDefault<MixHasher>>,
+    /// View buckets in the window.
+    bins: u64,
+    map: Map<u64, i64>,
+    /// The map's size at which a table is next considered; `None` once a
+    /// table is out of the question.
+    look_at: Option<usize>,
+    /// Each lane's row in `table`; for lanes below [`SMALL_LANES`], also
+    /// the row plus one by lane, 0 for none.
+    slots: Map<u32, usize>,
+    small: Vec<u32>,
+    /// `bins` counts per lane, row after row, while counting in a table.
+    table: Vec<i64>,
+    in_table: bool,
+    /// [`TABLE_CELLS`], but for tests.
+    table_cells: u64,
+}
+
+/// The map's key for a lane and view bucket. View buckets are below the
+/// 4000 a view may ask for, plus one.
+fn cell_key(lane: u32, bin: i64) -> u64 {
+    (u64::from(lane) << 32) | (bin as u64 & 0xFFFF_FFFF)
 }
 
 impl Counts {
     pub fn new(from: i64, to: i64, width: i64) -> Counts {
+        Counts::sized(from, to, width, TABLE_CELLS, 1024)
+    }
+
+    fn sized(from: i64, to: i64, width: i64, table_cells: u64, first_look: usize) -> Counts {
+        let width = width.max(1);
+        let bins = if from <= to {
+            view_bucket(to, from, width) as u64 + 1
+        } else {
+            0
+        };
         Counts {
             from,
             to,
-            width: width.max(1),
-            counts: HashMap::default(),
+            width,
+            bins,
+            map: Map::default(),
+            look_at: (bins <= table_cells).then_some(first_look),
+            slots: Map::default(),
+            small: Vec::new(),
+            table: Vec::new(),
+            in_table: false,
+            table_cells,
         }
     }
 
     fn add(&mut self, lane: u32, bin: i64, n: i64) {
-        // Bins are below the 4000 a view may ask for, plus one.
-        let key = (u64::from(lane) << 32) | (bin as u64 & 0xFFFF_FFFF);
-        *self.counts.entry(key).or_default() += n;
+        if self.in_table {
+            let known = match self.small.get(lane as usize) {
+                Some(&s) if s > 0 => Some(s as usize - 1),
+                Some(_) => None,
+                None => self.slots.get(&lane).copied(),
+            };
+            let slot = match known {
+                Some(slot) => Some(slot),
+                None if (self.slots.len() as u64 + 1) * self.bins <= self.table_cells => {
+                    let slot = self.slots.len();
+                    self.new_slot(lane, slot);
+                    self.table.resize(self.table.len() + self.bins as usize, 0);
+                    Some(slot)
+                }
+                None => None,
+            };
+            if let Some(slot) = slot {
+                self.table[slot * self.bins as usize + bin as usize] += n;
+                return;
+            }
+            // Too many lanes for a table: back to the map, for good.
+            self.leave_table();
+        }
+        *self.map.entry(cell_key(lane, bin)).or_default() += n;
+        if self.look_at.is_some_and(|at| self.map.len() >= at) {
+            self.look_at = self.look_at.map(|at| at * 2);
+            self.consider_table();
+        }
+    }
+
+    /// Moves to a table if the map holds at least a sixteenth of its cells
+    /// and it is small enough.
+    fn consider_table(&mut self) {
+        let mut lanes: Vec<u32> = self.map.keys().map(|&k| (k >> 32) as u32).collect();
+        lanes.sort_unstable();
+        lanes.dedup();
+        let cells = lanes.len() as u64 * self.bins;
+        if cells > self.table_cells || (self.map.len() as u64) * 16 < cells {
+            return;
+        }
+        self.table = vec![0; cells as usize];
+        for (slot, &lane) in lanes.iter().enumerate() {
+            self.new_slot(lane, slot);
+        }
+        for (&k, &n) in &self.map {
+            let slot = self.slots[&((k >> 32) as u32)];
+            self.table[slot * self.bins as usize + (k & 0xFFFF_FFFF) as usize] = n;
+        }
+        self.map = Map::default();
+        self.in_table = true;
+    }
+
+    fn new_slot(&mut self, lane: u32, slot: usize) {
+        self.slots.insert(lane, slot);
+        if lane < SMALL_LANES {
+            if self.small.len() <= lane as usize {
+                self.small.resize(lane as usize + 1, 0);
+            }
+            self.small[lane as usize] = slot as u32 + 1;
+        }
+    }
+
+    /// Moves what the table holds to the map, which counts from now on.
+    fn leave_table(&mut self) {
+        for (&lane, &slot) in &self.slots {
+            let row = &self.table[slot * self.bins as usize..(slot + 1) * self.bins as usize];
+            for (bin, &n) in row.iter().enumerate() {
+                if n != 0 {
+                    self.map.insert(cell_key(lane, bin as i64), n);
+                }
+            }
+        }
+        self.table = Vec::new();
+        self.slots = Map::default();
+        self.small = Vec::new();
+        self.in_table = false;
+        self.look_at = None;
     }
 
     /// One packet at `t`. Ignored outside the window.
@@ -631,12 +807,27 @@ impl Counts {
     /// One row per lane and view bucket: (lane, bucket, count), in that
     /// order.
     pub fn rows(&self) -> Vec<(i64, i64, i64)> {
-        let mut out: Vec<(i64, i64, i64)> = self
-            .counts
-            .iter()
-            .map(|(&k, &n)| ((k >> 32) as i64, (k & 0xFFFF_FFFF) as i64, n))
-            .collect();
-        out.sort_unstable();
+        if !self.in_table {
+            let mut out: Vec<(i64, i64, i64)> = self
+                .map
+                .iter()
+                .filter(|&(_, &n)| n != 0)
+                .map(|(&k, &n)| ((k >> 32) as i64, (k & 0xFFFF_FFFF) as i64, n))
+                .collect();
+            out.sort_unstable();
+            return out;
+        }
+        let mut order: Vec<(u32, usize)> = self.slots.iter().map(|(&l, &s)| (l, s)).collect();
+        order.sort_unstable();
+        let mut out = Vec::new();
+        for (lane, slot) in order {
+            let row = &self.table[slot * self.bins as usize..(slot + 1) * self.bins as usize];
+            for (bin, &n) in row.iter().enumerate() {
+                if n != 0 {
+                    out.push((i64::from(lane), bin as i64, n));
+                }
+            }
+        }
         out
     }
 }
@@ -781,7 +972,7 @@ mod tests {
         magic[31] ^= 1;
         assert!(Tail::decode(&magic).unwrap_err().0.contains("magic"));
         let mut version = bytes;
-        version[20] = 2;
+        version[20] = 1;
         assert!(Tail::decode(&version).unwrap_err().0.contains("version"));
         let mut huge = bytes;
         huge[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -812,6 +1003,17 @@ mod tests {
                 "case {i}"
             );
         }
+        // Bucket levels of one clock differ in shift; the same shift twice
+        // is a repeat.
+        let (tail, mut entries, mut dir_at) = sample();
+        let mut level = entries[1];
+        level.offset = dir_at;
+        level.param = 14;
+        entries.push(level);
+        dir_at += BUCKET_BYTES as u64;
+        assert!(check_directory(&entries, &tail, dir_at).is_ok());
+        entries[2].param = 12;
+        assert!(check_directory(&entries, &tail, dir_at).is_err());
         // A section of a kind not known yet is passed over.
         let (tail, mut entries, dir_at) = sample();
         entries.push(Entry {
@@ -914,6 +1116,77 @@ mod tests {
         // Too narrow to hold one stored bucket whole.
         assert_eq!(plan(5, 7, 4, 2).whole, None);
         assert_eq!(plan(i64::MIN, i64::MAX, i64::MAX, 63).whole, None);
+    }
+
+    #[test]
+    fn levels_are_kept_only_where_they_halve_what_is_read() {
+        // A sparse grid (about a record a packet) is not kept; from there
+        // each kept level holds at most half the last kept.
+        assert_eq!(
+            choose_levels(35, &[873, 437, 219, 109, 55, 28, 14], 1000),
+            vec![36, 38, 40, 41]
+        );
+        // Dense lanes halve at every level.
+        assert_eq!(
+            choose_levels(10, &[16, 8, 4, 2], 3000),
+            vec![10, 11, 12, 13]
+        );
+        // Nothing worth keeping, no packets, and never past shift 63.
+        assert_eq!(choose_levels(0, &[900, 800, 700], 1000), Vec::<u32>::new());
+        assert_eq!(choose_levels(0, &[0, 0], 0), Vec::<u32>::new());
+        assert_eq!(choose_levels(62, &[4, 2, 1], 100), vec![62, 63]);
+
+        // The coarsest level no wider than the view's buckets.
+        let levels = [36, 38, 40];
+        assert_eq!(level_for(&levels, (1 << 38) - 1), Some(36));
+        assert_eq!(level_for(&levels, 1 << 38), Some(38));
+        assert_eq!(level_for(&levels, i64::MAX), Some(40));
+        assert_eq!(level_for(&levels, (1 << 36) - 1), None);
+        assert_eq!(level_for(&[], i64::MAX), None);
+        assert_eq!(level_for(&[63], i64::MAX), None);
+    }
+
+    #[test]
+    fn counts_kept_in_a_table_or_a_map_agree() {
+        // Ten view buckets, a table of at most 30 cells (three lanes),
+        // looked at when the map holds four.
+        let mut c = Counts::sized(0, 9, 1, 30, 4);
+        let mut want = std::collections::BTreeMap::new();
+        let mut add = |c: &mut Counts, lane: u32, t: i64| {
+            c.point(lane, t);
+            *want.entry((i64::from(lane), t)).or_insert(0) += 1;
+            let rows: Vec<(i64, i64, i64)> = want.iter().map(|(&(l, t), &n)| (l, t, n)).collect();
+            assert_eq!(c.rows(), rows);
+        };
+        for t in [3, 0, 3, 5] {
+            add(&mut c, 7, t);
+        }
+        assert!(!c.in_table);
+        // Four cells of one lane's ten: a table.
+        add(&mut c, 7, 9);
+        assert!(c.in_table);
+        for (lane, t) in [(2, 5), (7, 3), (5, 0), (2, 5)] {
+            add(&mut c, lane, t);
+            assert!(c.in_table);
+        }
+        // A fourth lane does not fit: back to the map, for good.
+        add(&mut c, 1, 1);
+        assert!(!c.in_table);
+        for t in 0..10 {
+            add(&mut c, 3, t);
+        }
+        assert!(!c.in_table);
+        // Few cells of many: a map, never a table.
+        let mut sparse = Counts::sized(0, 999, 1, 1 << 20, 4);
+        for lane in 0..10 {
+            sparse.point(lane, i64::from(lane) * 7);
+        }
+        assert!(!sparse.in_table);
+        // More view buckets than a table holds.
+        let mut m = Counts::new(0, 1 << 23, 1);
+        assert!(m.look_at.is_none());
+        m.point(1, 1 << 22);
+        assert_eq!(m.rows(), vec![(1, 1 << 22, 1)]);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use packetlane::pure::segment::plan;
+use packetlane::pure::segment::{level_for, plan};
 use packetlane::pure::sql::{self, Clock, Query, bucket_width};
 use packetlane::pure::synth::{Source, demo_run};
 use packetlane::shell::ingest::ingest_targets;
@@ -98,28 +98,65 @@ fn counted(store: &Store, clock: Clock, from: i64, to: i64, buckets: i64) -> Vec
 /// stored bucket starts; any other packet in its own.
 fn rule_in_sql(store: &Store, clock: Clock, from: i64, to: i64, buckets: i64) -> Vec<Vec<i64>> {
     let c = clock.packet_column();
-    let shift = match clock {
-        Clock::Receive => "receive_shift",
-        Clock::Packet => "packet_shift",
-        Clock::Order => "order_shift",
-    };
     let width = bucket_width(from, to, buckets);
+    let (values, mut params) = level_table(store, clock, width);
+    params.splice(0..0, [from.into(), to.into(), width.into()]);
     ask(
         store,
         &format!(
-            "WITH p AS (
-               SELECT p.lane_id AS lane, p.{c} AS t, s.{shift} AS s,
-                      ((p.{c} >> s.{shift}) << s.{shift}) AS b0
-               FROM packets p JOIN segments s ON p.id BETWEEN s.first_packet AND s.last_packet
+            "WITH lv(a, z, s) AS (VALUES {values}),
+             p AS (
+               SELECT p.lane_id AS lane, p.{c} AS t, lv.s AS s,
+                      ((p.{c} >> lv.s) << lv.s) AS b0
+               FROM packets p JOIN lv ON p.id BETWEEN lv.a AND lv.z
                WHERE p.{c} BETWEEN ?1 AND ?2)
              SELECT lane,
-                    CASE WHEN ?3 >= (1 << s) AND b0 >= ?1 AND b0 + (1 << s) - 1 <= ?2
+                    CASE WHEN s IS NOT NULL AND ?3 >= (1 << s) AND b0 >= ?1
+                              AND b0 + (1 << s) - 1 <= ?2
                          THEN (b0 - ?1) / ?3 ELSE (t - ?1) / ?3 END AS bin,
                     COUNT(*)
              FROM p GROUP BY lane, bin ORDER BY lane, bin"
         ),
-        vec![from.into(), to.into(), width.into()],
+        params,
     )
+}
+
+/// The bucket level a view with buckets `width` wide reads in each segment,
+/// as the text of SQL `VALUES` rows (first packet id, last packet id,
+/// shift or null) and their parameters, numbered from 4.
+fn level_table(store: &Store, clock: Clock, width: i64) -> (String, Vec<sql::Param>) {
+    let mut rows = Vec::new();
+    let mut params = Vec::new();
+    for (first, last, levels) in segment_levels(store, clock) {
+        let n = params.len() + 4;
+        rows.push(format!("(?{n}, ?{}, ?{})", n + 1, n + 2));
+        params.push(first.into());
+        params.push(last.into());
+        params.push(level_for(&levels, width).map(i64::from).into());
+    }
+    (rows.join(", "), params)
+}
+
+/// Each segment's first and last packet id and stored bucket levels on a
+/// clock.
+fn segment_levels(store: &Store, clock: Clock) -> Vec<(i64, i64, Vec<u32>)> {
+    let names = store
+        .query(
+            &Query::new(
+                "SELECT name, first_packet, last_packet FROM segments",
+                vec![],
+            ),
+            usize::MAX,
+        )
+        .unwrap();
+    names
+        .rows
+        .iter()
+        .map(|r| {
+            let seg = Segment::open(&store.segment_folder().join(r[0].text().unwrap())).unwrap();
+            (r[1].int().unwrap(), r[2].int().unwrap(), seg.levels(clock))
+        })
+        .collect()
 }
 
 fn totals(rows: &[Vec<i64>]) -> Vec<(i64, i64)> {
@@ -251,14 +288,11 @@ fn check_store(store: &Store) -> [bool; 3] {
             let width = bucket_width(from, to, buckets);
             // Some segment is counted partly from whole buckets, partly
             // packet by packet.
-            let (lo_col, hi_col, shift_col) = manifest_columns(clock);
-            for r in ask(
-                store,
-                &format!("SELECT {shift_col} FROM segments WHERE {lo_col} <= ? AND {hi_col} >= ?"),
-                vec![to.into(), from.into()],
-            ) {
-                let p = plan(from, to, width, r[0] as u32);
-                coarse_seen |= p.whole.is_some() && !p.direct.is_empty();
+            for (_, _, levels) in segment_levels(store, clock) {
+                if let Some(shift) = level_for(&levels, width) {
+                    let p = plan(from, to, width, shift);
+                    coarse_seen |= p.whole.is_some() && !p.direct.is_empty();
+                }
             }
             let c = clock.packet_column();
             let direct = ask(
@@ -398,11 +432,16 @@ fn density_timing() {
         );
         let (min, max) = (r[0][0], r[0][1]);
         let span = max - min + 1;
-        for zoom in [1i64, 10, 100, 1000] {
+        for (zoom, buckets) in [
+            (1i64, 1000),
+            (1, 500),
+            (10, 1000),
+            (100, 1000),
+            (1000, 1000),
+        ] {
             let width = span / zoom;
             let from = min + (span - width) / 2;
             let to = from + width - 1;
-            let buckets = 1000;
             let (seg, seg_total) = median(Box::new(|| {
                 let mut n: i64 = store
                     .packet_density(run, clock, from, to, buckets)
@@ -448,7 +487,7 @@ fn density_timing() {
             }));
             assert_eq!(seg_total, old_total, "{clock:?} 1/{zoom}");
             println!(
-                "{} 1/{zoom}: whole request {seg:.1} ms (packets from segments {packets:.1} ms), \
+                "{} 1/{zoom} in {buckets}: whole request {seg:.1} ms (packets from segments {packets:.1} ms), \
                  before {old:.1} ms; {seg_total} items",
                 clock.name()
             );
@@ -765,7 +804,8 @@ fn damaged_segments_are_refused() {
     flip("bad trailing magic", len - 1);
     flip("wrong version", len - 12);
     flip("directory claims more entries", len - 16);
-    flip("first section moved", len - 32 - 7 * 32 + 8);
+    let entries = u32::from_le_bytes(good[len - 16..len - 12].try_into().unwrap()) as usize;
+    flip("first section moved", len - 32 - entries * 32 + 8);
     for (what, bytes) in &damaged {
         fs::write(&path, bytes).unwrap();
         assert!(Segment::open(&path).is_err(), "{what}");

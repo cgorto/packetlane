@@ -180,12 +180,16 @@ Limits of working from counters alone are listed at the top of
   a decimal number, with its name if the configuration gives one); text
   logs get lanes too.
 - Density bars when zoomed out, single packets when zoomed in. Packets are
-  counted from their segment files: each holds counts in up to 4,096
-  buckets across its own span, and a view wide enough takes those whole,
-  counting only its two ends packet by packet; a narrower view counts the
-  packets in it from the file's time order. A stored bucket is counted in
-  the bar its start falls in. Text log entries are counted in the store,
-  from counts made at ingest where the view is wide enough.
+  counted from their segment files: each holds counts per stream in
+  buckets across its own span, at widths from 4,096 buckets to the span
+  down to one, each width kept only if it holds at most half the counts of
+  the finer one kept before it (a file of hundreds of streams keeps only
+  the coarser ones). A view takes whole the buckets of the coarsest width
+  no wider than its own bars, counting only its two ends packet by packet;
+  a narrower view counts the packets in it from the file's time order. A
+  stored bucket is counted in the bar its start falls in. Text log entries
+  are counted in the store, from counts made at ingest where the view is
+  wide enough.
 - **Problems** lists the findings; choosing one jumps to it and opens the
   packet.
 - **Details** shows a packet's decoded fields, header values and a hex dump,
