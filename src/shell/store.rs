@@ -772,6 +772,7 @@ fn ingest_packets(
             insert_value.execute(params![
                 packet_id, file_id, v.packet, v.field, v.num, v.text
             ])?;
+            segment.push_value(v.packet, v.field, v.num, v.text.as_deref())?;
             if v.num.is_some() {
                 *series.entry((lane_id, v.packet, v.field)).or_default() += 1;
             }

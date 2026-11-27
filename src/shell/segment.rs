@@ -14,16 +14,24 @@ use std::path::{Path, PathBuf};
 
 use crate::pure::ingest::{PacketRow, ptype_code};
 use crate::pure::segment::{
-    self as layout, BUCKET_BYTES, BucketRecord, ENTRY_BYTES, Entry, FormatError, KIND_BUCKETS,
-    KIND_LABELS, KIND_PACKETS, KIND_TIME, MAGIC, MixHasher, PACKET_BYTES, PacketRecord, TAIL_BYTES,
-    TIME_BYTES, Tail, TimeRecord,
+    self as layout, BUCKET_BYTES, BucketRecord, DELAY, ENTRY_BYTES, Entry, FormatError,
+    GROUP_BYTES, GroupRecord, KIND_BUCKETS, KIND_GROUPS, KIND_LABELS, KIND_PACKETS, KIND_SERIES,
+    KIND_SERIES_BUCKETS, KIND_SERIES_NAMES, KIND_TEXTS, KIND_TIME, KIND_VALUES, MAGIC, MixHasher,
+    PACKET_BYTES, POINT_BYTES, POINT_KEY_BYTES, PacketRecord, PointRecord, SERIES_BUCKET_BYTES,
+    SeriesBucket, TAIL_BYTES, TIME_BYTES, Tail, TimeRecord, VALUE_BYTES, ValueRecord,
 };
 use crate::pure::sql::Clock;
 use crate::shell::store::Result;
 
 /// Records a time-order sorter holds before it writes a sorted run: about
-/// 1 MB each. Two of them run beside SQLite's page cache during ingest.
+/// 1 MB each. Two of them, and two of [`POINT_CHUNK`], run beside SQLite's
+/// page cache during ingest.
 const SORT_CHUNK: usize = (1 << 20) / TIME_BYTES;
+/// The same for the sorters of kept numbers and arrival delays.
+const POINT_CHUNK: usize = (1 << 20) / POINT_KEY_BYTES;
+/// Buffer for each of the temporary files kept values and their texts are
+/// written to.
+const SPOOL_BUFFER: usize = 64 << 10;
 /// Most sorted runs merged at once. More are merged in passes, so open
 /// files and buffers stay the same however long the input.
 const FAN_IN: usize = 32;
@@ -308,6 +316,104 @@ pub struct Writer {
     label_list: Vec<String>,
     sorters: Vec<Sorter<TIME_BYTES>>,
     ranges: [Option<(i64, i64)>; 2],
+    /// Kept series numbered by packet name, then field name.
+    series: HashMap<String, HashMap<String, u32>>,
+    series_list: Vec<(String, String)>,
+    /// Kept values in packet order and their texts, until they are copied
+    /// into the segment at the end.
+    values: Option<Spool>,
+    texts: Option<Spool>,
+    /// Kept numbers and arrival delays per time clock, to be sorted by
+    /// lane, series and time.
+    points: Vec<Sorter<POINT_KEY_BYTES>>,
+    /// The last packet added: its index, lane and times.
+    current: Option<(u32, u32, [Option<i64>; 2])>,
+}
+
+/// Bytes written one after another to a temporary file, to be copied into
+/// a segment when it is finished.
+struct Spool {
+    temp: TempFile,
+    out: BufWriter<File>,
+    len: u64,
+}
+
+impl Spool {
+    fn create(path: PathBuf) -> Result<Spool> {
+        let temp = TempFile::create(path)?;
+        let out = BufWriter::with_capacity(SPOOL_BUFFER, temp.file.try_clone()?);
+        Ok(Spool { temp, out, len: 0 })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.out.write_all(bytes)?;
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Copies everything written to `out`; returns how many bytes.
+    fn copy_into(mut self, out: &mut impl Write) -> Result<u64> {
+        self.out.flush()?;
+        let mut buf = vec![0u8; IO_BUFFER];
+        let mut at = 0u64;
+        while at < self.len {
+            let n = (self.len - at).min(buf.len() as u64) as usize;
+            self.temp.file.read_exact_at(&mut buf[..n], at)?;
+            out.write_all(&buf[..n])?;
+            at += n as u64;
+        }
+        Ok(self.len)
+    }
+}
+
+/// One lane's one series as its points come out of the sorter, with its
+/// buckets so far.
+struct OpenGroup {
+    lane: u32,
+    series: u32,
+    first: u64,
+    count: u64,
+    buckets: Vec<SeriesBucket>,
+}
+
+impl OpenGroup {
+    fn add(&mut self, shift: u32, p: &PointRecord) {
+        self.count += 1;
+        let bucket = layout::bucket_of(p.ns, shift);
+        match self.buckets.last_mut() {
+            Some(b) if b.bucket == bucket => {
+                b.lo = b.lo.min(p.num);
+                b.hi = b.hi.max(p.num);
+                b.count += 1;
+            }
+            _ => self.buckets.push(SeriesBucket {
+                bucket,
+                lo: p.num,
+                hi: p.num,
+                count: 1,
+            }),
+        }
+    }
+
+    /// Its group record, its buckets written to `spool` if they pay.
+    fn close(self, spool: &mut Spool) -> Result<GroupRecord> {
+        let bucket_first = spool.len / SERIES_BUCKET_BYTES as u64;
+        let n = self.buckets.len() as u64;
+        let keep = layout::series_buckets_pay(n, self.count);
+        if keep {
+            for b in &self.buckets {
+                spool.write(&b.encode())?;
+            }
+        }
+        Ok(GroupRecord {
+            lane: self.lane,
+            series: self.series,
+            first: self.first,
+            count: self.count,
+            bucket_first,
+            buckets: if keep { n } else { 0 },
+        })
+    }
 }
 
 impl Writer {
@@ -329,6 +435,15 @@ impl Writer {
         out.write_all(&MAGIC)?;
         let sorter =
             |clock: &str| Sorter::new(folder.join(format!("{file_id}.{clock}")), chunk, FAN_IN);
+        let points = |clock: &str| {
+            let chunk = if chunk == SORT_CHUNK {
+                POINT_CHUNK
+            } else {
+                chunk
+            };
+            Sorter::new(folder.join(format!("{file_id}.{clock}")), chunk, FAN_IN)
+        };
+        let spool = |what: &str| Spool::create(folder.join(format!("{file_id}.{what}.tmp")));
         Ok(Writer {
             folder: folder.to_path_buf(),
             file_id,
@@ -341,7 +456,73 @@ impl Writer {
             label_list: Vec::new(),
             sorters: vec![sorter("receive"), sorter("packet")],
             ranges: [None, None],
+            series: HashMap::new(),
+            series_list: Vec::new(),
+            values: Some(spool("values")?),
+            texts: Some(spool("texts")?),
+            points: vec![points("receive-kept"), points("packet-kept")],
+            current: None,
         })
+    }
+
+    /// The number of a kept series in this segment.
+    fn series_id(&mut self, packet: &str, field: &str) -> Result<u32> {
+        if let Some(&n) = self.series.get(packet).and_then(|f| f.get(field)) {
+            return Ok(n);
+        }
+        let n = u32::try_from(self.series_list.len())
+            .ok()
+            .filter(|&n| n < layout::MAX_SERIES)
+            .ok_or("too many kept fields for a segment")?;
+        self.series
+            .entry(packet.to_string())
+            .or_default()
+            .insert(field.to_string(), n);
+        self.series_list
+            .push((packet.to_string(), field.to_string()));
+        Ok(n)
+    }
+
+    /// Adds a kept value of the packet added last, as the `field_values`
+    /// table gets it. A number that is not a number is kept as none, as
+    /// SQLite stores it.
+    pub fn push_value(
+        &mut self,
+        packet: &str,
+        field: &str,
+        num: Option<f64>,
+        text: Option<&str>,
+    ) -> Result<()> {
+        let (index, lane, times) = self.current.ok_or("a kept value before any packet")?;
+        let series = self.series_id(packet, field)?;
+        let num = num.filter(|n| !n.is_nan());
+        let (Some(values), Some(texts)) = (&mut self.values, &mut self.texts) else {
+            return Err("a kept value after the segment was finished".into());
+        };
+        let text_at = match text {
+            Some(text) => {
+                let at = texts.len;
+                texts.write(&layout::encode_label(text)?)?;
+                Some(at)
+            }
+            None => None,
+        };
+        let record = ValueRecord {
+            index,
+            series,
+            num,
+            text_at,
+        };
+        values.write(&record.encode())?;
+        if let Some(num) = num {
+            for (c, t) in times.into_iter().enumerate() {
+                if let Some(ns) = t {
+                    let p = PointRecord { ns, index, num };
+                    self.points[c].push(layout::point_key(lane, series, &p))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Adds the next packet. Its id is the first packet's plus the number
@@ -387,6 +568,15 @@ impl Writer {
                 });
             }
         }
+        // Arrival delay, on both clocks, for a packet with both times.
+        if let (Some(r), Some(p)) = (row.receive_ns, row.packet_ns) {
+            let num = layout::delay_ms(r, p);
+            for (c, ns) in [r, p].into_iter().enumerate() {
+                let point = PointRecord { ns, index, num };
+                self.points[c].push(layout::point_key(lane, DELAY, &point))?;
+            }
+        }
+        self.current = Some((index, lane, [row.receive_ns, row.packet_ns]));
         self.count += 1;
         Ok(())
     }
@@ -472,6 +662,44 @@ impl Writer {
             }
         }
 
+        // Kept values: the series' names, the values in packet order and
+        // their texts, then for each time clock the numbers and delays by
+        // lane, series and time, their buckets and where each group lies.
+        let start = self.at;
+        for (packet, field) in std::mem::take(&mut self.series_list) {
+            self.append(&layout::encode_label(&packet)?)?;
+            self.append(&layout::encode_label(&field)?)?;
+        }
+        entries.push(Entry {
+            kind: KIND_SERIES_NAMES,
+            clock: 0,
+            record: 0,
+            offset: start,
+            length: self.at - start,
+            param: 0,
+        });
+        let spools = [
+            (KIND_VALUES, VALUE_BYTES as u32, self.values.take()),
+            (KIND_TEXTS, 0, self.texts.take()),
+        ];
+        for (kind, record, spool) in spools {
+            let spool = spool.ok_or("segment finished twice")?;
+            let start = self.at;
+            self.at += spool.copy_into(&mut self.out)?;
+            entries.push(Entry {
+                kind,
+                clock: 0,
+                record,
+                offset: start,
+                length: self.at - start,
+                param: 0,
+            });
+        }
+        for (c, sorter) in std::mem::take(&mut self.points).into_iter().enumerate() {
+            let shift = times[c].map_or(0, |t| t.2);
+            entries.extend(self.series_sections(c as u8, shift, sorter)?);
+        }
+
         let tail = Tail {
             first_packet: self.first_packet,
             packets: self.count,
@@ -504,6 +732,82 @@ impl Writer {
             times,
             order_shift,
         }))
+    }
+
+    /// Writes one time clock's kept numbers and delays from their sorter,
+    /// grouped by lane and series, with each group's buckets on the grid of
+    /// `shift` where they pay, and the groups. Returns the three entries.
+    fn series_sections(
+        &mut self,
+        clock: u8,
+        shift: u32,
+        sorter: Sorter<POINT_KEY_BYTES>,
+    ) -> Result<[Entry; 3]> {
+        let mut buckets = Spool::create(
+            self.folder
+                .join(format!("{}.buckets{clock}.tmp", self.file_id)),
+        )?;
+        let mut groups: Vec<GroupRecord> = Vec::new();
+        let mut open: Option<OpenGroup> = None;
+        let start = self.at;
+        let mut written = 0u64;
+        let out = &mut self.out;
+        sorter.finish(|key| {
+            let (lane, series, point) = layout::from_point_key(&key);
+            if open
+                .as_ref()
+                .is_some_and(|g| (g.lane, g.series) != (lane, series))
+                && let Some(g) = open.take()
+            {
+                groups.push(g.close(&mut buckets)?);
+            }
+            let group = open.get_or_insert_with(|| OpenGroup {
+                lane,
+                series,
+                first: written,
+                count: 0,
+                buckets: Vec::new(),
+            });
+            group.add(shift, &point);
+            out.write_all(&point.encode())?;
+            written += 1;
+            Ok(())
+        })?;
+        if let Some(g) = open.take() {
+            groups.push(g.close(&mut buckets)?);
+        }
+        self.at += written * POINT_BYTES as u64;
+        let series = Entry {
+            kind: KIND_SERIES,
+            clock,
+            record: POINT_BYTES as u32,
+            offset: start,
+            length: self.at - start,
+            param: 0,
+        };
+        let start = self.at;
+        self.at += buckets.copy_into(&mut self.out)?;
+        let bucket_entry = Entry {
+            kind: KIND_SERIES_BUCKETS,
+            clock,
+            record: SERIES_BUCKET_BYTES as u32,
+            offset: start,
+            length: self.at - start,
+            param: i64::from(shift),
+        };
+        let start = self.at;
+        for g in &groups {
+            self.append(&g.encode())?;
+        }
+        let group_entry = Entry {
+            kind: KIND_GROUPS,
+            clock,
+            record: GROUP_BYTES as u32,
+            offset: start,
+            length: self.at - start,
+            param: 0,
+        };
+        Ok([series, bucket_entry, group_entry])
     }
 
     /// How many bucket records each level from `base` up would hold, and
@@ -829,6 +1133,273 @@ impl Segment {
         Ok(PacketRecord::decode(&b))
     }
 
+    /// The first record in `lo..hi` of a fixed-width section for which
+    /// `before`, given the record's first `key` bytes, is false, by binary
+    /// search with one small read a step. `before` must be true for a
+    /// leading run of records and false after.
+    fn search(
+        &self,
+        e: &Entry,
+        (mut lo, mut hi): (u64, u64),
+        key: usize,
+        before: impl Fn(&[u8]) -> bool,
+    ) -> Result<u64> {
+        let mut b = [0u8; 16];
+        let key = key.min(16).min(e.record as usize);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            self.file
+                .read_exact_at(&mut b[..key], e.offset + mid * u64::from(e.record))?;
+            if before(&b[..key]) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Hands records `from..to` of a fixed-width section to `f`, in order,
+    /// until `f` returns false.
+    fn each<const N: usize>(
+        &self,
+        e: &Entry,
+        from: u64,
+        to: u64,
+        mut f: impl FnMut(&[u8; N]) -> Result<bool>,
+    ) -> Result<()> {
+        let to = to.min(e.records());
+        if from >= to {
+            return Ok(());
+        }
+        let mut r = RangeReader::<N>::new(
+            &self.file,
+            e.offset + from * N as u64,
+            e.offset + to * N as u64,
+            SCAN_BUFFER,
+        );
+        while let Some(rec) = r.read()? {
+            if !f(&rec)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Packets `from..=to` by index within the segment, with their index.
+    pub fn packets_in(
+        &self,
+        from: u64,
+        to: u64,
+        mut f: impl FnMut(u64, PacketRecord) -> Result<bool>,
+    ) -> Result<()> {
+        let e = self.section(KIND_PACKETS, 0)?;
+        let mut index = from;
+        self.each::<PACKET_BYTES>(&e, from, to.saturating_add(1), |rec| {
+            let go = f(index, PacketRecord::decode(rec))?;
+            index += 1;
+            Ok(go)
+        })
+    }
+
+    /// A cursor over the packets whose time on a time clock is at least
+    /// `from`, in order of time and index.
+    pub fn times_from(&self, clock: Clock, from: i64) -> Result<TimeCursor<'_>> {
+        let e = self.section(KIND_TIME, layout::clock_code(clock))?;
+        let first = self.lower_bound(&e, from)?;
+        Ok(TimeCursor {
+            reader: RangeReader::new(
+                &self.file,
+                e.offset + first * TIME_BYTES as u64,
+                e.offset + e.length,
+                SCAN_BUFFER,
+            ),
+        })
+    }
+
+    /// The kept series this segment names, by number: packet name and
+    /// field name.
+    pub fn series_names(&self) -> Result<Vec<(String, String)>> {
+        let e = self.section(KIND_SERIES_NAMES, 0)?;
+        let len = usize::try_from(e.length).map_err(|_| "series names section too large")?;
+        let mut b = vec![0u8; len];
+        self.file.read_exact_at(&mut b, e.offset)?;
+        let names = layout::decode_labels(&b)?;
+        if names.len() % 2 != 0 {
+            return Err(FormatError("series names section is not in pairs".into()).into());
+        }
+        Ok(names
+            .chunks_exact(2)
+            .map(|p| (p[0].clone(), p[1].clone()))
+            .collect())
+    }
+
+    /// The number of a kept series in this segment, if it has the series.
+    pub fn series_id(&self, packet: &str, field: &str) -> Result<Option<u32>> {
+        Ok(self
+            .series_names()?
+            .iter()
+            .position(|(p, f)| p == packet && f == field)
+            .map(|n| n as u32))
+    }
+
+    /// Every group (lane and series) of kept numbers and delays on a time
+    /// clock, in order of lane and series, each checked to lie within its
+    /// sections.
+    pub fn groups(&self, clock: Clock) -> Result<Vec<GroupRecord>> {
+        let code = layout::clock_code(clock);
+        let e = self.section(KIND_GROUPS, code)?;
+        let points = self.section(KIND_SERIES, code)?.records();
+        let buckets = self.section(KIND_SERIES_BUCKETS, code)?.records();
+        let series = self.series_names()?.len() as u64;
+        let mut out = Vec::with_capacity(e.records() as usize);
+        let mut bad = false;
+        self.each::<GROUP_BYTES>(&e, 0, e.records(), |rec| {
+            let g = GroupRecord::decode(rec);
+            let ends =
+                |first: u64, n: u64, of: u64| first.checked_add(n).is_some_and(|end| end <= of);
+            bad = !ends(g.first, g.count, points)
+                || !ends(g.bucket_first, g.buckets, buckets)
+                || (g.series != DELAY && u64::from(g.series) >= series)
+                || out.last().is_some_and(|last: &GroupRecord| {
+                    (last.lane, last.series) >= (g.lane, g.series)
+                });
+            out.push(g);
+            Ok(!bad)
+        })?;
+        if bad {
+            return Err(FormatError("a group of kept numbers is out of range".into()).into());
+        }
+        Ok(out)
+    }
+
+    /// The group of one lane's one series on a time clock, if there is one.
+    pub fn group(&self, clock: Clock, lane: u32, series: u32) -> Result<Option<GroupRecord>> {
+        let groups = self.groups(clock)?;
+        Ok(groups
+            .binary_search_by(|g| (g.lane, g.series).cmp(&(lane, series)))
+            .ok()
+            .map(|i| groups[i]))
+    }
+
+    /// The grid shift of a time clock's series buckets.
+    pub fn series_shift(&self, clock: Clock) -> Result<u32> {
+        let e = self.section(KIND_SERIES_BUCKETS, layout::clock_code(clock))?;
+        Ok(e.param as u32)
+    }
+
+    /// The points of a group whose time lies in `lo..=hi`, in order.
+    pub fn group_points(
+        &self,
+        clock: Clock,
+        g: &GroupRecord,
+        lo: i64,
+        hi: i64,
+        mut f: impl FnMut(PointRecord),
+    ) -> Result<()> {
+        if lo > hi {
+            return Ok(());
+        }
+        let e = self.section(KIND_SERIES, layout::clock_code(clock))?;
+        let end = g.first + g.count;
+        let first = self.search(&e, (g.first, end), 8, |b| i64_le(b) < lo)?;
+        self.each::<POINT_BYTES>(&e, first, end, |rec| {
+            let p = PointRecord::decode(rec);
+            if p.ns > hi {
+                return Ok(false);
+            }
+            f(p);
+            Ok(true)
+        })
+    }
+
+    /// The stored buckets of a group from `first` to `last`, in order.
+    pub fn group_buckets(
+        &self,
+        clock: Clock,
+        g: &GroupRecord,
+        first: i64,
+        last: i64,
+        mut f: impl FnMut(SeriesBucket),
+    ) -> Result<()> {
+        let e = self.section(KIND_SERIES_BUCKETS, layout::clock_code(clock))?;
+        let end = g.bucket_first + g.buckets;
+        let from = self.search(&e, (g.bucket_first, end), 8, |b| i64_le(b) < first)?;
+        self.each::<SERIES_BUCKET_BYTES>(&e, from, end, |rec| {
+            let b = SeriesBucket::decode(rec);
+            if b.bucket > last {
+                return Ok(false);
+            }
+            f(b);
+            Ok(true)
+        })
+    }
+
+    /// The kept values of packets `from..=to` (indexes within the segment),
+    /// in packet order and, within a packet, in the order they were kept.
+    pub fn values_in(
+        &self,
+        from: u64,
+        to: u64,
+        mut f: impl FnMut(ValueRecord) -> Result<bool>,
+    ) -> Result<()> {
+        let e = self.section(KIND_VALUES, 0)?;
+        let first = self.search(&e, (0, e.records()), 4, |b| u64::from(u32_le(b)) < from)?;
+        self.each::<VALUE_BYTES>(&e, first, e.records(), |rec| {
+            let v = ValueRecord::decode(rec);
+            if u64::from(v.index) > to {
+                return Ok(false);
+            }
+            f(v)
+        })
+    }
+
+    /// The text of a value, from the texts section.
+    pub fn text(&self, at: u64) -> Result<String> {
+        let e = self.section(KIND_TEXTS, 0)?;
+        let fail = || -> Error { FormatError("a kept text is out of range".into()).into() };
+        if at.checked_add(4).is_none_or(|end| end > e.length) {
+            return Err(fail());
+        }
+        let mut len = [0u8; 4];
+        self.file.read_exact_at(&mut len, e.offset + at)?;
+        let len = u64::from(u32::from_le_bytes(len));
+        if at + 4 + len > e.length {
+            return Err(fail());
+        }
+        let mut b = vec![0u8; len as usize];
+        self.file.read_exact_at(&mut b, e.offset + at + 4)?;
+        String::from_utf8(b).map_err(|_| FormatError("a kept text is not UTF-8".into()).into())
+    }
+
+    /// The kept values of the packet at `index`: packet name, field name,
+    /// number and text, in the order they were kept.
+    pub fn values_of(&self, index: u64) -> Result<Vec<KeptRow>> {
+        let names = self.series_names()?;
+        let mut found = Vec::new();
+        self.values_in(index, index, |v| {
+            found.push(v);
+            Ok(true)
+        })?;
+        let mut out = Vec::with_capacity(found.len());
+        for v in found {
+            let (packet, field) = names
+                .get(v.series as usize)
+                .ok_or_else(|| FormatError("a kept value names no series".into()))?;
+            let text = match v.text_at {
+                Some(at) => Some(self.text(at)?),
+                None => None,
+            };
+            out.push(KeptRow {
+                packet: packet.clone(),
+                field: field.clone(),
+                num: v.num,
+                text,
+            });
+        }
+        Ok(out)
+    }
+
     /// The segment's labels, numbered as packet records refer to them.
     pub fn labels(&self) -> Result<Vec<String>> {
         let e = self.section(KIND_LABELS, 0)?;
@@ -837,6 +1408,36 @@ impl Segment {
         self.file.read_exact_at(&mut b, e.offset)?;
         Ok(layout::decode_labels(&b)?)
     }
+}
+
+/// One kept value read back: as a `field_values` row has it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptRow {
+    pub packet: String,
+    pub field: String,
+    pub num: Option<f64>,
+    pub text: Option<String>,
+}
+
+/// Packets in order of time and index on one time clock, from a segment.
+pub struct TimeCursor<'a> {
+    reader: RangeReader<'a, TIME_BYTES>,
+}
+
+impl TimeCursor<'_> {
+    pub fn next_time(&mut self) -> Result<Option<TimeRecord>> {
+        Ok(self.reader.read()?.map(|b| TimeRecord::decode(&b)))
+    }
+}
+
+fn i64_le(b: &[u8]) -> i64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[..8]);
+    i64::from_le_bytes(a)
+}
+
+fn u32_le(b: &[u8]) -> u32 {
+    u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
 
 /// One segment as the store lists it: enough to decide, without opening
@@ -896,6 +1497,7 @@ pub fn density(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Scratch(PathBuf);
@@ -1073,6 +1675,200 @@ mod tests {
             (40, 4 ^ 0x5555, Some(0), 5)
         );
         assert_eq!(seg.labels().unwrap(), ["A"]);
+    }
+
+    #[test]
+    fn kept_values_and_delays_are_written_by_packet_and_by_series() {
+        let scratch = Scratch::new();
+        // Sorters of three records: everything below spills.
+        let mut writer = Writer::with_chunk(&scratch.0, 3, 100, 3).unwrap();
+        // (index, lane, receive, packet) and what each packet keeps.
+        let mut want_values: Vec<Vec<KeptRow>> = Vec::new();
+        type Points = Vec<(i64, u32, f64)>;
+        let mut want_points: BTreeMap<(u32, &str, usize), Points> = BTreeMap::new();
+        let kept = |packet: &str, field: &str, num: Option<f64>, text: Option<&str>| KeptRow {
+            packet: packet.into(),
+            field: field.into(),
+            num,
+            text: text.map(str::to_string),
+        };
+        for i in 0..600u32 {
+            let lane = 1 + i % 2;
+            let r = (i % 5 != 0).then_some(i64::from(i) * 1_000 + 7);
+            let p = (i % 3 != 0).then_some(i64::from(i) * 1_000 - (i64::from(i) % 4) * 250_000);
+            writer
+                .push(i64::from(lane), &row(i64::from(i), r, p), None)
+                .unwrap();
+            let mut values = Vec::new();
+            // A number on every packet; on lane 2 a label with it; now and
+            // then a text alone, a number that is not one, and an array.
+            values.push(kept("HK", "VOLTS", Some(f64::from(i) * 0.5 - 7.0), None));
+            if lane == 2 {
+                values.push(kept("HK", "MODE", Some(f64::from(i % 3)), Some("RUN")));
+            }
+            if i % 7 == 0 {
+                values.push(kept("TXT", "NAME", None, Some("unit ünï")));
+                values.push(kept("HK", "NAN", Some(f64::NAN), None));
+                values.push(kept("ARR", "SAMPLES", None, Some("[1, 2, 3]")));
+            }
+            for v in &values {
+                writer
+                    .push_value(&v.packet, &v.field, v.num, v.text.as_deref())
+                    .unwrap();
+            }
+            let series_of = |v: &KeptRow| match (v.packet.as_str(), v.field.as_str()) {
+                ("HK", "VOLTS") => "VOLTS",
+                ("HK", "MODE") => "MODE",
+                _ => "-",
+            };
+            for (c, t) in [r, p].into_iter().enumerate() {
+                let Some(ns) = t else { continue };
+                for v in &values {
+                    if let (Some(num), "VOLTS" | "MODE") =
+                        (v.num.filter(|n| !n.is_nan()), series_of(v))
+                    {
+                        let entry = want_points.entry((lane, series_of(v), c)).or_default();
+                        entry.push((ns, i, num));
+                    }
+                }
+                if let (Some(r), Some(p)) = (r, p) {
+                    let entry = want_points.entry((lane, "", c)).or_default();
+                    entry.push((ns, i, (r - p) as f64 / 1e6));
+                }
+            }
+            // As SQLite stores it: a number that is not one is none.
+            for v in &mut values {
+                v.num = v.num.filter(|n| !n.is_nan());
+            }
+            want_values.push(values);
+        }
+        let written = writer.finish().unwrap().unwrap();
+        let names: Vec<_> = fs::read_dir(&scratch.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("3.seg")]);
+        let seg = Segment::open(&scratch.0.join(&written.name)).unwrap();
+
+        // By packet: every value, in order, numbers and texts as kept.
+        for (i, want) in want_values.iter().enumerate() {
+            let got = seg.values_of(i as u64).unwrap();
+            assert_eq!(got.len(), want.len(), "{i}");
+            for (g, w) in got.iter().zip(want) {
+                assert_eq!(
+                    (&g.packet, &g.field, g.num.map(f64::to_bits), &g.text),
+                    (&w.packet, &w.field, w.num.map(f64::to_bits), &w.text),
+                    "{i}"
+                );
+            }
+        }
+        assert!(seg.values_of(600).unwrap().is_empty());
+        assert_eq!(
+            seg.series_id("HK", "MODE").unwrap(),
+            Some(4),
+            "{:?}",
+            seg.series_names()
+        );
+        assert_eq!(seg.series_id("HK", "NOPE").unwrap(), None);
+
+        // By series: each lane's numbers and delays in order of time.
+        for (c, clock) in [Clock::Receive, Clock::Packet].into_iter().enumerate() {
+            let groups = seg.groups(clock).unwrap();
+            let keys: Vec<_> = groups.iter().map(|g| (g.lane, g.series)).collect();
+            let id = |name: &str| match name {
+                "" => DELAY,
+                name => seg.series_id("HK", name).unwrap().unwrap(),
+            };
+            let mut by_id = BTreeMap::new();
+            for ((lane, name, clock), points) in &want_points {
+                if *clock == c {
+                    by_id.insert((*lane, id(name)), points.clone());
+                }
+            }
+            let want_keys: Vec<_> = by_id.keys().copied().collect();
+            assert_eq!(keys, want_keys, "{clock:?}");
+            let shift = seg.series_shift(clock).unwrap();
+            assert_eq!(shift, written.times[c].unwrap().2);
+            for g in &groups {
+                let mut want = by_id[&(g.lane, g.series)].clone();
+                want.sort_by_key(|a| (a.0, a.1));
+                let mut got = Vec::new();
+                seg.group_points(clock, g, i64::MIN, i64::MAX, |p| {
+                    got.push((p.ns, p.index, p.num));
+                })
+                .unwrap();
+                assert_eq!(got, want, "{clock:?} {g:?}");
+                // A window is a binary search and a scan.
+                let (lo, hi) = (want[10].0, want[20].0);
+                let mut part = Vec::new();
+                seg.group_points(clock, g, lo, hi, |p| part.push(p.ns))
+                    .unwrap();
+                let expect: Vec<i64> = want
+                    .iter()
+                    .map(|w| w.0)
+                    .filter(|t| (lo..=hi).contains(t))
+                    .collect();
+                assert_eq!(part, expect);
+                // Few points a bucket here: no buckets are kept.
+                assert_eq!(g.buckets, 0, "{g:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn series_buckets_are_kept_where_they_pay() {
+        let scratch = Scratch::new();
+        let mut writer = Writer::with_chunk(&scratch.0, 4, 1, 50).unwrap();
+        // Lane 1 has 5,000 numbers over a span of 1,000 ns: many a bucket.
+        // Lane 2 has 20 numbers spread over it: about one a bucket.
+        for i in 0..5_020i64 {
+            let lane = if i % 251 == 0 { 2 } else { 1 };
+            writer
+                .push(lane, &row(i, Some(i * 1_000 / 5_020), None), None)
+                .unwrap();
+            writer
+                .push_value("HK", "V", Some((i % 13) as f64), None)
+                .unwrap();
+        }
+        let written = writer.finish().unwrap().unwrap();
+        let seg = Segment::open(&scratch.0.join(&written.name)).unwrap();
+        let shift = seg.series_shift(Clock::Receive).unwrap();
+        assert_eq!(shift, 0);
+        let dense = seg.group(Clock::Receive, 1, 0).unwrap().unwrap();
+        let sparse = seg.group(Clock::Receive, 2, 0).unwrap().unwrap();
+        assert_eq!(sparse.buckets, 0);
+        assert!(dense.buckets > 0 && dense.buckets * 4 <= dense.count);
+        let mut points = Vec::new();
+        seg.group_points(Clock::Receive, &dense, i64::MIN, i64::MAX, |p| {
+            points.push(p)
+        })
+        .unwrap();
+        let mut buckets = Vec::new();
+        seg.group_buckets(Clock::Receive, &dense, i64::MIN, i64::MAX, |b| {
+            buckets.push(b)
+        })
+        .unwrap();
+        // Each bucket is the lowest, highest and number of its points.
+        let mut want: Vec<SeriesBucket> = Vec::new();
+        for p in &points {
+            let bucket = layout::bucket_of(p.ns, shift);
+            match want.last_mut() {
+                Some(b) if b.bucket == bucket => {
+                    b.lo = b.lo.min(p.num);
+                    b.hi = b.hi.max(p.num);
+                    b.count += 1;
+                }
+                _ => want.push(SeriesBucket {
+                    bucket,
+                    lo: p.num,
+                    hi: p.num,
+                    count: 1,
+                }),
+            }
+        }
+        assert_eq!(buckets, want);
+        assert_eq!(seg.group(Clock::Receive, 3, 0).unwrap(), None);
+        assert!(seg.group(Clock::Packet, 1, 0).unwrap().is_none());
     }
 
     #[test]

@@ -56,7 +56,7 @@
 //!
 //! Clocks are numbered 0 receive, 1 packet, 2 order.
 //!
-//! Sections in version 2:
+//! Sections in version 3:
 //!
 //! - kind 1, packets: one 56-byte record per logged item, in id order;
 //!   packet id = first packet id + index. Record: receive time (i64), packet
@@ -90,6 +90,43 @@
 //!   levels; one of a few lanes keeps them all. A view reads the coarsest
 //!   level no wider than its own buckets ([`level_for`]), or with none
 //!   counts every packet.
+//!
+//! Kept values (fields marked `keep`) hold everything the `field_values`
+//! table holds, one record for each of its rows:
+//!
+//! - kind 5, series names: the segment's kept series, each a packet name
+//!   and a field name encoded as labels are, numbered from 0 in order.
+//! - kind 6, values: a 24-byte record per kept value, in packet order and,
+//!   within a packet, in the order the values were kept: index (u32),
+//!   series (u32: the number in its low 24 bits, flags in the high 8),
+//!   number (f64), and where its text starts in the texts section (u64).
+//!   Flags: [`VALUE_NUM`] and [`VALUE_TEXT`]; a value may have both, either
+//!   or neither (a number that is not a number, which SQLite stores as
+//!   null, is kept as none). Every value is here whatever the packet's
+//!   times; a packet's values are found by a binary search on the index.
+//! - kind 7, texts: the values' texts, each a u32 length and that many
+//!   bytes of UTF-8.
+//! - kind 8, kept numbers in time order, one per time clock (receive,
+//!   packet): a 20-byte record (time i64, index u32, number f64) for every
+//!   value with a number on a packet with that time, and one for the
+//!   arrival delay of every packet with both times, in groups of one lane
+//!   and one series, each sorted by time and then index. A delay is the
+//!   series [`DELAY`]; its number is milliseconds, worked out once as
+//!   SQLite does ([`delay_ms`]), so plotting it is the same as plotting a
+//!   kept field.
+//! - kind 9, groups, one per time clock: a 40-byte record per group, sorted
+//!   by lane and series: lane (u32), series (u32), first record in kind 8
+//!   and how many (u64 each), first record in kind 10 and how many (u64
+//!   each; none if the group's buckets were not worth keeping). One lane's
+//!   one series over a window is a binary search in its group and a scan.
+//! - kind 10, series buckets, one per time clock, whose parameter is the
+//!   clock's base grid shift: a 32-byte record (bucket i64, lowest f64,
+//!   highest f64, count u64) per bucket of a group that holds numbers, in
+//!   bucket order, for the groups whose buckets pay
+//!   ([`series_buckets_pay`]: at most a quarter as many as the group's
+//!   numbers). A plot takes them as density takes its buckets: whole only
+//!   when the plot's buckets are at least as wide and the stored bucket
+//!   lies wholly inside the window, the two ends read point by point.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -99,7 +136,7 @@ use crate::pure::sql::Clock;
 
 pub const MAGIC: [u8; 8] = *b"PLSEGMNT";
 pub const TAIL_MAGIC: [u8; 8] = *b"PLSEGEND";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 pub const PACKET_BYTES: usize = 56;
 pub const TIME_BYTES: usize = 16;
@@ -117,6 +154,30 @@ pub const KIND_PACKETS: u16 = 1;
 pub const KIND_LABELS: u16 = 2;
 pub const KIND_TIME: u16 = 3;
 pub const KIND_BUCKETS: u16 = 4;
+pub const KIND_SERIES_NAMES: u16 = 5;
+pub const KIND_VALUES: u16 = 6;
+pub const KIND_TEXTS: u16 = 7;
+pub const KIND_SERIES: u16 = 8;
+pub const KIND_GROUPS: u16 = 9;
+pub const KIND_SERIES_BUCKETS: u16 = 10;
+
+pub const VALUE_BYTES: usize = 24;
+pub const POINT_BYTES: usize = 20;
+pub const GROUP_BYTES: usize = 40;
+pub const SERIES_BUCKET_BYTES: usize = 32;
+/// The sort key of a point while a segment is written: lane, series, time,
+/// index, value.
+pub const POINT_KEY_BYTES: usize = 28;
+
+/// The series number of arrival delay in the time-order sections.
+pub const DELAY: u32 = u32::MAX;
+/// Kept series a segment may name: series numbers take 24 bits of a value
+/// record.
+pub const MAX_SERIES: u32 = 1 << 24;
+
+/// Flags of a value record.
+pub const VALUE_NUM: u8 = 1;
+pub const VALUE_TEXT: u8 = 2;
 
 pub const HAS_RECEIVE: u8 = 1;
 pub const HAS_PACKET: u8 = 2;
@@ -314,6 +375,197 @@ impl BucketRecord {
     }
 }
 
+/// One kept value of a packet, as the `field_values` table has it: a
+/// number, a text, both or (a number that is not one, which SQLite stores
+/// as null) neither.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueRecord {
+    /// The packet's index in the segment.
+    pub index: u32,
+    /// Its number in the series names section.
+    pub series: u32,
+    pub num: Option<f64>,
+    /// Where its text starts in the texts section.
+    pub text_at: Option<u64>,
+}
+
+impl ValueRecord {
+    pub fn encode(&self) -> [u8; VALUE_BYTES] {
+        let mut b = [0u8; VALUE_BYTES];
+        let mut flags = 0u8;
+        b[0..4].copy_from_slice(&self.index.to_le_bytes());
+        if let Some(n) = self.num {
+            b[8..16].copy_from_slice(&n.to_bits().to_le_bytes());
+            flags |= VALUE_NUM;
+        }
+        if let Some(at) = self.text_at {
+            b[16..24].copy_from_slice(&at.to_le_bytes());
+            flags |= VALUE_TEXT;
+        }
+        let series = (self.series & (MAX_SERIES - 1)) | (u32::from(flags) << 24);
+        b[4..8].copy_from_slice(&series.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> ValueRecord {
+        let series = u32_at(b, 4);
+        let flags = (series >> 24) as u8;
+        ValueRecord {
+            index: u32_at(b, 0),
+            series: series & (MAX_SERIES - 1),
+            num: (flags & VALUE_NUM != 0).then(|| f64::from_bits(u64_at(b, 8))),
+            text_at: (flags & VALUE_TEXT != 0).then(|| u64_at(b, 16)),
+        }
+    }
+
+    /// The index of an encoded record, without decoding the rest.
+    pub fn index_of(b: &[u8]) -> u32 {
+        u32_at(b, 0)
+    }
+}
+
+/// One number of a series at one time, in a time-order section of kept
+/// numbers. Its lane and series are its group's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PointRecord {
+    pub ns: i64,
+    pub index: u32,
+    pub num: f64,
+}
+
+impl PointRecord {
+    pub fn encode(&self) -> [u8; POINT_BYTES] {
+        let mut b = [0u8; POINT_BYTES];
+        b[0..8].copy_from_slice(&self.ns.to_le_bytes());
+        b[8..12].copy_from_slice(&self.index.to_le_bytes());
+        b[12..20].copy_from_slice(&self.num.to_bits().to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> PointRecord {
+        PointRecord {
+            ns: i64_at(b, 0),
+            index: u32_at(b, 8),
+            num: f64::from_bits(u64_at(b, 12)),
+        }
+    }
+}
+
+/// A point while a segment is written, with its lane and series, as bytes
+/// whose order is the section's: lane, series, time, index (and the value,
+/// which only orders two values of one field of one packet).
+pub fn point_key(lane: u32, series: u32, p: &PointRecord) -> [u8; POINT_KEY_BYTES] {
+    let mut b = [0u8; POINT_KEY_BYTES];
+    b[0..4].copy_from_slice(&lane.to_be_bytes());
+    b[4..8].copy_from_slice(&series.to_be_bytes());
+    b[8..16].copy_from_slice(&(((p.ns as u64) ^ (1 << 63)).to_be_bytes()));
+    b[16..20].copy_from_slice(&p.index.to_be_bytes());
+    b[20..28].copy_from_slice(&p.num.to_bits().to_be_bytes());
+    b
+}
+
+/// The lane, series and point of a [`point_key`].
+pub fn from_point_key(b: &[u8; POINT_KEY_BYTES]) -> (u32, u32, PointRecord) {
+    let be32 = |at: usize| u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    let be64 = |at: usize| {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[at..at + 8]);
+        u64::from_be_bytes(a)
+    };
+    let point = PointRecord {
+        ns: (be64(8) ^ (1 << 63)) as i64,
+        index: be32(16),
+        num: f64::from_bits(be64(20)),
+    };
+    (be32(0), be32(4), point)
+}
+
+/// Where one lane's one series lies in a time-order section of kept numbers
+/// and in its buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GroupRecord {
+    pub lane: u32,
+    /// A number in the series names section, or [`DELAY`].
+    pub series: u32,
+    /// First record and number of records in the section.
+    pub first: u64,
+    pub count: u64,
+    /// The same in the series buckets section; no buckets if none were
+    /// worth keeping.
+    pub bucket_first: u64,
+    pub buckets: u64,
+}
+
+impl GroupRecord {
+    pub fn encode(&self) -> [u8; GROUP_BYTES] {
+        let mut b = [0u8; GROUP_BYTES];
+        b[0..4].copy_from_slice(&self.lane.to_le_bytes());
+        b[4..8].copy_from_slice(&self.series.to_le_bytes());
+        b[8..16].copy_from_slice(&self.first.to_le_bytes());
+        b[16..24].copy_from_slice(&self.count.to_le_bytes());
+        b[24..32].copy_from_slice(&self.bucket_first.to_le_bytes());
+        b[32..40].copy_from_slice(&self.buckets.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> GroupRecord {
+        GroupRecord {
+            lane: u32_at(b, 0),
+            series: u32_at(b, 4),
+            first: u64_at(b, 8),
+            count: u64_at(b, 16),
+            bucket_first: u64_at(b, 24),
+            buckets: u64_at(b, 32),
+        }
+    }
+}
+
+/// The lowest and highest number of a series in one bucket, and how many.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SeriesBucket {
+    pub bucket: i64,
+    pub lo: f64,
+    pub hi: f64,
+    pub count: u64,
+}
+
+impl SeriesBucket {
+    pub fn encode(&self) -> [u8; SERIES_BUCKET_BYTES] {
+        let mut b = [0u8; SERIES_BUCKET_BYTES];
+        b[0..8].copy_from_slice(&self.bucket.to_le_bytes());
+        b[8..16].copy_from_slice(&self.lo.to_bits().to_le_bytes());
+        b[16..24].copy_from_slice(&self.hi.to_bits().to_le_bytes());
+        b[24..32].copy_from_slice(&self.count.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> SeriesBucket {
+        SeriesBucket {
+            bucket: i64_at(b, 0),
+            lo: f64::from_bits(u64_at(b, 8)),
+            hi: f64::from_bits(u64_at(b, 16)),
+            count: u64_at(b, 24),
+        }
+    }
+}
+
+/// Whether a series' buckets are worth keeping: at most a quarter as many
+/// as its numbers, so that reading them costs at most a quarter of reading
+/// the numbers.
+pub fn series_buckets_pay(buckets: u64, numbers: u64) -> bool {
+    buckets > 0 && buckets.saturating_mul(4) <= numbers
+}
+
+/// Arrival delay in milliseconds, as SQLite works it out from
+/// `(receive_ns - packet_ns) / 1000000.0`: the difference in whole
+/// nanoseconds, or in floating point if that does not fit in 64 bits.
+pub fn delay_ms(receive_ns: i64, packet_ns: i64) -> f64 {
+    match receive_ns.checked_sub(packet_ns) {
+        Some(d) => d as f64 / 1_000_000.0,
+        None => (receive_ns as f64 - packet_ns as f64) / 1_000_000.0,
+    }
+}
+
 /// One label as stored in the labels section.
 pub fn encode_label(text: &str) -> Result<Vec<u8>, FormatError> {
     let len = u32::try_from(text.len()).or_else(|_| bad("label too long"))?;
@@ -461,6 +713,12 @@ pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<()
             KIND_LABELS => (0, &[0]),
             KIND_TIME => (TIME_BYTES as u32, &[0, 1]),
             KIND_BUCKETS => (BUCKET_BYTES as u32, &[0, 1, 2]),
+            KIND_SERIES_NAMES => (0, &[0]),
+            KIND_VALUES => (VALUE_BYTES as u32, &[0]),
+            KIND_TEXTS => (0, &[0]),
+            KIND_SERIES => (POINT_BYTES as u32, &[0, 1]),
+            KIND_GROUPS => (GROUP_BYTES as u32, &[0, 1]),
+            KIND_SERIES_BUCKETS => (SERIES_BUCKET_BYTES as u32, &[0, 1]),
             // A section of a later version.
             _ => continue,
         };
@@ -470,7 +728,7 @@ pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<()
         if record != 0 && e.length % u64::from(record) != 0 {
             return bad(format!("section of kind {} is cut short", e.kind));
         }
-        if e.kind == KIND_BUCKETS && !(0..=63).contains(&e.param) {
+        if matches!(e.kind, KIND_BUCKETS | KIND_SERIES_BUCKETS) && !(0..=63).contains(&e.param) {
             return bad("bucket grid shift out of range");
         }
         if e.kind == KIND_PACKETS {
