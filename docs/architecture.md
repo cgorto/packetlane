@@ -30,10 +30,21 @@ the facts and asks the core.
 | Checks | `continuity`, `order`, `limits`, `cross`: packets or stored counts in, findings out, all as one type (`finding`) with a fixed list of kinds; `pipeline` runs the per-file ones | prints or stores them |
 | Naming and decoding packets | `config`, `format`: definitions plus bytes give named values | reads the config file, reads packet bytes back from the log |
 | Store | `sql`: schema text, statements and their parameters; `ingest`: records to rows | `store`: owns the connection, runs statements |
+| Segment files | `segment`: record and directory layouts, the bucket grid, how a density view is counted from stored buckets and single packets | `segment`: writes a file's packets beside the store as it is read (sorting in bounded chunks), reads them back with positioned reads; `store` lists them in the `segments` table |
 | Web API | `http`: bytes to request, response to bytes; `api`: request to an authorised command, results to JSON | `server`: owns the socket, runs the command against the store |
 | File browser | `paths`: is this canonical path inside the allowed roots | canonicalises paths, lists directories |
 | Access token | compares tokens | supplies the random bytes |
 | Time | `time`: calendar arithmetic, parsing, packet time codes | supplies "now" when a timestamp of the present is needed |
+
+## Where things are stored
+
+Everything is in one SQLite file, and each packet file's packets are also
+written to a segment file of their own in a folder beside it
+(`<store>.seg/`), listed in the store's `segments` table. For now both
+hold the same packets: the timeline's density is read from the segments,
+and every other reader still uses SQLite, which the tests use to check
+the segments. The format is described in `src/pure/segment.rs`. A store
+from a build before schema 4 is refused.
 
 ## Decoders
 

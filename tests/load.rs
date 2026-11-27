@@ -378,7 +378,9 @@ fn measure(name: &str, dir: &Path, run_dir: &Path, expect_packets: Option<u64>) 
         baseline.change("ingest, seconds", secs),
     );
     let (again, _, _) = run(&["ingest", "--db", db_text, run_text]);
-    let store_bytes = fs::metadata(&db).unwrap().len();
+    // The store is its SQLite file and the segment files beside it.
+    let segments = packetlane::shell::segment::folder_for(&db);
+    let store_bytes = fs::metadata(&db).unwrap().len() + folder_bytes(&segments);
     println!(
         "  ingest again, nothing changed: {:.2} s; store {:.0} MB, {:.1} times the logs",
         again.as_secs_f64(),

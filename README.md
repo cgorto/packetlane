@@ -142,6 +142,15 @@ Limits of working from counters alone are listed at the top of
   by its place in the run and a checksum of its content: ingesting it again
   changes nothing, and a file that has changed replaces what was read before.
   Changing the configuration makes the whole run be read again.
+- Each packet file's packets are also written to a segment file of their
+  own, in a folder beside the store named after it (`packetlane.db.seg/`
+  for `packetlane.db`). The timeline's packet counts are read from these;
+  everything else still reads SQLite. A segment is written whole before
+  the store lists it, replaced when its file is read again, and one the
+  store does not list is removed the next time the store is opened for
+  writing.
+  Delete the folder with the store. The layout is described at the top of
+  `src/pure/segment.rs`.
 - Views `packet_view`, `log_view`, `finding_view`, `file_view` and
   `value_view` (the stored values of fields marked `keep`) are the
   friendly way in for queries: one row per item, with the run, source and
@@ -149,10 +158,13 @@ Limits of working from counters alone are listed at the top of
 - `packetlane query` and the SQL box in the UI accept one statement that
   reads. The connection they use cannot write.
 - A store made by an earlier build with a different layout is refused, and
-  says so: delete it and ingest again. Nothing in it is not in the logs.
+  says so (this build's is layout 4; the segment files came with it): delete
+  it, and its `.seg` folder, and ingest again. Nothing in it is not in the
+  logs.
 - Writing uses about 35 MB of memory whatever the size of the run, most of
   it the store's page cache (8 MB, which is enough for files of several
-  hundred streams each). Set `PACKETLANE_CACHE_MB` to change it: a file
+  hundred streams each). Sorting a segment's time order takes two
+  1 MB buffers more. Set `PACKETLANE_CACHE_MB` to change it: a file
   with more streams than that ingests faster with more, and 2 is enough
   for files of a few dozen.
 - An ingest of a run that more than one source logged also writes
@@ -167,8 +179,13 @@ Limits of working from counters alone are listed at the top of
 - Opens fitted to the whole run. Lanes are created per host and APID (shown as
   a decimal number, with its name if the configuration gives one); text
   logs get lanes too.
-- Density bars when zoomed out, single packets when zoomed in. Whole-run views
-  are drawn from counts made at ingest, so millions of packets stay quick.
+- Density bars when zoomed out, single packets when zoomed in. Packets are
+  counted from their segment files: each holds counts in up to 4,096
+  buckets across its own span, and a view wide enough takes those whole,
+  counting only its two ends packet by packet; a narrower view counts the
+  packets in it from the file's time order. A stored bucket is counted in
+  the bar its start falls in. Text log entries are counted in the store,
+  from counts made at ingest where the view is wide enough.
 - **Problems** lists the findings; choosing one jumps to it and opens the
   packet.
 - **Details** shows a packet's decoded fields, header values and a hex dump,
@@ -396,7 +413,7 @@ been built here.
 src/pure/     functional core: decoders, frames and codes, checks, config, SQL text, HTTP and API as values.
               pipeline.rs is where a file's records become rows and findings, for the store and for `check` alike
               finding.rs is the one shape every check reports in, and the list of finding kinds
-src/shell/    imperative shell: files, SQLite, sockets, command line
+src/shell/    imperative shell: files, SQLite, segment files, sockets, command line
 web/          the page: structure, style, script (embedded at build time)
 tests/        end-to-end tests, decoders against damaged input, and the test
               that keeps I/O out of src/pure
