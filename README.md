@@ -144,11 +144,14 @@ Limits of working from counters alone are listed at the top of
   Changing the configuration makes the whole run be read again.
 - Each packet file's packets are also written to a segment file of their
   own, in a folder beside the store named after it (`packetlane.db.seg/`
-  for `packetlane.db`). The timeline's packet counts are read from these;
-  everything else still reads SQLite. A segment is written whole before
-  the store lists it, replaced when its file is read again, and one the
-  store does not list is removed the next time the store is opened for
-  writing.
+  for `packetlane.db`), with the values of fields marked `keep`. The
+  timeline's packet counts, its single packets, its plots, a packet's
+  details and the times of the findings it lists are read from these;
+  text logs, the lists of lanes, files and findings, and the SQL box still
+  read SQLite, which for now holds the same packets and values. A segment
+  is written whole before the store lists it, replaced when its file is
+  read again, and one the store does not list is removed the next time
+  the store is opened for writing.
   Delete the folder with the store. The layout is described at the top of
   `src/pure/segment.rs`.
 - Views `packet_view`, `log_view`, `finding_view`, `file_view` and
@@ -159,14 +162,15 @@ Limits of working from counters alone are listed at the top of
   reads. The connection they use cannot write.
 - A store made by an earlier build with a different layout is refused, and
   says so (this build's is layout 4; the segment files came with it): delete
-  it, and its `.seg` folder, and ingest again. Nothing in it is not in the
-  logs.
+  it, and its `.seg` folder, and ingest again. A segment written by a
+  build with another segment format (this build's is 3) cannot be read
+  either: ingest the store again. Nothing in it is not in the logs.
 - Writing uses about 35 MB of memory whatever the size of the run, most of
   it the store's page cache (8 MB, which is enough for files of several
-  hundred streams each). Sorting a segment's time order takes two
-  1 MB buffers more. Set `PACKETLANE_CACHE_MB` to change it: a file
-  with more streams than that ingests faster with more, and 2 is enough
-  for files of a few dozen.
+  hundred streams each). Sorting a segment's time order and its kept
+  values takes four 1 MB buffers more. Set `PACKETLANE_CACHE_MB` to
+  change it: a file with more streams than that ingests faster with more,
+  and 2 is enough for files of a few dozen.
 - An ingest of a run that more than one source logged also writes
   temporary files, removed when it ends, of up to about a quarter of the
   size the store will be (460 MB for ten million packets). They go where SQLite
@@ -213,12 +217,14 @@ Limits of working from counters alone are listed at the top of
   findings are drawn as vertical lines, and the pointer marks the same
   moment on every plot.
 
-  A plot reads only its own lane's packets in view. For a lane with more
-  than about 130,000 packets the store also keeps, at ingest, the lowest
-  and highest value in each of 16,384 buckets across the run, and a view
-  wide enough is drawn from those: a whole-run plot takes about 5 ms on a
-  run of ten million packets. A stored bucket is drawn in the plot column
-  its start falls in, so a value can sit one column early.
+  A plot reads only its own lane's values in view, from the segment
+  files, where each lane's values of each field (and its delays) lie
+  together in time order. Each file also keeps, for a lane with at least
+  four values a bucket, the lowest and highest value in each of up to
+  16,384 buckets across the file, and a view wide enough is drawn from
+  those: a whole-run plot takes well under a millisecond on a run of ten
+  million packets. A stored bucket is drawn in the plot column its start
+  falls in, so a value can sit one column early.
 - The view (run, clock, range, lanes, plots, selection, search) is kept in
   the address, so it can be bookmarked while the server is running.
 
