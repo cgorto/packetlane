@@ -94,6 +94,8 @@ fn run(args: &[&str]) -> (Duration, u64, String) {
     let started = Instant::now();
     let mut child = Command::new(BIN)
         .args(args)
+        // Ingest then says how long each of its parts took.
+        .env("PACKETLANE_TIMING", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()

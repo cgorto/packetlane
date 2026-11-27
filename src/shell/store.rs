@@ -113,6 +113,35 @@ fn collect(stmt: &mut rusqlite::Statement<'_>, params: &[Param], limit: usize) -
     })
 }
 
+/// Says how long each part of an ingest took, on standard error, when the
+/// environment variable `PACKETLANE_TIMING` is set. For measuring; the
+/// load tests set it.
+struct Phases {
+    on: bool,
+    last: Instant,
+}
+
+impl Phases {
+    fn start() -> Phases {
+        Phases {
+            on: std::env::var_os("PACKETLANE_TIMING").is_some(),
+            last: Instant::now(),
+        }
+    }
+
+    /// The part that has just ended.
+    fn mark(&mut self, name: &str) {
+        self.say(name, self.last.elapsed());
+        self.last = Instant::now();
+    }
+
+    fn say(&self, name: &str, took: Duration) {
+        if self.on {
+            eprintln!("  phase {name}: {:.2} s", took.as_secs_f64());
+        }
+    }
+}
+
 /// See where it is set, in [`Store::open`].
 const WRITE_CACHE_KIB: i64 = 32 * 1024;
 
@@ -233,6 +262,7 @@ impl Store {
             .conn
             .query_row(sql::RUN_ID, params![root_text], |r| r.get(0))?;
 
+        let mut phases = Phases::start();
         let mut outcomes = Vec::with_capacity(files.len());
         let mut changed = false;
         for (path, rel) in files {
@@ -252,12 +282,15 @@ impl Store {
             outcomes.push(outcome);
         }
 
+        phases.mark("reading files");
         if changed {
             let tx = self.conn.transaction()?;
             for statement in sql::REFRESH_PACKET_LANES {
                 tx.execute(statement, params![run_id])?;
             }
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
+            phases.mark("lane counts");
+            let mut series_took = Duration::ZERO;
             tx.execute(sql::CLEAR_COARSE, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_META, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_SERIES, params![run_id])?;
@@ -277,17 +310,25 @@ impl Store {
                             width,
                             sql::SERIES_MIN_PACKETS,
                         );
-                        for q in sql::build_coarse(run_id, clock, min, max)
-                            .iter()
-                            .chain(&series)
-                        {
+                        for q in sql::build_coarse(run_id, clock, min, max) {
                             tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
                         }
+                        let started = Instant::now();
+                        for q in series {
+                            tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
+                        }
+                        series_took += started.elapsed();
                     }
                 }
             }
+            phases.say("series buckets", series_took);
+            phases.say(
+                "density buckets",
+                phases.last.elapsed().saturating_sub(series_took),
+            );
+            phases.last = Instant::now();
             tx.execute(sql::DELETE_CROSS_FINDINGS, params![run_id])?;
-            for finding in cross_findings(&tx, run_id)? {
+            for finding in cross_findings(&tx, run_id, &mut phases)? {
                 tx.execute(
                     sql::INSERT_FINDING,
                     params![
@@ -302,6 +343,7 @@ impl Store {
                 )?;
             }
             tx.commit()?;
+            phases.mark("writing it down");
         }
 
         let problems: i64 = self.conn.query_row(
@@ -650,7 +692,11 @@ fn ingest_text(
     Ok(count)
 }
 
-fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
+fn cross_findings(
+    conn: &Connection,
+    run_id: i64,
+    phases: &mut Phases,
+) -> Result<Vec<CrossFinding>> {
     let mut out = Vec::new();
 
     // Every pair is compared in one query; the findings are then made in
@@ -686,6 +732,7 @@ fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
         }
     }
 
+    phases.mark("comparing sources");
     let mixed = run_query(
         conn,
         &sql::lanes_with_finding(run_id, Kind::Interleaved.name()),
@@ -708,5 +755,6 @@ fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
             .collect();
         out.extend(origin_finding(lane, row[4].int(), &list));
     }
+    phases.mark("tracing interleaved streams");
     Ok(out)
 }
