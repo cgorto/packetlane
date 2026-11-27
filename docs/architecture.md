@@ -27,10 +27,10 @@ the facts and asks the core.
 |---|---|---|
 | Reading logs | `decode`: push decoders take bytes and return records, bytes used, "need more" or an error | `files`: opens read-only, owns the read loop and buffer |
 | Text logs | `textlog`: lines in, timestamped entries out | reads lines |
-| Checks | `continuity`, `order`, `limits`, `cross`: packets or stored counts in, findings out, all as one type (`finding`) with a fixed list of kinds; `pipeline` runs the per-file ones | prints or stores them |
+| Checks | `continuity`, `order`, `limits`, `cross`: packets or stored counts in, findings out, all as one type (`finding`) with a fixed list of kinds; `pipeline` runs the per-file ones; `cross` also says what a run's packets in checksum order come to, one checksum at a time | prints or stores them; `cross` merges the segments' checksum sections with bounded fan-in and keeps what must be given back later in temporary files |
 | Naming and decoding packets | `config`, `format`: definitions plus bytes give named values | reads the config file, reads packet bytes back from the log |
 | Store | `sql`: schema text, statements and their parameters; `ingest`: records to rows | `store`: owns the connection, runs statements |
-| Segment files | `segment`: record and directory layouts, the bucket grids and which levels are kept, how a density view or a plot is put together from stored buckets and single values | `segment`: writes a file's packets and kept values beside the store as it is read (sorting in bounded chunks), reads them back with positioned reads, merges item lists across files; `store` lists them in the `segments` table |
+| Segment files | `segment`: record and directory layouts, the bucket grids and which levels are kept, how a density view or a plot is put together from stored buckets and single values | `segment`: writes a file's packets and kept values beside the store as it is read (sorting in bounded chunks), reads them back with positioned reads, merges item lists across files; `store` lists them in the `segments` table, and what each holds of each lane in `segment_lanes` |
 | Web API | `http`: bytes to request, response to bytes; `api`: request to an authorised command, results to JSON | `server`: owns the socket, runs the command against the store |
 | File browser | `paths`: is this canonical path inside the allowed roots | canonicalises paths, lists directories |
 | Access token | compares tokens | supplies the random bytes |
@@ -44,12 +44,18 @@ written to a segment file of their own in a folder beside it
 hold the same packets and kept values, and the tests check the segments
 against SQLite's rows. Read from the segments: the timeline's density,
 its item list, plots of kept fields and arrival delay, a packet's
-details (with its file and source from SQLite) and the packet times of
-a run's findings. Read from SQLite: runs, files, lanes, findings, text
-logs, the list of what can be plotted (`file_series`), and the SQL box
-and its views. The format is described in `src/pure/segment.rs`. A store
-from a build before schema 4 is refused, and a segment of a format
-version other than this build's fails to read: ingest such a store again.
+details (with its file and source from SQLite), the packet times of a
+run's findings, and at the end of an ingest the comparison of sources
+(each segment's packets in checksum order, merged). Read from SQLite:
+runs, files, lanes, findings, text logs, the list of what can be plotted
+(`file_series`), and the SQL box and its views. A lane's count and time
+ranges are added up from `segment_lanes`, written with each file; the
+next packet id is one more than the highest any segment holds. Ingest
+writes the `packets` and `field_values` rows but no longer reads them;
+only the SQL box and the tests do. The format is described in
+`src/pure/segment.rs`. A store from a build before schema 5 is refused,
+and a segment of a format version other than this build's fails to
+read: ingest such a store again.
 
 ## Decoders
 

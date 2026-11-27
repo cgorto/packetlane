@@ -146,12 +146,16 @@ Limits of working from counters alone are listed at the top of
   own, in a folder beside the store named after it (`packetlane.db.seg/`
   for `packetlane.db`), with the values of fields marked `keep`. The
   timeline's packet counts, its single packets, its plots, a packet's
-  details and the times of the findings it lists are read from these;
-  text logs, the lists of lanes, files and findings, and the SQL box still
-  read SQLite, which for now holds the same packets and values. A segment
-  is written whole before the store lists it, replaced when its file is
-  read again, and one the store does not list is removed the next time
-  the store is opened for writing.
+  details and the times of the findings it lists are read from these, and
+  so is the comparison of sources at the end of an ingest, from each
+  segment's packets in checksum order. Each lane's count and time range
+  is added up from what each segment holds of it, kept per file in the
+  store (`segment_lanes`). Text logs, the lists of lanes, files and
+  findings, and the SQL box still read SQLite, which for now holds the
+  same packets and values, written but no longer read while ingesting. A
+  segment is written whole before the store lists it, replaced when its
+  file is read again, and one the store does not list is removed the next
+  time the store is opened for writing.
   Delete the folder with the store. The layout is described at the top of
   `src/pure/segment.rs`.
 - Views `packet_view`, `log_view`, `finding_view`, `file_view` and
@@ -161,22 +165,29 @@ Limits of working from counters alone are listed at the top of
 - `packetlane query` and the SQL box in the UI accept one statement that
   reads. The connection they use cannot write.
 - A store made by an earlier build with a different layout is refused, and
-  says so (this build's is layout 4; the segment files came with it): delete
-  it, and its `.seg` folder, and ingest again. A segment written by a
-  build with another segment format (this build's is 3) cannot be read
-  either: ingest the store again. Nothing in it is not in the logs.
-- Writing uses about 35 MB of memory whatever the size of the run, most of
+  says so (this build's is layout 5): delete it, and its `.seg` folder,
+  and ingest again. A segment written by a build with another segment
+  format (this build's is 4) cannot be read either: ingest the store
+  again. Nothing in it is not in the logs.
+- Writing uses about 25 MB of memory whatever the size of the run, most of
   it the store's page cache (8 MB, which is enough for files of several
-  hundred streams each). Sorting a segment's time order and its kept
-  values takes four 1 MB buffers more. Set `PACKETLANE_CACHE_MB` to
-  change it: a file with more streams than that ingests faster with more,
-  and 2 is enough for files of a few dozen.
-- An ingest of a run that more than one source logged also writes
-  temporary files, removed when it ends, of up to about a quarter of the
-  size the store will be (460 MB for ten million packets). They go where SQLite
-  puts temporary files: the folder named by `SQLITE_TMPDIR` or `TMPDIR`,
-  else the system's. If that folder is kept in memory, as `/tmp` is on some
-  systems, this is memory: point `SQLITE_TMPDIR` at a disk.
+  hundred streams each). Sorting a segment's time order, its kept values
+  and its checksums takes five 1 MB buffers more, and comparing sources
+  about 5 MB more whatever the number of files or of repeats. Set
+  `PACKETLANE_CACHE_MB` to change it: a file with more streams than that
+  ingests faster with more, and 2 is enough for files of a few dozen.
+- An ingest writes temporary files in the segment folder, each removed
+  when done with (or, after a crash, the next time the store is opened for
+  writing): while a file is read, the sorted runs of its segment's
+  sections, together up to about the size of that segment; and when a run
+  that more than one source logged is compared, 12 bytes for each packet
+  that a source holds and another source logging the same stream lacks,
+  12 for each copy of a packet repeated more than 65,536 times, and for a
+  run of more than 64 files 30 bytes for each packet of the streams more
+  than one source logged, twice over. The comparison makes no temporary
+  table. SQLite itself needs little temporary space now: for counting text
+  log entries into buckets. It puts it in the folder named by
+  `SQLITE_TMPDIR` or `TMPDIR`, else the system's.
 
 ### Timeline
 
