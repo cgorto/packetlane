@@ -66,7 +66,6 @@ CREATE TABLE IF NOT EXISTS packets (
 );
 CREATE INDEX IF NOT EXISTS packets_receive ON packets (receive_ns, lane_id);
 CREATE INDEX IF NOT EXISTS packets_packet ON packets (packet_ns, lane_id);
-CREATE INDEX IF NOT EXISTS packets_sum ON packets (sum, lane_id);
 CREATE INDEX IF NOT EXISTS packets_lane_receive ON packets (lane_id, receive_ns, packet_ns);
 CREATE INDEX IF NOT EXISTS packets_lane_packet ON packets (lane_id, packet_ns, receive_ns);
 CREATE TABLE IF NOT EXISTS logs (
@@ -753,9 +752,49 @@ pub fn lane_pairs(run: i64) -> Query {
     )
 }
 
+// Whether a packet of one lane is also in another is asked by the checksum
+// of its bytes. An index of every packet by checksum would answer that, but
+// checksums come in no order, so keeping one up to date touches a different
+// page for every packet read: it was most of the time an ingest took, and
+// what made ingest need a large page cache. Instead, once the files are
+// read, the packets of the streams that more than one source logged are
+// copied to a temporary table and indexed there in one sorted build. The
+// comparisons below read that table, and it is dropped when they are done.
+
+/// Drops the temporary table of [`hop_stage`], if a failed ingest left one.
+pub const HOP_UNSTAGE: &str = "DROP TABLE IF EXISTS temp.hop";
+
+/// The statements that make `temp.hop`: the packets of a run's lanes that
+/// have a counterpart from another source, in id order, and an index of
+/// them by checksum and lane. The run's packets are found by its files'
+/// id ranges, so no other run is read.
+pub fn hop_stage(run: i64) -> Vec<Query> {
+    vec![
+        Query::new(
+            "CREATE TEMP TABLE hop
+               (id INTEGER, lane_id INTEGER, sum INTEGER, seq INTEGER, length INTEGER)",
+            vec![],
+        ),
+        Query::new(
+            "INSERT INTO temp.hop (id, lane_id, sum, seq, length)
+             SELECT p.id, p.lane_id, p.sum, p.seq, p.length
+             FROM files f CROSS JOIN packets p NOT INDEXED
+               ON p.id BETWEEN f.first_packet AND f.last_packet
+             WHERE f.run_id = ?1 AND p.lane_id IN (
+               SELECT a.id FROM lanes a JOIN lanes b
+                 ON b.run_id = a.run_id AND b.kind = 'packet' AND b.apid = a.apid
+                AND b.ptype = a.ptype AND b.source != a.source
+               WHERE a.run_id = ?1 AND a.kind = 'packet')
+             ORDER BY p.id",
+            vec![run.into()],
+        ),
+        Query::new("CREATE INDEX temp.hop_sum ON hop (sum, lane_id)", vec![]),
+    ]
+}
+
 /// How every lane of a run compares with each lane that carries the same
 /// stream from another source, matching packets by the checksum of their
-/// bytes, which the `(sum, lane_id)` index answers without a row read.
+/// bytes. Reads `temp.hop`, which [`hop_stage`] must have made.
 ///
 /// One row for each pair (`a`, `b`) where `a` has packets that `b` lacks
 /// between the first and last packet they share. Columns: lane `a`, lane
@@ -765,8 +804,7 @@ pub fn lane_pairs(run: i64) -> Query {
 /// The packets are read twice in all, however many pairs there are: once
 /// to find what each pair shares and once to count what is missing.
 /// `CROSS JOIN` keeps SQLite to that order. Asking pair by pair instead
-/// reads every packet once per pair, which for hundreds of streams from
-/// several sources is most of the time an ingest takes.
+/// reads every packet once per pair.
 pub fn hop_compare_all(run: i64) -> Query {
     Query::new(
         "WITH pair AS MATERIALIZED (
@@ -777,14 +815,14 @@ pub fn hop_compare_all(run: i64) -> Query {
            WHERE a.run_id = ?1 AND a.kind = 'packet'),
          shared AS MATERIALIZED (
            SELECT pair.a AS a, pair.b AS b, COUNT(*) AS n, MIN(p.id) AS lo, MAX(p.id) AS hi
-           FROM packets p CROSS JOIN pair ON pair.a = p.lane_id
-           WHERE EXISTS (SELECT 1 FROM packets q
+           FROM temp.hop p CROSS JOIN pair ON pair.a = p.lane_id
+           WHERE EXISTS (SELECT 1 FROM temp.hop q
                          WHERE q.sum = p.sum AND q.lane_id = pair.b)
            GROUP BY pair.a, pair.b)
          SELECT shared.a, shared.b, shared.n, COUNT(*), MIN(p.id)
-         FROM packets p CROSS JOIN shared ON shared.a = p.lane_id
+         FROM temp.hop p CROSS JOIN shared ON shared.a = p.lane_id
          WHERE p.id BETWEEN shared.lo AND shared.hi
-           AND NOT EXISTS (SELECT 1 FROM packets q
+           AND NOT EXISTS (SELECT 1 FROM temp.hop q
                            WHERE q.sum = p.sum AND q.lane_id = shared.b)
          GROUP BY shared.a, shared.b",
         vec![run.into()],
@@ -803,14 +841,15 @@ pub fn lanes_with_finding(run: i64, kind: &str) -> Query {
     )
 }
 
-/// Which other sources hold copies of a lane's packets.
+/// Which other sources hold copies of a lane's packets. Reads `temp.hop`,
+/// which [`hop_stage`] must have made.
 /// Columns: source, number of the lane's packets found there.
 pub fn lane_origins(run: i64, lane: i64, apid: i64, ptype: i64) -> Query {
     Query::new(
         "SELECT l.source,
-                SUM((SELECT COUNT(*) FROM packets p
+                SUM((SELECT COUNT(*) FROM temp.hop p
                      WHERE p.lane_id = ?1 AND EXISTS (
-                       SELECT 1 FROM packets q
+                       SELECT 1 FROM temp.hop q
                        WHERE q.sum = p.sum AND q.lane_id = l.id
                          AND q.seq = p.seq AND q.length = p.length))) AS n
          FROM lanes l

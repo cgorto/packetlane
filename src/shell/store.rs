@@ -156,6 +156,8 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Sorting and temporary tables go to a file, not to memory.
+        conn.pragma_update(None, "temp_store", "FILE")?;
         // Pages of the store held in memory while writing, in KiB (negative
         // means a size, not a page count). SQLite's own 2 MB is less than
         // one index of a large run, and a run with many lanes writes all
@@ -724,11 +726,15 @@ fn cross_findings(
     // the order the pairs are listed, which is the order they are stored in.
     // A run from one source has no pairs, and its packets are not read.
     let pairs = run_query(conn, &sql::lane_pairs(run_id), usize::MAX)?;
-    let compared = if pairs.rows.is_empty() {
-        Vec::new()
-    } else {
-        run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?.rows
-    };
+    if pairs.rows.is_empty() {
+        return Ok(out);
+    }
+    conn.execute_batch(sql::HOP_UNSTAGE)?;
+    for q in sql::hop_stage(run_id) {
+        conn.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
+    }
+    phases.mark("indexing packets by content");
+    let compared = run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?.rows;
     let compared: HashMap<(i64, i64), &Vec<Cell>> = compared
         .iter()
         .filter_map(|r| Some(((r[0].int()?, r[1].int()?), r)))
@@ -777,5 +783,6 @@ fn cross_findings(
         out.extend(origin_finding(lane, row[4].int(), &list));
     }
     phases.mark("tracing interleaved streams");
+    conn.execute_batch(sql::HOP_UNSTAGE)?;
     Ok(out)
 }
