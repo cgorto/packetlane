@@ -264,9 +264,16 @@ impl Group {
         Ok(())
     }
 
+    /// Empties the group.
+    fn clear(&mut self) {
+        LARGEST_GROUP.fetch_max(self.size, Ordering::Relaxed);
+        self.held.clear();
+        self.over_len = 0;
+        self.size = 0;
+    }
+
     /// Hands every packet of the group to `f`, and empties it.
     fn drain(&mut self, mut f: impl FnMut(u32, i64) -> Result<()>) -> Result<()> {
-        LARGEST_GROUP.fetch_max(self.size, Ordering::Relaxed);
         if let Some(over) = &self.over
             && self.over_len > 0
         {
@@ -279,9 +286,7 @@ impl Group {
         for &(lane, id) in &self.held {
             f(lane, id)?;
         }
-        self.held.clear();
-        self.over_len = 0;
-        self.size = 0;
+        self.clear();
         Ok(())
     }
 }
@@ -393,7 +398,8 @@ impl Kept {
     ) -> Result<()> {
         cmp.end_group();
         if !cmp.any_absent() {
-            return group.drain(|_, _| Ok(()));
+            group.clear();
+            return Ok(());
         }
         if self.file.is_none() {
             let temp = temps.create()?;
