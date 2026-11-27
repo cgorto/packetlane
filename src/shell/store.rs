@@ -680,9 +680,7 @@ impl Store {
         phases.mark("reading files");
         if changed {
             let tx = self.conn.transaction()?;
-            for statement in sql::REFRESH_PACKET_LANES {
-                tx.execute(statement, params![run_id])?;
-            }
+            tx.execute(sql::LANES_FROM_SEGMENTS, params![run_id])?;
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
             phases.mark("lane counts");
             let mut series_took = Duration::ZERO;
@@ -926,6 +924,23 @@ impl Store {
                     i64::from(w.order_shift)
                 ],
             )?;
+            let mut insert_lane = tx.prepare_cached(sql::INSERT_SEGMENT_LANE)?;
+            for (lane, s) in &w.lanes {
+                let [(r, r_n), (p, p_n)] = s.times;
+                insert_lane.execute(params![
+                    file_id,
+                    lane,
+                    s.count as i64,
+                    r.map(|t| t.0),
+                    r.map(|t| t.1),
+                    r_n as i64,
+                    p.map(|t| t.0),
+                    p.map(|t| t.1),
+                    p_n as i64,
+                    s.first_id,
+                    s.last_id
+                ])?;
+            }
         }
         if let Err(e) = tx.commit() {
             if let Some(w) = &written {

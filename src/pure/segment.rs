@@ -574,6 +574,48 @@ pub fn delay_ms(receive_ns: i64, packet_ns: i64) -> f64 {
     }
 }
 
+/// What one segment holds of one lane: how many packets, the lowest and
+/// highest time and how many have one on each time clock, and the first
+/// and last packet id. Kept while the segment is written and stored in the
+/// `segment_lanes` table; a lane's totals are worked out from its rows
+/// there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaneStats {
+    pub count: u64,
+    /// Receive time, then packet time: lowest and highest, and how many.
+    pub times: [(Option<(i64, i64)>, u64); 2],
+    pub first_id: i64,
+    pub last_id: i64,
+}
+
+impl LaneStats {
+    /// A lane whose first packet has id `id`, before that packet is added.
+    pub fn new(id: i64) -> LaneStats {
+        LaneStats {
+            count: 0,
+            times: [(None, 0); 2],
+            first_id: id,
+            last_id: id,
+        }
+    }
+
+    /// Adds a packet with id `id` and its receive and packet time.
+    pub fn add(&mut self, id: i64, times: [Option<i64>; 2]) {
+        self.count += 1;
+        self.first_id = self.first_id.min(id);
+        self.last_id = self.last_id.max(id);
+        for (slot, t) in self.times.iter_mut().zip(times) {
+            if let Some(t) = t {
+                slot.0 = Some(match slot.0 {
+                    Some((lo, hi)) => (lo.min(t), hi.max(t)),
+                    None => (t, t),
+                });
+                slot.1 += 1;
+            }
+        }
+    }
+}
+
 /// One label as stored in the labels section.
 pub fn encode_label(text: &str) -> Result<Vec<u8>, FormatError> {
     let len = u32::try_from(text.len()).or_else(|_| bad("label too long"))?;

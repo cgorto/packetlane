@@ -838,21 +838,6 @@ fn a_file_read_again_takes_only_its_own_rows_with_it() {
     assert_eq!(count(2), two);
     check_lanes(&store.conn);
 
-    // Counting a run's lanes reads that run's packets, from an index that
-    // holds all it needs.
-    let steps = plan(
-        &store.conn,
-        &Query {
-            sql: sql::REFRESH_PACKET_LANES[1].to_string(),
-            params: vec![1i64.into()],
-        },
-    );
-    assert_eq!(
-        step(&steps, "packets"),
-        "SEARCH packets USING COVERING INDEX packets_lane_receive (lane_id=?)",
-        "{steps:#?}"
-    );
-
     // And the rows are found by id, not by reading every packet.
     for statement in sql::delete_file_packets() {
         let steps = plan(
@@ -941,4 +926,130 @@ fn an_interleaved_stream_is_traced_as_the_packets_say() {
     // With another run in the store, the answer is the same.
     add_run(&store, "second", &awkward_run());
     assert_eq!(check_origins(&store.conn, 1), 2);
+}
+
+// ---- lane totals from what each segment holds ---------------------------------------
+
+/// How a run's packet lanes were counted from the `packets` rows before the
+/// counts were kept per segment: the statements the store ran, kept here
+/// to check the counts against.
+const OLD_REFRESH_PACKET_LANES: [&str; 2] = [
+    "UPDATE lanes SET
+       (count, receive_min, receive_max, receive_count,
+        packet_min, packet_max, packet_count, order_min, order_max) =
+       (0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL)
+     WHERE run_id = ? AND kind != 'log'",
+    "UPDATE lanes SET
+       (count, receive_min, receive_max, receive_count,
+        packet_min, packet_max, packet_count, order_min, order_max) =
+       (s.n, s.r_min, s.r_max, s.r_n, s.p_min, s.p_max, s.p_n, s.o_min, s.o_max)
+     FROM (SELECT lane_id, COUNT(*) AS n,
+                  MIN(receive_ns) AS r_min, MAX(receive_ns) AS r_max, COUNT(receive_ns) AS r_n,
+                  MIN(packet_ns) AS p_min, MAX(packet_ns) AS p_max, COUNT(packet_ns) AS p_n,
+                  MIN(id) AS o_min, MAX(id) AS o_max
+           FROM packets INDEXED BY packets_lane_receive
+           WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?1)
+           GROUP BY lane_id) AS s
+     WHERE lanes.id = s.lane_id AND lanes.run_id = ?1 AND lanes.kind != 'log'",
+];
+
+/// Every lane row of the store as the old statements would leave it, for
+/// every run, against what is stored: the old statements run inside a
+/// transaction that is rolled back. Returns how many packet lanes hold
+/// packets.
+fn lanes_match_the_old_counts(db: &Path) -> usize {
+    let conn = Connection::open(db).unwrap();
+    let all = || {
+        rows(
+            &conn,
+            &Query::new(
+                "SELECT id, run_id, source, kind, apid, ptype, file_id, count,
+                        receive_min, receive_max, receive_count,
+                        packet_min, packet_max, packet_count, order_min, order_max
+                 FROM lanes ORDER BY id",
+                vec![],
+            ),
+        )
+    };
+    let stored = all();
+    conn.execute_batch("BEGIN").unwrap();
+    let runs: Vec<i64> = conn
+        .prepare("SELECT id FROM runs")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    for run in runs {
+        for statement in OLD_REFRESH_PACKET_LANES {
+            conn.execute(statement, [run]).unwrap();
+        }
+    }
+    let old = all();
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(stored, old);
+    stored
+        .iter()
+        .filter(|r| r[3] != "log" && r[7] != "0")
+        .count()
+}
+
+/// The lane counts follow every way a file's packets can change: read,
+/// read again after growing, emptied, losing a stream, a changed
+/// configuration, with another run in the store.
+#[test]
+fn lane_counts_are_what_the_packets_say() {
+    let mut demo_files: Vec<(String, Vec<u8>)> = demo_run(120)
+        .into_iter()
+        .map(|f| (f.rel.to_string(), f.bytes))
+        .collect();
+    let (rel, bytes) = demo_files
+        .iter()
+        .filter(|(rel, _)| rel.ends_with(".bin"))
+        .max_by_key(|(_, bytes)| bytes.len())
+        .cloned()
+        .unwrap();
+    // Beside it, from the same source, its first third: its lanes are
+    // then held by two segments each, over different spans.
+    let early = rel.replace(".bin", "-early.bin");
+    demo_files.push((early, bytes[..bytes.len() / 3].to_vec()));
+    let store = stored(&awkward_run());
+    let first = store.dir.join("run");
+    let db = store.dir.join("store.db");
+    assert_eq!(lanes_match_the_old_counts(&db), 8);
+    let second = add_run(&store, "second", &demo_files);
+    let both = lanes_match_the_old_counts(&db);
+    assert!(both > 8);
+
+    // A file of the first run grows: more of a stream, and a new one.
+    let path = first.join("b/tlm.bin");
+    let mut grown = std::fs::read(&path).unwrap();
+    for seq in 40..60u16 {
+        grown.extend(packet(10, seq, &[seq as u8, 1, 2]));
+        grown.extend(packet(14, seq, &[seq as u8]));
+    }
+    std::fs::write(&path, grown).unwrap();
+    ingest(&db, &first);
+    assert_eq!(lanes_match_the_old_counts(&db), both + 1);
+
+    // A file of the second run, cut short; then one emptied.
+    std::fs::write(second.join(&rel), &bytes[..bytes.len() / 2]).unwrap();
+    ingest(&db, &second);
+    assert_eq!(lanes_match_the_old_counts(&db), both + 1);
+    std::fs::write(first.join("c/tlm.bin"), b"").unwrap();
+    ingest(&db, &first);
+    // c held APIDs 10 and 13 alone.
+    assert_eq!(lanes_match_the_old_counts(&db), both - 1);
+
+    // c again, with one of its streams; then the configuration changes,
+    // and the whole run is read again.
+    let only: Vec<u8> = (0..40u16)
+        .flat_map(|seq| packet(10, seq, &[seq as u8, 9, 9]))
+        .collect();
+    std::fs::write(first.join("c/tlm.bin"), only).unwrap();
+    ingest(&db, &first);
+    assert_eq!(lanes_match_the_old_counts(&db), both);
+    std::fs::write(first.join("packetlane.toml"), "# changed\n").unwrap();
+    ingest(&db, &first);
+    assert_eq!(lanes_match_the_old_counts(&db), both);
 }

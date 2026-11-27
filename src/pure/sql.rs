@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde::ser::Serializer;
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -144,6 +144,23 @@ CREATE TABLE IF NOT EXISTS segments (
   packet_shift INTEGER,
   order_shift INTEGER NOT NULL
 );
+-- What each segment holds of each lane; a packet lane's count and time
+-- ranges in `lanes` are worked out from these rows.
+CREATE TABLE IF NOT EXISTS segment_lanes (
+  file_id INTEGER NOT NULL REFERENCES files(id),
+  lane_id INTEGER NOT NULL REFERENCES lanes(id),
+  count INTEGER NOT NULL,
+  receive_min INTEGER,
+  receive_max INTEGER,
+  receive_count INTEGER NOT NULL,
+  packet_min INTEGER,
+  packet_max INTEGER,
+  packet_count INTEGER NOT NULL,
+  order_min INTEGER NOT NULL,
+  order_max INTEGER NOT NULL,
+  PRIMARY KEY (lane_id, file_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS segment_lanes_file ON segment_lanes (file_id);
 DROP VIEW IF EXISTS value_view;
 CREATE VIEW value_view AS
   SELECT v.packet_id AS id, r.root AS run, l.source, f.rel AS file, p.apid, v.packet, v.field,
@@ -701,8 +718,9 @@ pub const RUN_FILE_IDS: &str = "SELECT id FROM files WHERE run_id = ?";
 /// Removes everything read for a run but the run itself, each taking the
 /// run id. The packets and kept values go first, file by file, with
 /// [`delete_file_packets`].
-pub const RESET_RUN: [&str; 9] = [
+pub const RESET_RUN: [&str; 10] = [
     "DELETE FROM segments WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
+    "DELETE FROM segment_lanes WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM file_series WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM logs WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM findings WHERE run_id = ?",
@@ -720,8 +738,9 @@ pub const FILE_BY_REL: &str = "SELECT id, size, checksum FROM files WHERE run_id
 /// Statements that remove one file and what was read from it, each taking
 /// the file id. Its packets and kept values go first, with
 /// [`delete_file_packets`].
-pub const DELETE_FILE: [&str; 6] = [
+pub const DELETE_FILE: [&str; 7] = [
     "DELETE FROM segments WHERE file_id = ?",
+    "DELETE FROM segment_lanes WHERE file_id = ?",
     "DELETE FROM file_series WHERE file_id = ?",
     "DELETE FROM logs WHERE file_id = ?",
     "DELETE FROM findings WHERE file_id = ?",
@@ -810,31 +829,26 @@ pub fn lane_source(lane: i64) -> Query {
     Query::new("SELECT source FROM lanes WHERE id = ?", vec![lane.into()])
 }
 
-/// Recomputes the per-lane totals and time ranges for a run.
-/// Sets each packet lane's count and time ranges from its packets, in two
-/// statements run in this order: the first clears them, so that a lane
-/// whose packets are all gone reads as empty; the second fills them in from
-/// one pass over the run's packets, lane by lane in the lane-first index,
-/// which holds everything asked for. No other run's packets are read.
-pub const REFRESH_PACKET_LANES: [&str; 2] = [
-    "UPDATE lanes SET
+/// Takes file id, lane id, count, receive min, max and count, packet min,
+/// max and count, first and last packet id: what one segment holds of one
+/// lane.
+pub const INSERT_SEGMENT_LANE: &str = "INSERT INTO segment_lanes
+     (file_id, lane_id, count, receive_min, receive_max, receive_count,
+      packet_min, packet_max, packet_count, order_min, order_max)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+/// Sets each packet lane's count and time ranges for a run from what its
+/// segments hold of it (`segment_lanes`), which is kept as each file is
+/// read and removed with the file. A lane none of whose packets are left
+/// reads as empty. No packet is read.
+pub const LANES_FROM_SEGMENTS: &str = "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count,
         packet_min, packet_max, packet_count, order_min, order_max) =
-       (0, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL)
-     WHERE run_id = ? AND kind != 'log'",
-    "UPDATE lanes SET
-       (count, receive_min, receive_max, receive_count,
-        packet_min, packet_max, packet_count, order_min, order_max) =
-       (s.n, s.r_min, s.r_max, s.r_n, s.p_min, s.p_max, s.p_n, s.o_min, s.o_max)
-     FROM (SELECT lane_id, COUNT(*) AS n,
-                  MIN(receive_ns) AS r_min, MAX(receive_ns) AS r_max, COUNT(receive_ns) AS r_n,
-                  MIN(packet_ns) AS p_min, MAX(packet_ns) AS p_max, COUNT(packet_ns) AS p_n,
-                  MIN(id) AS o_min, MAX(id) AS o_max
-           FROM packets INDEXED BY packets_lane_receive
-           WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?1)
-           GROUP BY lane_id) AS s
-     WHERE lanes.id = s.lane_id AND lanes.run_id = ?1 AND lanes.kind != 'log'",
-];
+       (SELECT COALESCE(SUM(count), 0), MIN(receive_min), MAX(receive_max),
+               COALESCE(SUM(receive_count), 0), MIN(packet_min), MAX(packet_max),
+               COALESCE(SUM(packet_count), 0), MIN(order_min), MAX(order_max)
+        FROM segment_lanes WHERE lane_id = lanes.id)
+     WHERE run_id = ? AND kind != 'log'";
 pub const REFRESH_LOG_LANES: &str = "UPDATE lanes SET
        (count, receive_min, receive_max, receive_count, packet_min, packet_max, packet_count) =
        (SELECT COUNT(*), MIN(log_ns), MAX(log_ns), COUNT(log_ns),

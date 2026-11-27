@@ -16,9 +16,10 @@ use crate::pure::ingest::{PacketRow, ptype_code};
 use crate::pure::segment::{
     self as layout, BUCKET_BYTES, BucketRecord, DELAY, ENTRY_BYTES, Entry, FormatError,
     GROUP_BYTES, GroupRecord, KIND_BUCKETS, KIND_GROUPS, KIND_LABELS, KIND_PACKETS, KIND_SERIES,
-    KIND_SERIES_BUCKETS, KIND_SERIES_NAMES, KIND_TEXTS, KIND_TIME, KIND_VALUES, MAGIC, MixHasher,
-    PACKET_BYTES, POINT_BYTES, POINT_KEY_BYTES, PacketRecord, PointRecord, SERIES_BUCKET_BYTES,
-    SeriesBucket, TAIL_BYTES, TIME_BYTES, Tail, TimeRecord, VALUE_BYTES, ValueRecord,
+    KIND_SERIES_BUCKETS, KIND_SERIES_NAMES, KIND_TEXTS, KIND_TIME, KIND_VALUES, LaneStats, MAGIC,
+    MixHasher, PACKET_BYTES, POINT_BYTES, POINT_KEY_BYTES, PacketRecord, PointRecord,
+    SERIES_BUCKET_BYTES, SeriesBucket, TAIL_BYTES, TIME_BYTES, Tail, TimeRecord, VALUE_BYTES,
+    ValueRecord,
 };
 use crate::pure::sql::Clock;
 use crate::shell::store::Result;
@@ -299,6 +300,8 @@ pub struct Written {
     /// the packet clock, if any packet has that time.
     pub times: [Option<(i64, i64, u32)>; 2],
     pub order_shift: u32,
+    /// What the segment holds of each lane, in lane order.
+    pub lanes: Vec<(u32, LaneStats)>,
 }
 
 /// Writes one segment as a file's packets are read. Nothing is visible
@@ -328,6 +331,8 @@ pub struct Writer {
     points: Vec<Sorter<POINT_KEY_BYTES>>,
     /// The last packet added: its index, lane and times.
     current: Option<(u32, u32, [Option<i64>; 2])>,
+    /// What has been added of each lane.
+    lanes: HashMap<u32, LaneStats>,
 }
 
 /// Bytes written one after another to a temporary file, to be copied into
@@ -462,6 +467,7 @@ impl Writer {
             texts: Some(spool("texts")?),
             points: vec![points("receive-kept"), points("packet-kept")],
             current: None,
+            lanes: HashMap::new(),
         })
     }
 
@@ -576,6 +582,11 @@ impl Writer {
                 self.points[c].push(layout::point_key(lane, DELAY, &point))?;
             }
         }
+        let id = self.first_packet + i64::from(index);
+        self.lanes
+            .entry(lane)
+            .or_insert_with(|| LaneStats::new(id))
+            .add(id, [row.receive_ns, row.packet_ns]);
         self.current = Some((index, lane, [row.receive_ns, row.packet_ns]));
         self.count += 1;
         Ok(())
@@ -725,12 +736,15 @@ impl Writer {
         // Renamed: the temporary file is gone, nothing to remove on drop.
         self.temp.path = PathBuf::new();
         File::open(&self.folder)?.sync_all()?;
+        let mut lanes: Vec<(u32, LaneStats)> = self.lanes.drain().collect();
+        lanes.sort_unstable_by_key(|l| l.0);
         Ok(Some(Written {
             name,
             first_packet: self.first_packet,
             last_packet,
             times,
             order_shift,
+            lanes,
         }))
     }
 
