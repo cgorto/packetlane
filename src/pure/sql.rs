@@ -1419,6 +1419,23 @@ mod tests {
     }
 
     #[test]
+    fn log_density_from_stored_buckets_reads_no_packets() {
+        let coarse = Some((1_000, 100));
+        let q = log_density_stored(1, Clock::Receive, 1_050, 1_449, 2, coarse);
+        assert_eq!(q.len(), 3);
+        assert!(q[0].sql.contains("FROM coarse") && q[0].sql.contains("kind = 'log'"));
+        assert!(q[1..].iter().all(|q| q.sql.contains("FROM logs")));
+        let narrow = log_density_stored(1, Clock::Packet, 1_050, 1_149, 1, coarse);
+        assert_eq!(narrow.len(), 1);
+        assert!(narrow[0].sql.contains("FROM logs"));
+        assert!(log_density_stored(1, Clock::Order, 0, 99, 2, coarse).is_empty());
+        // The full statements still count packets and every lane.
+        let all = density(1, Clock::Receive, 1_050, 1_449, 2, coarse);
+        assert!(!all[0].sql.contains("kind = 'log'"));
+        assert!(all.iter().any(|q| q.sql.contains("FROM packets")));
+    }
+
+    #[test]
     fn coarse_build_statements() {
         let q = build_coarse(7, Clock::Packet, 1_000, 410_599);
         assert_eq!(q.len(), 3);

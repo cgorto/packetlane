@@ -437,8 +437,10 @@ impl Tail {
 /// every known section lies between the magic and the directory, has the
 /// record size its kind needs and a whole number of records, and the
 /// packets section holds as many records as the tail says.
+/// Known sections appear once each and do not overlap.
 pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<(), FormatError> {
     let mut packets = None;
+    let mut known: Vec<(u64, u64, u16, u8)> = Vec::new();
     for e in entries {
         let end = e.offset.checked_add(e.length);
         if e.offset < MAGIC.len() as u64 || end.is_none_or(|end| end > dir_at) {
@@ -464,9 +466,17 @@ pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<()
         if e.kind == KIND_PACKETS {
             packets = Some(e.records());
         }
+        known.push((e.offset, e.offset + e.length, e.kind, e.clock));
     }
     if packets != Some(tail.packets) {
         return bad("packet count does not match the packets section");
+    }
+    let mut kinds: Vec<(u16, u8)> = known.iter().map(|k| (k.2, k.3)).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    known.sort_unstable();
+    if kinds.len() != known.len() || known.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return bad("sections overlap or repeat");
     }
     Ok(())
 }
@@ -779,8 +789,14 @@ mod tests {
         assert!(Tail::decode(&bytes[1..]).is_err());
 
         // A section running into the directory, a ragged one, a wrong
-        // record size, an absurd shift, a miscounted packets section.
-        let broken: [fn(&mut Vec<Entry>, &mut Tail); 6] = [
+        // record size, an absurd shift, a miscounted packets section, two
+        // sections overlapping, one repeated.
+        let broken: [fn(&mut Vec<Entry>, &mut Tail); 8] = [
+            |e, _| e[1].offset -= 16,
+            |e, _| {
+                e[1].length = 0;
+                e.push(e[1]);
+            },
             |e, _| e[1].length += 16,
             |e, _| e[1].length -= 1,
             |e, _| e[0].record = 48,

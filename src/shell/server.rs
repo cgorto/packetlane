@@ -250,13 +250,15 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
         Command::Density { window, buckets } => {
             let store = reader()?;
             let w = &window;
+            // Packets from their segment files; text log entries from the
+            // store, from its pre-counted buckets where they fit.
+            let mut tables = vec![store.packet_density(w.run, w.clock, w.from, w.to, buckets)?];
             let meta = store.query(&sql::coarse_meta(w.run, w.clock), 1)?;
             let coarse = meta
                 .rows
                 .first()
                 .and_then(|r| Some((r[0].int()?, r[1].int()?)));
-            let mut tables = Vec::new();
-            for q in sql::density(w.run, w.clock, w.from, w.to, buckets, coarse) {
+            for q in sql::log_density_stored(w.run, w.clock, w.from, w.to, buckets, coarse) {
                 tables.push(store.query(&q, 2_000_000)?);
             }
             let tables: Vec<&sql::Table> = tables.iter().collect();
