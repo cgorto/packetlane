@@ -222,9 +222,11 @@ Limits of working from counters alone are listed at the top of
   together in time order. Each file also keeps, for a lane with at least
   four values a bucket, the lowest and highest value in each of up to
   16,384 buckets across the file, and a view wide enough is drawn from
-  those: a whole-run plot takes well under a millisecond on a run of ten
-  million packets. A stored bucket is drawn in the plot column its start
-  falls in, so a value can sit one column early.
+  those: a whole-run plot on the receive or packet clock takes well under
+  a millisecond on a run of ten million packets; on the order clock it
+  reads every value of the lane, tens of milliseconds there. A stored
+  bucket is drawn in the plot column its start falls in, so a value can
+  sit one column early.
 - The view (run, clock, range, lanes, plots, selection, search) is kept in
   the address, so it can be bookmarked while the server is running.
 

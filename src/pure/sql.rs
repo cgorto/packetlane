@@ -424,15 +424,26 @@ pub fn run_findings(run: i64) -> Query {
     )
 }
 
-/// A run's findings without their packets' times, which come from the
-/// segment files; see [`run_findings`] for the order they are shown in.
-/// Columns: id, severity, kind, message, lane, file, packet, file's rel.
-pub fn run_findings_untimed(run: i64) -> Query {
+/// What a run's findings are ordered by, without their packets' times,
+/// which come from the segment files: id, whether it is only information,
+/// packet id. See [`run_findings`] for the order.
+pub fn run_finding_keys(run: i64) -> Query {
+    Query::new(
+        "SELECT id, severity = 'info', packet_id FROM findings WHERE run_id = ?",
+        vec![run.into()],
+    )
+}
+
+/// Some of a run's findings, by id (a JSON array of them), without their
+/// packets' times. Columns: id, severity, kind, message, lane, file,
+/// packet, file's rel.
+pub fn findings_by_id(run: i64, ids_json: &str) -> Query {
     Query::new(
         "SELECT x.id, x.severity, x.kind, x.message, x.lane_id, x.file_id, x.packet_id,
                 COALESCE((SELECT f.rel FROM files f WHERE f.id = x.file_id), '')
-         FROM findings x WHERE x.run_id = ? ORDER BY x.id",
-        vec![run.into()],
+         FROM findings x
+         WHERE x.run_id = ? AND x.id IN (SELECT value FROM json_each(?))",
+        vec![run.into(), ids_json.into()],
     )
 }
 

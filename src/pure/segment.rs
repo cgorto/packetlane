@@ -1007,9 +1007,17 @@ impl Counts {
     /// Moves to a table if the map holds at least a sixteenth of its cells
     /// and it is small enough.
     fn consider_table(&mut self) {
-        let mut lanes: Vec<u32> = self.map.keys().map(|&k| (k >> 32) as u32).collect();
+        // The most lanes a table may have: stop counting them past that.
+        let most = (self.map.len() as u64 * 16).min(self.table_cells) / self.bins.max(1);
+        let mut seen: Map<u32, ()> = Map::default();
+        for &k in self.map.keys() {
+            seen.insert((k >> 32) as u32, ());
+            if seen.len() as u64 > most {
+                return;
+            }
+        }
+        let mut lanes: Vec<u32> = seen.into_keys().collect();
         lanes.sort_unstable();
-        lanes.dedup();
         let cells = lanes.len() as u64 * self.bins;
         if cells > self.table_cells || (self.map.len() as u64) * 16 < cells {
             return;

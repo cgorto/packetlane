@@ -479,7 +479,9 @@ impl Store {
     /// id. The times come from the segment files. At most `limit`,
     /// `truncated` if there were more.
     pub fn run_findings(&self, run: i64, limit: usize) -> Result<Table> {
-        let mut found = self.query(&sql::run_findings_untimed(run), usize::MAX)?;
+        // First what they are ordered by, which is small whatever their
+        // messages; then the text of the ones shown.
+        let keys = self.query(&sql::run_finding_keys(run), usize::MAX)?;
         let ranges = self.query(&sql::run_segment_ranges(run), usize::MAX)?;
         let ranges: Vec<segment::Listed> = ranges
             .rows
@@ -494,10 +496,10 @@ impl Store {
             })
             .collect();
         // The packets asked about, segment by segment.
-        let mut wanted: Vec<(usize, i64)> = found
+        let mut wanted: Vec<(usize, i64)> = keys
             .rows
             .iter()
-            .filter_map(|r| r[6].int())
+            .filter_map(|r| r[2].int())
             .filter_map(|id| {
                 let at = ranges.partition_point(|s| s.max < id);
                 ranges
@@ -519,32 +521,53 @@ impl Store {
                 times.insert(id, (p.receive_ns, p.packet_ns));
             }
         }
-        let mut rows: Vec<(bool, i64, i64, Vec<Cell>)> = std::mem::take(&mut found.rows)
-            .into_iter()
-            .map(|mut r| {
-                let packet = r[6].int();
+        let mut order: Vec<(bool, i64, i64)> = keys
+            .rows
+            .iter()
+            .map(|r| {
+                let packet = r[2].int();
                 let (receive, time) = packet
                     .and_then(|id| times.get(&id).copied())
                     .unwrap_or((None, None));
-                let order = receive.or(time).or(packet).unwrap_or(0);
-                let info = r[1].text() == Some("info");
-                let id = r[0].int().unwrap_or(0);
+                let at = receive.or(time).or(packet).unwrap_or(0);
+                (r[1].int() == Some(1), at, r[0].int().unwrap_or(0))
+            })
+            .collect();
+        order.sort_unstable();
+        let truncated = order.len() > limit;
+        order.truncate(limit);
+        let rank: HashMap<i64, usize> = order.iter().enumerate().map(|(i, k)| (k.2, i)).collect();
+        let ids = format!(
+            "[{}]",
+            order
+                .iter()
+                .map(|k| k.2.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut found = self.query(&sql::findings_by_id(run, &ids), usize::MAX)?;
+        let mut rows: Vec<(usize, Vec<Cell>)> = std::mem::take(&mut found.rows)
+            .into_iter()
+            .map(|mut r| {
+                let (receive, time) = r[6]
+                    .int()
+                    .and_then(|id| times.get(&id).copied())
+                    .unwrap_or((None, None));
+                let at = r[0].int().and_then(|id| rank.get(&id).copied());
                 let rel = r.pop().unwrap_or(Cell::Null);
                 r.push(receive.map_or(Cell::Null, Cell::Int));
                 r.push(time.map_or(Cell::Null, Cell::Int));
                 r.push(rel);
-                (info, order, id, r)
+                (at.unwrap_or(usize::MAX), r)
             })
             .collect();
-        rows.sort_by_key(|r| (r.0, r.1, r.2));
-        let truncated = rows.len() > limit;
-        rows.truncate(limit);
+        rows.sort_by_key(|r| r.0);
         let mut columns = found.columns;
         let rel = columns.pop().unwrap_or_default();
         columns.extend(["receive_ns".to_string(), "packet_ns".to_string(), rel]);
         Ok(Table {
             columns,
-            rows: rows.into_iter().map(|r| r.3).collect(),
+            rows: rows.into_iter().map(|r| r.1).collect(),
             truncated,
         })
     }
