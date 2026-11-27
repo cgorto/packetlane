@@ -285,26 +285,9 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
             let w = &window;
             let store = reader()?;
             let key = field.as_ref().map(|(p, f)| (p.as_str(), f.as_str()));
-            // A lane with many packets has its series kept in buckets.
-            let kept = !store
-                .query(&sql::has_coarse_series(lane, w.clock, key), 1)?
-                .rows
-                .is_empty();
-            let stored = if kept {
-                store
-                    .query(&sql::coarse_meta(w.run, w.clock), 1)?
-                    .rows
-                    .first()
-                    .and_then(|r| Some((r[0].int()?, r[1].int()?)))
-            } else {
-                None
-            };
-            let mut parts = Vec::new();
-            for q in sql::series(w.run, w.clock, lane, key, w.from, w.to, buckets, stored) {
-                parts.push(store.query(&q, 4001)?);
-            }
-            let parts: Vec<&sql::Table> = parts.iter().collect();
-            let table = sql::merge_series(&parts);
+            // From the segment files, from their stored buckets where they
+            // were kept and the view is wide enough.
+            let table = store.series(w.run, w.clock, lane, key, w.from, w.to, buckets)?;
             render_series(w, bucket_width(w.from, w.to, buckets), &table)
         }
         Command::Packet { id } => {

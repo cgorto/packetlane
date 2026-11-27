@@ -315,6 +315,43 @@ impl Store {
         })
     }
 
+    /// One lane's kept field (packet name and field name), or its arrival
+    /// delay in milliseconds if `field` is `None`, over a window in
+    /// `buckets` buckets, as `sql::series` and `sql::merge_series` have it
+    /// (columns: bucket, min, max, count), from the segment files.
+    #[allow(clippy::too_many_arguments)]
+    pub fn series(
+        &self,
+        run: i64,
+        clock: sql::Clock,
+        lane: i64,
+        field: Option<(&str, &str)>,
+        from: i64,
+        to: i64,
+        buckets: i64,
+    ) -> Result<Table> {
+        let listed = self.listed(run, clock, from, to)?;
+        let width = sql::bucket_width(from, to, buckets);
+        let rows = segment::series(&self.segments, &listed, clock, lane, field, from, to, width)?;
+        Ok(Table {
+            columns: ["bucket", "min", "max", "count"]
+                .map(str::to_string)
+                .to_vec(),
+            rows: rows
+                .into_iter()
+                .map(|(b, lo, hi, n)| {
+                    vec![
+                        Cell::Int(b),
+                        Cell::Real(lo),
+                        Cell::Real(hi),
+                        Cell::Int(i64::try_from(n).unwrap_or(i64::MAX)),
+                    ]
+                })
+                .collect(),
+            truncated: false,
+        })
+    }
+
     /// The folder of segment files beside the store.
     pub fn segment_folder(&self) -> &Path {
         &self.segments

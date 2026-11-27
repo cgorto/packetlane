@@ -1090,9 +1090,121 @@ impl Counts {
     }
 }
 
+/// Most view buckets [`SeriesBins`] keeps in a table; more go to a map.
+const SERIES_TABLE: u64 = 1 << 16;
+
+/// A series over a window, reduced to the lowest and highest value and the
+/// count in each view bucket, from stored buckets and single points, by
+/// the rule of [`plan`].
+pub struct SeriesBins {
+    from: i64,
+    to: i64,
+    width: i64,
+    /// (lowest, highest, count) by view bucket; count 0 for none.
+    table: Vec<(f64, f64, u64)>,
+    map: Option<std::collections::BTreeMap<i64, (f64, f64, u64)>>,
+}
+
+impl SeriesBins {
+    pub fn new(from: i64, to: i64, width: i64) -> SeriesBins {
+        let width = width.max(1);
+        let bins = if from <= to {
+            view_bucket(to, from, width) as u64 + 1
+        } else {
+            0
+        };
+        let small = bins <= SERIES_TABLE;
+        SeriesBins {
+            from,
+            to,
+            width,
+            table: if small {
+                vec![(0.0, 0.0, 0); bins as usize]
+            } else {
+                Vec::new()
+            },
+            map: (!small).then(std::collections::BTreeMap::new),
+        }
+    }
+
+    fn add(&mut self, bin: i64, lo: f64, hi: f64, count: u64) {
+        let cell = match &mut self.map {
+            Some(map) => map.entry(bin).or_insert((lo, hi, 0)),
+            None => &mut self.table[bin as usize],
+        };
+        if cell.2 == 0 {
+            *cell = (lo, hi, count);
+        } else {
+            *cell = (cell.0.min(lo), cell.1.max(hi), cell.2 + count);
+        }
+    }
+
+    /// One value at `t`. Ignored outside the window.
+    pub fn point(&mut self, t: i64, value: f64) {
+        if (self.from..=self.to).contains(&t) {
+            self.add(view_bucket(t, self.from, self.width), value, value, 1);
+        }
+    }
+
+    /// A stored bucket taken whole: it goes to the view bucket its start
+    /// falls in. Ignored unless it lies wholly inside the window.
+    pub fn bucket(&mut self, b: &SeriesBucket, shift: u32) {
+        let (start, end) = bucket_span(b.bucket, shift);
+        if b.count > 0 && start >= i128::from(self.from) && end <= i128::from(self.to) {
+            let bin = view_bucket(start as i64, self.from, self.width);
+            self.add(bin, b.lo, b.hi, b.count);
+        }
+    }
+
+    /// One row per view bucket with values: (bucket, lowest, highest,
+    /// count), in bucket order.
+    pub fn rows(&self) -> Vec<(i64, f64, f64, u64)> {
+        match &self.map {
+            Some(map) => map
+                .iter()
+                .map(|(&bin, &(lo, hi, n))| (bin, lo, hi, n))
+                .collect(),
+            None => self
+                .table
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.2 > 0)
+                .map(|(bin, &(lo, hi, n))| (bin as i64, lo, hi, n))
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn series_bins_follow_the_rule() {
+        let mut s = SeriesBins::new(10, 49, 10);
+        s.point(10, 3.0);
+        s.point(19, -1.0);
+        s.point(20, 7.5);
+        s.point(50, 100.0);
+        s.point(9, 100.0);
+        let bucket = |bucket, lo, hi, count| SeriesBucket {
+            bucket,
+            lo,
+            hi,
+            count,
+        };
+        // 12..=15 (shift 2, bucket 3) starts in view bucket 0; 48..=51 is
+        // not wholly inside and is dropped.
+        s.bucket(&bucket(3, -4.0, 2.0, 6), 2);
+        s.bucket(&bucket(12, -9.0, 9.0, 2), 2);
+        assert_eq!(s.rows(), vec![(0, -4.0, 3.0, 8), (1, 7.5, 7.5, 1)]);
+        // A window of more view buckets than a table holds.
+        let mut wide = SeriesBins::new(0, 1 << 40, 1);
+        wide.point(1 << 39, 2.0);
+        wide.point(1 << 39, 1.0);
+        assert_eq!(wide.rows(), vec![(1 << 39, 1.0, 2.0, 2)]);
+        assert!(SeriesBins::new(5, 4, 1).rows().is_empty());
+    }
 
     #[test]
     fn packet_records_keep_what_is_there_and_nothing_else() {

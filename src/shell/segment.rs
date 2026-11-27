@@ -1202,6 +1202,21 @@ impl Segment {
         })
     }
 
+    /// A cursor over the packets from index `from` on, in index order.
+    pub fn packet_cursor(&self, from: u64) -> Result<PacketCursor<'_>> {
+        let e = self.section(KIND_PACKETS, 0)?;
+        let from = from.min(self.packets);
+        Ok(PacketCursor {
+            index: from,
+            reader: RangeReader::new(
+                &self.file,
+                e.offset + from * PACKET_BYTES as u64,
+                e.offset + e.length,
+                SCAN_BUFFER,
+            ),
+        })
+    }
+
     /// A cursor over the packets whose time on a time clock is at least
     /// `from`, in order of time and index.
     pub fn times_from(&self, clock: Clock, from: i64) -> Result<TimeCursor<'_>> {
@@ -1430,6 +1445,22 @@ impl TimeCursor<'_> {
     }
 }
 
+/// Packets in index order, with their index, from a segment.
+pub struct PacketCursor<'a> {
+    index: u64,
+    reader: RangeReader<'a, PACKET_BYTES>,
+}
+
+impl PacketCursor<'_> {
+    pub fn next_packet(&mut self) -> Result<Option<(u64, PacketRecord)>> {
+        let Some(b) = self.reader.read()? else {
+            return Ok(None);
+        };
+        self.index += 1;
+        Ok(Some((self.index - 1, PacketRecord::decode(&b))))
+    }
+}
+
 fn i64_le(b: &[u8]) -> i64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[..8]);
@@ -1583,6 +1614,120 @@ pub fn items(
         out.push(item(id, ns, &p));
     }
     Ok(out)
+}
+
+/// One lane's kept field (`field` as packet name and field name), or its
+/// arrival delay if `field` is `None`, over `from..=to` in buckets `width`
+/// wide, from the listed segments: (bucket, lowest, highest, count) for
+/// each bucket with values, in bucket order.
+///
+/// On a time clock a segment's stored buckets of the series are taken
+/// whole where the rule of `pure::segment::plan` allows and they were kept,
+/// and the rest is read point by point from the series' group. On the
+/// order clock the packets in the window are read with their values.
+#[allow(clippy::too_many_arguments)]
+pub fn series(
+    folder: &Path,
+    listed: &[Listed],
+    clock: Clock,
+    lane: i64,
+    field: Option<(&str, &str)>,
+    from: i64,
+    to: i64,
+    width: i64,
+) -> Result<Vec<(i64, f64, f64, u64)>> {
+    let mut bins = layout::SeriesBins::new(from, to, width);
+    let Ok(lane) = u32::try_from(lane) else {
+        return Ok(Vec::new());
+    };
+    if from > to {
+        return Ok(Vec::new());
+    }
+    for s in listed {
+        if s.max < from || s.min > to {
+            continue;
+        }
+        let seg = open_listed(folder, s)?;
+        let series = match field {
+            None => DELAY,
+            Some((packet, name)) => match seg.series_id(packet, name)? {
+                Some(id) => id,
+                None => continue,
+            },
+        };
+        if clock == Clock::Order {
+            order_series(&seg, lane, series, from, to, &mut bins)?;
+            continue;
+        }
+        let Some(group) = seg.group(clock, lane, series)? else {
+            continue;
+        };
+        let shift = seg.series_shift(clock)?;
+        let plan = if group.buckets > 0 {
+            layout::plan(from, to, width, shift)
+        } else {
+            layout::Plan {
+                whole: None,
+                direct: vec![(from, to)],
+            }
+        };
+        if let Some((first, last)) = plan.whole {
+            seg.group_buckets(clock, &group, first, last, |b| bins.bucket(&b, shift))?;
+        }
+        for (lo, hi) in plan.direct {
+            seg.group_points(clock, &group, lo, hi, |p| bins.point(p.ns, p.num))?;
+        }
+    }
+    Ok(bins.rows())
+}
+
+/// A series on the order clock, from one segment: the lane's packets with
+/// ids in `from..=to` and, for a kept field, their values, read side by
+/// side in packet order.
+fn order_series(
+    seg: &Segment,
+    lane: u32,
+    series: u32,
+    from: i64,
+    to: i64,
+    bins: &mut layout::SeriesBins,
+) -> Result<()> {
+    let first = seg.first_packet();
+    let last = first + seg.packets() as i64 - 1;
+    let (lo, hi) = (from.max(first), to.min(last));
+    if lo > hi {
+        return Ok(());
+    }
+    let (lo, hi) = ((lo - first) as u64, (hi - first) as u64);
+    if series == DELAY {
+        return seg.packets_in(lo, hi, |index, p| {
+            if p.lane == lane
+                && let (Some(r), Some(t)) = (p.receive_ns, p.packet_ns)
+            {
+                bins.point(first + index as i64, layout::delay_ms(r, t));
+            }
+            Ok(true)
+        });
+    }
+    let mut packets = seg.packet_cursor(lo)?;
+    let mut at: Option<(u64, u32)> = None;
+    seg.values_in(lo, hi, |v| {
+        let Some(num) = v.num.filter(|_| v.series == series) else {
+            return Ok(true);
+        };
+        let index = u64::from(v.index);
+        // The packet's lane, reading forward to it.
+        while at.is_none_or(|(i, _)| i < index) {
+            let Some((i, p)) = packets.next_packet()? else {
+                return Ok(false);
+            };
+            at = Some((i, p.lane));
+        }
+        if at == Some((index, lane)) {
+            bins.point(first + index as i64, num);
+        }
+        Ok(true)
+    })
 }
 
 fn item(id: i64, time: i64, p: &PacketRecord) -> Item {
