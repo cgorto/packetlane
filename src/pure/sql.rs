@@ -94,17 +94,6 @@ CREATE TABLE IF NOT EXISTS coarse (
   count INTEGER NOT NULL,
   PRIMARY KEY (lane_id, clock, bucket)
 ) WITHOUT ROWID;
-CREATE TABLE IF NOT EXISTS coarse_series (
-  lane_id INTEGER NOT NULL,
-  clock INTEGER NOT NULL,
-  packet TEXT NOT NULL,
-  field TEXT NOT NULL,
-  bucket INTEGER NOT NULL,
-  lo REAL NOT NULL,
-  hi REAL NOT NULL,
-  count INTEGER NOT NULL,
-  PRIMARY KEY (lane_id, clock, packet, field, bucket)
-) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS coarse_meta (
   run_id INTEGER NOT NULL,
   clock INTEGER NOT NULL,
@@ -718,13 +707,12 @@ pub const RUN_FILE_IDS: &str = "SELECT id FROM files WHERE run_id = ?";
 /// Removes everything read for a run but the run itself, each taking the
 /// run id. The packets and kept values go first, file by file, with
 /// [`delete_file_packets`].
-pub const RESET_RUN: [&str; 10] = [
+pub const RESET_RUN: [&str; 9] = [
     "DELETE FROM segments WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM segment_lanes WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM file_series WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM logs WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM findings WHERE run_id = ?",
-    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
     "DELETE FROM coarse WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
     "DELETE FROM coarse_meta WHERE run_id = ?",
     "DELETE FROM lanes WHERE run_id = ?",
@@ -890,12 +878,15 @@ pub fn lanes_with_finding(run: i64, kind: &str) -> Query {
     )
 }
 
-// ---- pre-counted density ---------------------------------------------------
+// ---- pre-counted density of text logs -------------------------------------------
 //
-// Counting every packet of a long run for each redraw is too slow, so after
-// an ingest the store keeps counts per lane in `COARSE_BUCKETS` fixed buckets
-// per clock. A view whose own buckets are at least that wide is drawn from
-// those counts; a narrower view covers little enough to count directly.
+// Packets are counted from their segment files (see `pure::segment`). Text
+// log entries are counted from the `logs` table, and counting every entry
+// of a long run for each redraw would be slow, so after an ingest the store
+// keeps counts per log lane in `COARSE_BUCKETS` fixed buckets per clock. A
+// view whose own buckets are at least that wide is drawn from those counts;
+// a narrower view covers little enough to count directly. The buckets lie
+// on a grid set by the whole run, packets included, on each clock.
 
 /// Buckets kept per run and clock.
 pub const COARSE_BUCKETS: i64 = 4096;
@@ -927,28 +918,25 @@ pub fn run_extents(run: i64) -> Query {
     )
 }
 
-/// The statements that fill the pre-counted buckets for one clock of a run
-/// whose values on that clock span `min..=max`.
-pub fn build_coarse(run: i64, clock: Clock, min: i64, max: i64) -> Vec<Query> {
+/// The statements that fill the pre-counted log buckets for one clock of a
+/// run whose values on that clock span `min..=max`: the grid, and on a
+/// clock with a place for text logs, their counts.
+pub fn build_log_coarse(run: i64, clock: Clock, min: i64, max: i64) -> Vec<Query> {
     let width = bucket_width(min, max, COARSE_BUCKETS);
     let mut out = vec![Query::new(
         "INSERT INTO coarse_meta (run_id, clock, origin, width) VALUES (?, ?, ?, ?)",
         vec![run.into(), clock.code().into(), min.into(), width.into()],
     )];
-    let mut fill = |table: &str, column: &str| {
+    if let Some(column) = clock.log_column() {
         out.push(Query::new(
             format!(
                 "INSERT INTO coarse (lane_id, clock, bucket, count)
-                 SELECT lane_id, ?1, ({column} - ?2) / ?3 AS b, COUNT(*) FROM {table}
+                 SELECT lane_id, ?1, ({column} - ?2) / ?3 AS b, COUNT(*) FROM logs
                  WHERE {column} IS NOT NULL AND lane_id IN (SELECT id FROM lanes WHERE run_id = ?4)
                  GROUP BY lane_id, b"
             ),
             vec![clock.code().into(), min.into(), width.into(), run.into()],
         ));
-    };
-    fill("packets", clock.packet_column());
-    if let Some(column) = clock.log_column() {
-        fill("logs", column);
     }
     out
 }
@@ -958,27 +946,6 @@ pub fn coarse_meta(run: i64, clock: Clock) -> Query {
     Query::new(
         "SELECT origin, width FROM coarse_meta WHERE run_id = ? AND clock = ?",
         vec![run.into(), clock.code().into()],
-    )
-}
-
-/// Counts rows of one table whose time lies in `lo..=hi`, into buckets of
-/// `width` measured from `from`.
-fn range_density(
-    table: &str,
-    column: &str,
-    run: i64,
-    lo: i64,
-    hi: i64,
-    from: i64,
-    width: i64,
-) -> Query {
-    Query::new(
-        format!(
-            "SELECT lane_id, ({column} - ?) / ? AS b, COUNT(*) FROM {table}
-             WHERE {column} BETWEEN ? AND ? AND lane_id IN {RUN_LANES}
-             GROUP BY lane_id, b"
-        ),
-        vec![from.into(), width.into(), lo.into(), hi.into(), run.into()],
     )
 }
 
@@ -1009,25 +976,12 @@ fn whole_coarse_buckets(
     Some((first, last, lo, hi))
 }
 
-/// The statements that count a window into `buckets` buckets. Each returns
-/// lane, bucket, count, and together they count every row in the window
-/// exactly once. `coarse` is the origin and width from [`coarse_meta`], if
-/// the run has pre-counted buckets: those are used for the part of the
-/// window they cover whole, and the two ends are counted directly.
-pub fn density(
-    run: i64,
-    clock: Clock,
-    from: i64,
-    to: i64,
-    buckets: i64,
-    coarse: Option<(i64, i64)>,
-) -> Vec<Query> {
-    density_of(run, clock, from, to, buckets, coarse, false)
-}
-
-/// As [`density`], for text log entries only: the statements that count a
-/// window's log entries, from the pre-counted buckets of log lanes where
-/// they cover it whole. None on a clock with no place for text logs.
+/// The statements that count a window's text log entries into `buckets`
+/// buckets. Each returns lane, bucket, count, and together they count every
+/// entry in the window exactly once. `coarse` is the origin and width from
+/// [`coarse_meta`], if the run has pre-counted buckets: those are used for
+/// the part of the window they cover whole, and the two ends are counted
+/// directly. None on a clock with no place for text logs.
 pub fn log_density_stored(
     run: i64,
     clock: Clock,
@@ -1036,40 +990,19 @@ pub fn log_density_stored(
     buckets: i64,
     coarse: Option<(i64, i64)>,
 ) -> Vec<Query> {
-    if clock.log_column().is_none() {
+    let Some(column) = clock.log_column() else {
         return Vec::new();
-    }
-    density_of(run, clock, from, to, buckets, coarse, true)
-}
-
-fn density_of(
-    run: i64,
-    clock: Clock,
-    from: i64,
-    to: i64,
-    buckets: i64,
-    coarse: Option<(i64, i64)>,
-    logs_only: bool,
-) -> Vec<Query> {
+    };
     let width = bucket_width(from, to, buckets);
-    let lanes = if logs_only { " AND kind = 'log'" } else { "" };
-    let direct = |lo: i64, hi: i64| -> Vec<Query> {
-        let mut out = Vec::new();
-        if !logs_only {
-            out.push(range_density(
-                &format!("packets {}", clock.all_lanes()),
-                clock.packet_column(),
-                run,
-                lo,
-                hi,
-                from,
-                width,
-            ));
-        }
-        if let Some(column) = clock.log_column() {
-            out.push(range_density("logs", column, run, lo, hi, from, width));
-        }
-        out
+    let direct = |lo: i64, hi: i64| {
+        Query::new(
+            format!(
+                "SELECT lane_id, ({column} - ?) / ? AS b, COUNT(*) FROM logs
+                 WHERE {column} BETWEEN ? AND ? AND lane_id IN {RUN_LANES}
+                 GROUP BY lane_id, b"
+            ),
+            vec![from.into(), width.into(), lo.into(), hi.into(), run.into()],
+        )
     };
     let whole = match coarse {
         Some((origin, coarse_width)) if coarse_width > 0 && width >= coarse_width => {
@@ -1079,15 +1012,13 @@ fn density_of(
         _ => None,
     };
     let Some(((first, last, lo, hi), origin, coarse_width)) = whole else {
-        return direct(from, to);
+        return vec![direct(from, to)];
     };
     let mut out = vec![Query::new(
-        format!(
-            "SELECT lane_id, (?1 + bucket * ?2 - ?3) / ?4 AS b, SUM(count) FROM coarse
-             WHERE clock = ?5 AND bucket BETWEEN ?6 AND ?7
-               AND lane_id IN (SELECT id FROM lanes WHERE run_id = ?8{lanes})
-             GROUP BY lane_id, b"
-        ),
+        "SELECT lane_id, (?1 + bucket * ?2 - ?3) / ?4 AS b, SUM(count) FROM coarse
+         WHERE clock = ?5 AND bucket BETWEEN ?6 AND ?7
+           AND lane_id IN (SELECT id FROM lanes WHERE run_id = ?8 AND kind = 'log')
+         GROUP BY lane_id, b",
         vec![
             origin.into(),
             coarse_width.into(),
@@ -1100,171 +1031,6 @@ fn density_of(
         ],
     )];
     if from < lo {
-        out.extend(direct(from, lo - 1));
-    }
-    if hi < to {
-        out.extend(direct(hi + 1, to));
-    }
-    out
-}
-
-// ---- stored series buckets ---------------------------------------------------
-//
-// A plot of a whole long run reads every packet of its lane. For lanes with
-// enough packets to make that slow, the store keeps, after an ingest, the
-// lowest and highest value in each of a fixed set of buckets, for every
-// kept field and for arrival delay. A view whose own buckets are at least
-// that wide is drawn from those; a narrower view covers little enough of
-// the lane to read directly.
-
-/// Stored series buckets per pre-counted density bucket: 16,384 a run.
-pub const SERIES_PER_COARSE: i64 = 4;
-
-/// Lanes with fewer packets than this on a clock get no stored buckets:
-/// reading them whole is quick, and buckets for every small lane would
-/// cost more room than the lane's values.
-pub const SERIES_MIN_PACKETS: i64 = 8 * SERIES_PER_COARSE * COARSE_BUCKETS;
-
-/// The width of a stored series bucket, from the width of the run's
-/// pre-counted density buckets on the same clock. They share an origin.
-pub fn series_width(coarse_width: i64) -> i64 {
-    (coarse_width / SERIES_PER_COARSE).max(1)
-}
-
-pub const CLEAR_COARSE_SERIES: &str =
-    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)";
-
-/// The statements that fill the stored series buckets for one clock of a
-/// run, for lanes with at least `min_packets` on that clock. `origin` and
-/// `coarse_width` are the run's, as in `coarse_meta`. None for the order
-/// clock, which has no lane-first index to read a lane by.
-pub fn build_coarse_series(
-    run: i64,
-    clock: Clock,
-    origin: i64,
-    coarse_width: i64,
-    min_packets: i64,
-) -> Vec<Query> {
-    let (c, counted) = match clock {
-        Clock::Receive => ("receive_ns", "receive_count"),
-        Clock::Packet => ("packet_ns", "packet_count"),
-        Clock::Order => return Vec::new(),
-    };
-    let index = clock.one_lane();
-    let lanes =
-        format!("(SELECT id FROM lanes WHERE run_id = ?4 AND kind = 'packet' AND {counted} >= ?5)");
-    let params: Vec<Param> = vec![
-        clock.code().into(),
-        origin.into(),
-        series_width(coarse_width).into(),
-        run.into(),
-        min_packets.into(),
-    ];
-    vec![
-        Query::new(
-            format!(
-                "INSERT INTO coarse_series (lane_id, clock, packet, field, bucket, lo, hi, count)
-                 SELECT lane_id, ?1, '', '', ({c} - ?2) / ?3 AS b,
-                        MIN(receive_ns - packet_ns) / 1000000.0,
-                        MAX(receive_ns - packet_ns) / 1000000.0, COUNT(*)
-                 FROM packets {index}
-                 WHERE lane_id IN {lanes} AND receive_ns IS NOT NULL AND packet_ns IS NOT NULL
-                 GROUP BY lane_id, b"
-            ),
-            params.clone(),
-        ),
-        Query::new(
-            format!(
-                "INSERT INTO coarse_series (lane_id, clock, packet, field, bucket, lo, hi, count)
-                 SELECT p.lane_id, ?1, v.packet, v.field, (p.{c} - ?2) / ?3 AS b,
-                        MIN(v.num), MAX(v.num), COUNT(*)
-                 FROM packets p {index} CROSS JOIN field_values v ON v.packet_id = p.id
-                 WHERE p.lane_id IN {lanes} AND p.{c} IS NOT NULL AND v.num IS NOT NULL
-                 GROUP BY p.lane_id, v.packet, v.field, b"
-            ),
-            params,
-        ),
-    ]
-}
-
-/// The name a series is stored under: a kept field's packet and field, or
-/// two empty names for arrival delay.
-fn series_key<'a>(field: Option<(&'a str, &'a str)>) -> (&'a str, &'a str) {
-    field.unwrap_or(("", ""))
-}
-
-/// Whether a series has stored buckets on a clock: one row if so.
-pub fn has_coarse_series(lane: i64, clock: Clock, field: Option<(&str, &str)>) -> Query {
-    let (packet, field) = series_key(field);
-    Query::new(
-        "SELECT 1 FROM coarse_series
-         WHERE lane_id = ? AND clock = ? AND packet = ? AND field = ? LIMIT 1",
-        vec![
-            lane.into(),
-            clock.code().into(),
-            packet.into(),
-            field.into(),
-        ],
-    )
-}
-
-/// The statements that reduce a series over a window to `buckets` buckets.
-/// Each returns bucket, min, max, count; a bucket may come from more than
-/// one, and [`merge_series`] joins them. Together they take in every packet
-/// in the window exactly once.
-///
-/// `stored` is the origin and width from [`coarse_meta`] if the series has
-/// stored buckets ([`has_coarse_series`]): those are used for the part of
-/// the window they cover whole, and the two ends are read directly. A
-/// stored bucket goes to the requested bucket its start falls in.
-#[allow(clippy::too_many_arguments)]
-pub fn series(
-    run: i64,
-    clock: Clock,
-    lane: i64,
-    field: Option<(&str, &str)>,
-    from: i64,
-    to: i64,
-    buckets: i64,
-    stored: Option<(i64, i64)>,
-) -> Vec<Query> {
-    let width = bucket_width(from, to, buckets);
-    let direct = |lo: i64, hi: i64| series_range(run, clock, lane, field, (from, width), lo, hi);
-    let whole = match stored {
-        Some((origin, coarse_width)) if coarse_width > 0 => {
-            let stored_width = series_width(coarse_width);
-            (width >= stored_width)
-                .then(|| whole_coarse_buckets(from, to, origin, stored_width))
-                .flatten()
-                .map(|found| (found, origin, stored_width))
-        }
-        _ => None,
-    };
-    let Some(((first, last, lo, hi), origin, stored_width)) = whole else {
-        return vec![direct(from, to)];
-    };
-    let (packet, name) = series_key(field);
-    let mut out = vec![Query::new(
-        "SELECT (?1 + bucket * ?2 - ?3) / ?4 AS b, MIN(lo), MAX(hi), SUM(count)
-         FROM coarse_series
-         WHERE lane_id = ?5 AND lane_id IN (SELECT id FROM lanes WHERE run_id = ?6)
-           AND clock = ?7 AND packet = ?8 AND field = ?9 AND bucket BETWEEN ?10 AND ?11
-         GROUP BY b ORDER BY b",
-        vec![
-            origin.into(),
-            stored_width.into(),
-            from.into(),
-            width.into(),
-            lane.into(),
-            run.into(),
-            clock.code().into(),
-            packet.into(),
-            name.into(),
-            first.into(),
-            last.into(),
-        ],
-    )];
-    if from < lo {
         out.push(direct(from, lo - 1));
     }
     if hi < to {
@@ -1273,7 +1039,7 @@ pub fn series(
     out
 }
 
-/// Joins the answers to the statements from [`series`] into one row a
+/// Joins answers that each give bucket, min, max, count into one row a
 /// bucket, in bucket order: the lowest min, the highest max, the counts
 /// added.
 pub fn merge_series(parts: &[&Table]) -> Table {
@@ -1363,64 +1129,49 @@ mod tests {
     }
 
     #[test]
-    fn density_uses_pre_counted_buckets_only_when_they_are_fine_enough() {
+    fn log_density_uses_pre_counted_buckets_only_when_they_are_fine_enough() {
         // Whole run: view buckets (250) are wider than the stored ones (100).
-        let wide = density(1, Clock::Receive, 1_000, 100_999, 400, Some((1_000, 100)));
+        let wide = log_density_stored(1, Clock::Receive, 1_000, 100_999, 400, Some((1_000, 100)));
         assert_eq!(wide.len(), 1);
-        assert!(wide[0].sql.contains("FROM coarse"));
+        assert!(wide[0].sql.contains("FROM coarse") && wide[0].sql.contains("kind = 'log'"));
         assert_eq!(wide[0].params[5], Param::Int(0));
         assert_eq!(wide[0].params[6], Param::Int(999));
-        // Zoomed in: view buckets (5) are narrower, so count the rows.
-        let narrow = density(1, Clock::Receive, 50_000, 51_999, 400, Some((1_000, 100)));
-        assert_eq!(narrow.len(), 2);
-        assert!(narrow.iter().all(|q| !q.sql.contains("FROM coarse")));
-        assert!(narrow[0].sql.contains("FROM packets"));
-        assert!(narrow[1].sql.contains("FROM logs"));
-        // No stored buckets, and a clock with no text logs.
-        assert_eq!(density(1, Clock::Order, 0, 99_999, 400, None).len(), 1);
+        // Zoomed in: view buckets (5) are narrower, so count the entries.
+        let narrow = log_density_stored(1, Clock::Receive, 50_000, 51_999, 400, Some((1_000, 100)));
+        assert_eq!(narrow.len(), 1);
+        assert!(narrow[0].sql.contains("FROM logs"));
+        // No stored buckets; and a clock with no text logs.
+        assert_eq!(
+            log_density_stored(1, Clock::Packet, 0, 99_999, 400, None).len(),
+            1
+        );
+        assert!(log_density_stored(1, Clock::Order, 0, 99, 2, Some((1_000, 100))).is_empty());
         // A window that starts before the stored origin.
-        let early = density(1, Clock::Receive, -5_000, 100_999, 400, Some((1_000, 100)));
+        let early = log_density_stored(1, Clock::Receive, -5_000, 100_999, 400, Some((1_000, 100)));
         assert_eq!(early[0].params[5], Param::Int(-60));
     }
 
     #[test]
-    fn log_density_from_stored_buckets_reads_no_packets() {
-        let coarse = Some((1_000, 100));
-        let q = log_density_stored(1, Clock::Receive, 1_050, 1_449, 2, coarse);
-        assert_eq!(q.len(), 3);
-        assert!(q[0].sql.contains("FROM coarse") && q[0].sql.contains("kind = 'log'"));
-        assert!(q[1..].iter().all(|q| q.sql.contains("FROM logs")));
-        let narrow = log_density_stored(1, Clock::Packet, 1_050, 1_149, 1, coarse);
-        assert_eq!(narrow.len(), 1);
-        assert!(narrow[0].sql.contains("FROM logs"));
-        assert!(log_density_stored(1, Clock::Order, 0, 99, 2, coarse).is_empty());
-        // The full statements still count packets and every lane.
-        let all = density(1, Clock::Receive, 1_050, 1_449, 2, coarse);
-        assert!(!all[0].sql.contains("kind = 'log'"));
-        assert!(all.iter().any(|q| q.sql.contains("FROM packets")));
-    }
-
-    #[test]
-    fn coarse_build_statements() {
-        let q = build_coarse(7, Clock::Packet, 1_000, 410_599);
-        assert_eq!(q.len(), 3);
+    fn log_coarse_build_statements() {
+        let q = build_log_coarse(7, Clock::Packet, 1_000, 410_599);
+        assert_eq!(q.len(), 2);
         assert_eq!(
             q[0].params,
             vec![7.into(), 1.into(), 1_000.into(), 100.into()]
         );
-        assert!(q[1].sql.contains("FROM packets") && q[1].sql.contains("packet_ns"));
-        assert!(q[2].sql.contains("FROM logs") && q[2].sql.contains("log_ns"));
-        assert_eq!(build_coarse(7, Clock::Order, 1, 50).len(), 2);
+        assert!(q[1].sql.contains("FROM logs") && q[1].sql.contains("log_ns"));
+        // The order clock has a grid and no text logs.
+        assert_eq!(build_log_coarse(7, Clock::Order, 1, 50).len(), 1);
     }
 
     #[test]
     fn pre_counted_buckets_are_only_used_where_they_fit_whole() {
         let coarse = Some((1_000, 100));
         // Neither stored bucket lies wholly inside 1050..=1149: count directly.
-        let q = density(1, Clock::Receive, 1_050, 1_149, 1, coarse);
+        let q = log_density_stored(1, Clock::Receive, 1_050, 1_149, 1, coarse);
         assert!(q.iter().all(|q| !q.sql.contains("FROM coarse")));
         // 1050..=1449 holds buckets 1..=3 whole (1100..=1399), plus two ends.
-        let q = density(1, Clock::Order, 1_050, 1_449, 2, coarse);
+        let q = log_density_stored(1, Clock::Packet, 1_050, 1_449, 2, coarse);
         assert_eq!(q.len(), 3);
         assert_eq!(
             (&q[0].params[5], &q[0].params[6]),
@@ -1435,7 +1186,7 @@ mod tests {
             (&Param::Int(1_400), &Param::Int(1_449))
         );
         // Extremes fall back to counting directly instead of overflowing.
-        let q = density(1, Clock::Order, i64::MIN, i64::MAX, 400, Some((0, 1)));
+        let q = log_density_stored(1, Clock::Receive, i64::MIN, i64::MAX, 400, Some((0, 1)));
         assert!(!q.is_empty());
     }
 }

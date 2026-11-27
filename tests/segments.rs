@@ -1194,12 +1194,10 @@ fn density_timing() {
                 n
             }));
             let (old, old_total) = median(Box::new(|| {
-                let meta = store.query(&sql::coarse_meta(run, clock), 1).unwrap();
-                let coarse = meta
-                    .rows
-                    .first()
-                    .and_then(|r| Some((r[0].int()?, r[1].int()?)));
-                sql::density(run, clock, from, to, buckets, coarse)
+                // Every packet and entry counted from the rows.
+                std::iter::once(sql::packet_density(run, clock, from, to, buckets))
+                    .chain(sql::log_density(run, clock, from, to, buckets))
+                    .collect::<Vec<_>>()
                     .iter()
                     .flat_map(|q| store.query(q, usize::MAX).unwrap().rows)
                     .map(|r| r[2].int().unwrap())
@@ -1562,8 +1560,7 @@ fn damaged_segments_are_refused() {
     );
 }
 
-/// The old way of reading a plot: from the store's stored series buckets
-/// where they fit, the rest from its rows.
+/// The old way of reading a plot: from the store's rows.
 #[allow(clippy::too_many_arguments)]
 fn series_from_sql(
     store: &Store,
@@ -1575,25 +1572,13 @@ fn series_from_sql(
     to: i64,
     buckets: i64,
 ) -> sql::Table {
-    let kept = !store
-        .query(&sql::has_coarse_series(lane, clock, field), 1)
-        .unwrap()
-        .rows
-        .is_empty();
-    let stored = if kept {
-        let meta = store.query(&sql::coarse_meta(run, clock), 1).unwrap();
-        meta.rows
-            .first()
-            .and_then(|r| Some((r[0].int()?, r[1].int()?)))
-    } else {
-        None
+    let q = match field {
+        Some((packet, name)) => {
+            sql::value_series(run, clock, lane, packet, name, from, to, buckets)
+        }
+        None => sql::lag_series(run, clock, lane, from, to, buckets),
     };
-    let parts: Vec<sql::Table> = sql::series(run, clock, lane, field, from, to, buckets, stored)
-        .iter()
-        .map(|q| store.query(q, 4001).unwrap())
-        .collect();
-    let parts: Vec<&sql::Table> = parts.iter().collect();
-    sql::merge_series(&parts)
+    store.query(&q, 4001).unwrap()
 }
 
 #[test]

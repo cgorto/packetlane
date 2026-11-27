@@ -631,6 +631,8 @@ fn pre_counted_and_direct_density_agree() {
             .map(|r| r[2].int().unwrap())
             .sum()
     };
+    // Text log entries: packets are counted from their segments.
+    let mut counted = 0;
     for clock in [Clock::Receive, Clock::Packet] {
         let meta = reader.query(&sql::coarse_meta(1, clock), 1).unwrap();
         let coarse = Some((
@@ -644,11 +646,13 @@ fn pre_counted_and_direct_density_agree() {
             (t0 + 10_000_000_001, t0 + 10_030_000_000, 1),
             (t0 + 20_000_000_000, t0 + 20_000_000_000, 5),
         ] {
-            let with = total(sql::density(1, clock, from, to, buckets, coarse));
-            let without = total(sql::density(1, clock, from, to, buckets, None));
+            let with = total(sql::log_density_stored(1, clock, from, to, buckets, coarse));
+            let without = total(sql::log_density_stored(1, clock, from, to, buckets, None));
             assert_eq!(with, without, "{clock:?} {from}..{to} in {buckets}");
+            counted += without;
         }
     }
+    assert!(counted > 0);
 }
 
 #[test]

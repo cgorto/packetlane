@@ -683,11 +683,11 @@ impl Store {
             let tx = self.conn.transaction()?;
             tx.execute(sql::LANES_FROM_SEGMENTS, params![run_id])?;
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
-            phases.mark("lane counts");
-            let mut series_took = Duration::ZERO;
+            phases.mark("lane totals from the files' counts");
+            // Text log entries are counted into buckets for the density
+            // view; packets are counted from their segments when asked.
             tx.execute(sql::CLEAR_COARSE, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_META, params![run_id])?;
-            tx.execute(sql::CLEAR_COARSE_SERIES, params![run_id])?;
             let extents = run_query(&tx, &sql::run_extents(run_id), 1)?;
             if let Some(row) = extents.rows.first() {
                 for (i, clock) in sql::Clock::ALL.into_iter().enumerate() {
@@ -696,31 +696,13 @@ impl Store {
                     if let (Some(min), Some(max)) = (row[i * 2].int(), row[i * 2 + 1].int())
                         && max.checked_sub(min).is_some()
                     {
-                        let width = sql::bucket_width(min, max, sql::COARSE_BUCKETS);
-                        let series = sql::build_coarse_series(
-                            run_id,
-                            clock,
-                            min,
-                            width,
-                            sql::SERIES_MIN_PACKETS,
-                        );
-                        for q in sql::build_coarse(run_id, clock, min, max) {
+                        for q in sql::build_log_coarse(run_id, clock, min, max) {
                             tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
                         }
-                        let started = Instant::now();
-                        for q in series {
-                            tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
-                        }
-                        series_took += started.elapsed();
                     }
                 }
             }
-            phases.say("series buckets", series_took);
-            phases.say(
-                "density buckets",
-                phases.last.elapsed().saturating_sub(series_took),
-            );
-            phases.last = Instant::now();
+            phases.mark("text log buckets");
             tx.execute(sql::DELETE_CROSS_FINDINGS, params![run_id])?;
             for finding in cross_findings(&tx, &self.segments, run_id, &mut phases)? {
                 tx.execute(
@@ -737,7 +719,7 @@ impl Store {
                 )?;
             }
             tx.commit()?;
-            phases.mark("writing it down");
+            phases.mark("storing the findings");
         }
 
         let problems: i64 = self.conn.query_row(
