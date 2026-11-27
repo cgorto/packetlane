@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use packetlane::pure::oracle;
 use packetlane::pure::segment::{DELAY, level_for, plan};
 use packetlane::pure::sql::{self, Clock, Query, bucket_width};
 use packetlane::pure::synth::{Source, cosmos4_entry, cosmos4_header, demo_run, timed_packet};
@@ -43,7 +44,7 @@ impl Scratch {
 
     fn ingest(&self) {
         let run = fs::canonicalize(self.0.join("run")).unwrap();
-        let mut store = Store::open(&self.db()).unwrap();
+        let mut store = Store::open_with_oracle(&self.db()).unwrap();
         ingest_targets(&mut store, &[run], None, None, None).unwrap();
     }
 
@@ -86,7 +87,7 @@ fn from_segments(store: &Store, clock: Clock, from: i64, to: i64, buckets: i64) 
 /// `sql::packet_density`, every packet counted directly, one row per lane
 /// and bucket in that order.
 fn counted(store: &Store, clock: Clock, from: i64, to: i64, buckets: i64) -> Vec<Vec<i64>> {
-    let mut rows = ints(store, &sql::packet_density(1, clock, from, to, buckets));
+    let mut rows = ints(store, &oracle::packet_density(1, clock, from, to, buckets));
     rows.sort();
     rows
 }
@@ -108,7 +109,7 @@ fn rule_in_sql(store: &Store, clock: Clock, from: i64, to: i64, buckets: i64) ->
              p AS (
                SELECT p.lane_id AS lane, p.{c} AS t, lv.s AS s,
                       ((p.{c} >> lv.s) << lv.s) AS b0
-               FROM packets p JOIN lv ON p.id BETWEEN lv.a AND lv.z
+               FROM oracle_packets p JOIN lv ON p.id BETWEEN lv.a AND lv.z
                WHERE p.{c} BETWEEN ?1 AND ?2)
              SELECT lane,
                     CASE WHEN s IS NOT NULL AND ?3 >= (1 << s) AND b0 >= ?1
@@ -175,7 +176,7 @@ fn extent(store: &Store, clock: Clock) -> Option<(i64, i64)> {
     let c = clock.packet_column();
     let r = ask(
         store,
-        &format!("SELECT MIN({c}), MAX({c}) FROM packets WHERE {c} IS NOT NULL"),
+        &format!("SELECT MIN({c}), MAX({c}) FROM oracle_packets WHERE {c} IS NOT NULL"),
         vec![],
     );
     (r[0][0] != i64::MIN).then(|| (r[0][0], r[0][1]))
@@ -298,7 +299,7 @@ fn check_store(store: &Store) -> [bool; 3] {
             let direct = ask(
                 store,
                 &format!(
-                    "SELECT lane_id, COUNT(*) FROM packets WHERE {c} BETWEEN ? AND ?
+                    "SELECT lane_id, COUNT(*) FROM oracle_packets WHERE {c} BETWEEN ? AND ?
                      GROUP BY lane_id ORDER BY lane_id"
                 ),
                 vec![from.into(), to.into()],
@@ -381,7 +382,7 @@ fn check_items(store: &Store) -> bool {
         let tied = ask(
             store,
             &format!(
-                "SELECT {c} FROM packets WHERE {c} IS NOT NULL
+                "SELECT {c} FROM oracle_packets WHERE {c} IS NOT NULL
                  GROUP BY {c} HAVING COUNT(*) > 1 ORDER BY {c} LIMIT 3"
             ),
             vec![],
@@ -402,7 +403,7 @@ fn check_items(store: &Store) -> bool {
                 let lim = limit.min(i64::MAX as usize) as i64;
                 let old = store
                     .query(
-                        &sql::packet_items(1, clock, from, to, lim.saturating_add(1)),
+                        &oracle::packet_items(1, clock, from, to, lim.saturating_add(1)),
                         limit,
                     )
                     .unwrap();
@@ -425,7 +426,7 @@ fn check_items(store: &Store) -> bool {
                     store,
                     &Query::new(
                         format!(
-                            "SELECT id, lane_id, {c}, seq, length FROM packets
+                            "SELECT id, lane_id, {c}, seq, length FROM oracle_packets
                              WHERE {c} BETWEEN ? AND ? ORDER BY {c}, id LIMIT ?"
                         ),
                         vec![from.into(), to.into(), lim.into()],
@@ -720,7 +721,7 @@ fn series_rule_in_sql(
         ),
         Some(_) => (
             "v.num",
-            "CROSS JOIN field_values v INDEXED BY field_values_packet ON v.packet_id = p.id",
+            "CROSS JOIN oracle_field_values v INDEXED BY oracle_field_values_packet ON v.packet_id = p.id",
             "v.packet = ?8 AND v.field = ?9 AND v.num IS NOT NULL",
         ),
     };
@@ -736,7 +737,7 @@ fn series_rule_in_sql(
                          THEN (((t >> ?6) << ?6) - ?1) / ?3 ELSE (t - ?1) / ?3 END AS bin,
                         MIN(num), MAX(num), COUNT(*)
                  FROM (SELECT p.{c} AS t, {value} AS num
-                       FROM packets p {join}
+                       FROM oracle_packets p {join}
                        WHERE p.id BETWEEN ?4 AND ?5 AND p.lane_id = ?10
                          AND p.{c} BETWEEN ?1 AND ?2 AND {filter})
                  GROUP BY bin"
@@ -776,8 +777,8 @@ fn check_series(db: &Path) -> (usize, usize, usize) {
     let mut series: Vec<(i64, Option<(String, String)>)> = store
         .query(
             &Query::new(
-                "SELECT DISTINCT p.lane_id, v.packet, v.field FROM field_values v
-                 JOIN packets p ON p.id = v.packet_id WHERE v.num IS NOT NULL
+                "SELECT DISTINCT p.lane_id, v.packet, v.field FROM oracle_field_values v
+                 JOIN oracle_packets p ON p.id = v.packet_id WHERE v.num IS NOT NULL
                  ORDER BY 1, 2, 3",
                 vec![],
             ),
@@ -796,7 +797,7 @@ fn check_series(db: &Path) -> (usize, usize, usize) {
         .collect();
     for r in ask(
         store,
-        "SELECT DISTINCT lane_id FROM packets
+        "SELECT DISTINCT lane_id FROM oracle_packets
          WHERE receive_ns IS NOT NULL AND packet_ns IS NOT NULL ORDER BY 1",
         vec![],
     ) {
@@ -810,7 +811,7 @@ fn check_series(db: &Path) -> (usize, usize, usize) {
             let c = clock.packet_column();
             let r = ask(
                 store,
-                &format!("SELECT MIN({c}), MAX({c}) FROM packets WHERE lane_id = ?"),
+                &format!("SELECT MIN({c}), MAX({c}) FROM oracle_packets WHERE lane_id = ?"),
                 vec![(*lane).into()],
             );
             if r[0][0] == i64::MIN {
@@ -844,8 +845,8 @@ fn check_series(db: &Path) -> (usize, usize, usize) {
                         .unwrap(),
                 );
                 let q = match field {
-                    Some((p, f)) => sql::value_series(1, clock, *lane, p, f, from, to, buckets),
-                    None => sql::lag_series(1, clock, *lane, from, to, buckets),
+                    Some((p, f)) => oracle::value_series(1, clock, *lane, p, f, from, to, buckets),
+                    None => oracle::lag_series(1, clock, *lane, from, to, buckets),
                 };
                 let want = series_rows(&store.query(&q, usize::MAX).unwrap());
                 assert_eq!(got, want, "fine {}", what(from, to, buckets));
@@ -869,8 +870,8 @@ fn check_series(db: &Path) -> (usize, usize, usize) {
                 assert_eq!(got, want, "rule {}", what(from, to, buckets));
                 // Totals, lowest and highest are those of the window.
                 let q = match field {
-                    Some((p, f)) => sql::value_series(1, clock, *lane, p, f, from, to, 1),
-                    None => sql::lag_series(1, clock, *lane, from, to, 1),
+                    Some((p, f)) => oracle::value_series(1, clock, *lane, p, f, from, to, 1),
+                    None => oracle::lag_series(1, clock, *lane, from, to, 1),
                 };
                 let all = series_rows(&store.query(&q, usize::MAX).unwrap());
                 let sum = |rows: &[(i64, f64, f64, i64)]| rows.iter().map(|r| r.3).sum::<i64>();
@@ -920,12 +921,12 @@ fn check_details(store: &Store) -> usize {
     for pick in [
         // No packet time; neither time; a text; a text and a number; an
         // array; a number that is not one.
-        "SELECT id FROM packets WHERE packet_ns IS NULL LIMIT 5",
-        "SELECT id FROM packets WHERE packet_ns IS NULL AND receive_ns IS NULL LIMIT 5",
-        "SELECT packet_id FROM field_values WHERE text IS NOT NULL AND num IS NULL LIMIT 5",
-        "SELECT packet_id FROM field_values WHERE text IS NOT NULL AND num IS NOT NULL LIMIT 5",
-        "SELECT packet_id FROM field_values WHERE text LIKE '[%' LIMIT 5",
-        "SELECT packet_id FROM field_values WHERE field = 'F' AND num IS NULL LIMIT 5",
+        "SELECT id FROM oracle_packets WHERE packet_ns IS NULL LIMIT 5",
+        "SELECT id FROM oracle_packets WHERE packet_ns IS NULL AND receive_ns IS NULL LIMIT 5",
+        "SELECT packet_id FROM oracle_field_values WHERE text IS NOT NULL AND num IS NULL LIMIT 5",
+        "SELECT packet_id FROM oracle_field_values WHERE text IS NOT NULL AND num IS NOT NULL LIMIT 5",
+        "SELECT packet_id FROM oracle_field_values WHERE text LIKE '[%' LIMIT 5",
+        "SELECT packet_id FROM oracle_field_values WHERE field = 'F' AND num IS NULL LIMIT 5",
     ] {
         ids.extend(ask(store, pick, vec![]).iter().map(|r| r[0]));
     }
@@ -934,13 +935,13 @@ fn check_details(store: &Store) -> usize {
     for &id in &ids {
         assert_eq!(
             store.packet_detail(id).unwrap(),
-            store.query(&sql::packet_detail(id), 1).unwrap(),
+            store.query(&oracle::packet_detail(id), 1).unwrap(),
             "packet {id}"
         );
         let rows = store
             .query(
                 &Query::new(
-                    "SELECT packet, field, num, text FROM field_values
+                    "SELECT packet, field, num, text FROM oracle_field_values
                      WHERE packet_id = ? ORDER BY rowid",
                     vec![id.into()],
                 ),
@@ -955,11 +956,11 @@ fn check_details(store: &Store) -> usize {
 /// A run's findings with their packets' times from the segments against
 /// `sql::run_findings`, whole and cut short.
 fn check_findings(store: &Store) -> usize {
-    let all = store.query(&sql::run_findings(1), usize::MAX).unwrap();
+    let all = store.query(&oracle::run_findings(1), usize::MAX).unwrap();
     for limit in [usize::MAX, all.rows.len(), 3, 1] {
         assert_eq!(
             store.run_findings(1, limit).unwrap(),
-            store.query(&sql::run_findings(1), limit).unwrap(),
+            store.query(&oracle::run_findings(1), limit).unwrap(),
             "limit {limit}"
         );
     }
@@ -976,7 +977,7 @@ fn packet_details_values_and_findings_from_segments_match_the_rows() {
     // Values on packets with neither time are kept.
     let timeless = ask(
         &store,
-        "SELECT COUNT(*) FROM field_values v JOIN packets p ON p.id = v.packet_id
+        "SELECT COUNT(*) FROM oracle_field_values v JOIN oracle_packets p ON p.id = v.packet_id
          WHERE p.receive_ns IS NULL AND p.packet_ns IS NULL",
         vec![],
     );
@@ -1024,7 +1025,7 @@ fn damaged_kept_value_sections_are_errors_not_panics() {
     let r = ask(
         &store,
         "SELECT s.first_packet, p.lane_id FROM segments s
-         JOIN files f ON f.id = s.file_id JOIN packets p ON p.id = s.first_packet
+         JOIN files f ON f.id = s.file_id JOIN oracle_packets p ON p.id = s.first_packet
          WHERE f.rel = 'bench/dense.bin'",
         vec![],
     );
@@ -1154,7 +1155,7 @@ fn density_timing() {
         let c = clock.packet_column();
         let r = ask(
             &store,
-            &format!("SELECT MIN({c}), MAX({c}) FROM packets"),
+            &format!("SELECT MIN({c}), MAX({c}) FROM oracle_packets"),
             vec![],
         );
         let (min, max) = (r[0][0], r[0][1]);
@@ -1195,7 +1196,7 @@ fn density_timing() {
             }));
             let (old, old_total) = median(Box::new(|| {
                 // Every packet and entry counted from the rows.
-                std::iter::once(sql::packet_density(run, clock, from, to, buckets))
+                std::iter::once(oracle::packet_density(run, clock, from, to, buckets))
                     .chain(sql::log_density(run, clock, from, to, buckets))
                     .collect::<Vec<_>>()
                     .iter()
@@ -1271,7 +1272,7 @@ fn check_records(scratch: &Scratch, store: &Store) {
                 &Query::new(
                     "SELECT receive_ns, packet_ns, offset, sum, length, lane_id, apid, seq, ptype,
                             label
-                     FROM packets WHERE id BETWEEN ? AND ? ORDER BY id",
+                     FROM oracle_packets WHERE id BETWEEN ? AND ? ORDER BY id",
                     vec![ids[0].into(), ids[1].into()],
                 ),
                 usize::MAX,
@@ -1323,7 +1324,7 @@ fn segments_hold_the_rows_of_their_files() {
     // Some packets have a receive time and no packet time.
     let partial = ask(
         &store,
-        "SELECT COUNT(*) FROM packets WHERE receive_ns IS NOT NULL AND packet_ns IS NULL",
+        "SELECT COUNT(*) FROM oracle_packets WHERE receive_ns IS NOT NULL AND packet_ns IS NULL",
         vec![],
     );
     assert!(partial[0][0] > 0);
@@ -1438,7 +1439,10 @@ fn a_file_that_no_longer_holds_packets_loses_its_segment() {
     scratch.ingest();
     assert!(listed(&store).is_empty());
     assert!(files_in(&folder).is_empty());
-    assert_eq!(ask(&store, "SELECT COUNT(*) FROM packets", vec![])[0][0], 0);
+    assert_eq!(
+        ask(&store, "SELECT COUNT(*) FROM oracle_packets", vec![])[0][0],
+        0
+    );
 }
 
 #[test]
@@ -1489,7 +1493,7 @@ fn files_in_the_segment_folder_that_the_store_does_not_list_are_removed() {
     for stray in ["99.seg", "7.seg.tmp", "7.receive.1.tmp", "notes.txt"] {
         fs::write(folder.join(stray), b"left behind").unwrap();
     }
-    drop(Store::open(&scratch.db()).unwrap());
+    drop(Store::open_with_oracle(&scratch.db()).unwrap());
     let mut expected = kept.clone();
     expected.push("notes.txt".to_string());
     expected.sort();
@@ -1574,9 +1578,9 @@ fn series_from_sql(
 ) -> sql::Table {
     let q = match field {
         Some((packet, name)) => {
-            sql::value_series(run, clock, lane, packet, name, from, to, buckets)
+            oracle::value_series(run, clock, lane, packet, name, from, to, buckets)
         }
-        None => sql::lag_series(run, clock, lane, from, to, buckets),
+        None => oracle::lag_series(run, clock, lane, from, to, buckets),
     };
     store.query(&q, 4001).unwrap()
 }
@@ -1624,7 +1628,7 @@ fn reads_timing() {
         let c = clock.packet_column();
         let r = ask(
             &store,
-            &format!("SELECT MIN({c}), MAX({c}) FROM packets"),
+            &format!("SELECT MIN({c}), MAX({c}) FROM oracle_packets"),
             vec![],
         );
         let (min, max) = (r[0][0], r[0][1]);
@@ -1645,7 +1649,7 @@ fn reads_timing() {
             });
             let (old, m) = median(&mut || {
                 store
-                    .query(&sql::packet_items(run, clock, from, to, 1001), 1000)
+                    .query(&oracle::packet_items(run, clock, from, to, 1001), 1000)
                     .unwrap()
                     .rows
                     .len()

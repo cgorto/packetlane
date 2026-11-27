@@ -18,6 +18,7 @@ use crate::pure::cross::{Comparison, CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
 use crate::pure::finding::{Kind, Severity};
 use crate::pure::ingest::{LaneKey, ptype_code};
+use crate::pure::oracle;
 use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
@@ -39,6 +40,9 @@ pub struct Store {
     conn: Connection,
     /// The folder of segment files beside the store.
     segments: PathBuf,
+    /// Whether every packet and kept value is also written to the oracle
+    /// tables of `pure::oracle`; only tests ask for it.
+    oracle: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -194,7 +198,24 @@ impl Store {
         let segments = segment::folder_for(path);
         fs::create_dir_all(&segments)?;
         remove_orphans(&conn, &segments)?;
-        Ok(Store { conn, segments })
+        Ok(Store {
+            conn,
+            segments,
+            oracle: false,
+        })
+    }
+
+    /// Opens the store for reading and writing as [`Store::open`] does, and
+    /// also writes every packet and kept value to the oracle tables of
+    /// `pure::oracle`, with the ids they would have had in SQLite. For
+    /// tests only: they compare what the segment files give with those
+    /// rows. Nothing the program runs opens a store this way.
+    #[doc(hidden)]
+    pub fn open_with_oracle(path: &Path) -> Result<Store> {
+        let mut store = Store::open(path)?;
+        store.conn.execute_batch(oracle::SCHEMA)?;
+        store.oracle = true;
+        Ok(store)
     }
 
     /// Opens the store so that nothing run on this connection can change it
@@ -215,6 +236,7 @@ impl Store {
         Ok(Store {
             conn,
             segments: segment::folder_for(path),
+            oracle: false,
         })
     }
 
@@ -273,7 +295,7 @@ impl Store {
             .collect())
     }
 
-    /// Individual packets in a window, as `sql::packet_items` has them
+    /// Individual packets in a window, as `oracle::packet_items` had them
     /// (columns: id, lane, time, seq, length), from the segment files: at
     /// most `limit`, in order of time and then id, `truncated` if there
     /// were more.
@@ -375,7 +397,7 @@ impl Store {
         Ok(Some((seg, index, row[2..].to_vec())))
     }
 
-    /// One packet, as `sql::packet_detail` has it: its record from its
+    /// One packet, as `oracle::packet_detail` had it: its record from its
     /// segment file, its file and source from the store. No rows if there
     /// is no such packet.
     pub fn packet_detail(&self, id: i64) -> Result<Table> {
@@ -473,7 +495,7 @@ impl Store {
         Ok(table)
     }
 
-    /// A run's findings, as `sql::run_findings` has them (columns: id,
+    /// A run's findings, as `oracle::run_findings` had them (columns: id,
     /// severity, kind, message, lane, file, packet, the packet's receive
     /// and packet time, the file's rel), in its order: problems first, then
     /// by the packet's time (receive, else packet, else its id), then by
@@ -636,6 +658,11 @@ impl Store {
                 for statement in sql::delete_file_packets() {
                     tx.execute(&statement, params![file_id])?;
                 }
+                if self.oracle {
+                    for statement in oracle::delete_file_packets() {
+                        tx.execute(&statement, params![file_id])?;
+                    }
+                }
             }
             let old_segments: Vec<String> = tx
                 .prepare(sql::RUN_SEGMENTS)?
@@ -777,6 +804,11 @@ impl Store {
             for statement in sql::delete_file_packets() {
                 tx.execute(&statement, params![file_id])?;
             }
+            if self.oracle {
+                for statement in oracle::delete_file_packets() {
+                    tx.execute(&statement, params![file_id])?;
+                }
+            }
             for statement in sql::DELETE_FILE {
                 tx.execute(statement, params![file_id])?;
             }
@@ -835,6 +867,7 @@ impl Store {
                     &mut lanes,
                     first_packet,
                     &mut writer,
+                    self.oracle,
                 )?;
                 written = writer.finish()?;
                 (packets, 0, note)
@@ -1039,9 +1072,19 @@ fn ingest_packets(
     base_id: i64,
     // Where each packet is also written.
     segment: &mut Writer,
+    // Whether each packet and value also goes to the oracle tables.
+    oracle: bool,
 ) -> Result<(u64, String)> {
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
+    let mut oracle_inserts = if oracle {
+        Some((
+            conn.prepare_cached(oracle::INSERT_PACKET)?,
+            conn.prepare_cached(oracle::INSERT_VALUE)?,
+        ))
+    } else {
+        None
+    };
     let mut check = FileCheck::new(config, source);
     let mut end = None;
     // How many numbers were kept of each field of each lane, for the list
@@ -1061,7 +1104,7 @@ fn ingest_packets(
         let Seen { row, values } = check.observe(&record);
         let packet_id = base_id + row.idx;
         let lane_id = lanes.id(conn, row.lane())?;
-        insert.execute(params![
+        let packet = params![
             packet_id,
             file_id,
             lane_id,
@@ -1075,13 +1118,19 @@ fn ingest_packets(
             row.header.map(|h| i64::from(h.seq_count)),
             row.sum,
             record.label,
-        ])?;
+        ];
+        insert.execute(packet)?;
+        if let Some((insert, _)) = &mut oracle_inserts {
+            insert.execute(packet)?;
+        }
         segment.push(lane_id, &row, record.label.as_deref())?;
         // After the packet's own row, which these rows point at.
         for v in values {
-            insert_value.execute(params![
-                packet_id, file_id, v.packet, v.field, v.num, v.text
-            ])?;
+            let value = params![packet_id, file_id, v.packet, v.field, v.num, v.text];
+            insert_value.execute(value)?;
+            if let Some((_, insert)) = &mut oracle_inserts {
+                insert.execute(value)?;
+            }
             segment.push_value(v.packet, v.field, v.num, v.text.as_deref())?;
             if v.num.is_some() {
                 *series.entry((lane_id, v.packet, v.field)).or_default() += 1;

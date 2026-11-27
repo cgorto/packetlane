@@ -32,7 +32,7 @@ const HOP_STAGE: [&str; 2] = [
      ) WITHOUT ROWID",
     "INSERT INTO temp.hop (sum, lane_id, id, seq, length)
      SELECT p.sum, p.lane_id, p.id, p.seq, p.length
-     FROM files f CROSS JOIN packets p NOT INDEXED
+     FROM files f CROSS JOIN oracle_packets p NOT INDEXED
        ON p.id BETWEEN f.first_packet AND f.last_packet
      WHERE f.run_id = ?1 AND p.lane_id IN (
        SELECT a.id FROM lanes a JOIN lanes b
@@ -67,7 +67,7 @@ const HOP_COMPARE_ALL: &str = "WITH pair AS MATERIALIZED (
 /// Which other sources hold copies of a lane's packets, matched by
 /// checksum, sequence count and length. Takes lane, run, apid, ptype.
 const LANE_ORIGINS: &str = "SELECT l.source,
-            SUM((SELECT COUNT(*) FROM packets p INDEXED BY packets_lane_receive
+            SUM((SELECT COUNT(*) FROM oracle_packets p INDEXED BY oracle_packets_lane_receive
                  WHERE p.lane_id = ?1 AND EXISTS (
                    SELECT 1 FROM temp.hop q
                    WHERE q.sum = p.sum AND q.lane_id = l.id
@@ -226,7 +226,7 @@ impl Scratch {
 
     fn ingest_again(&self, run: &Path) {
         let run = std::fs::canonicalize(run).unwrap();
-        let mut store = Store::open(&self.db()).unwrap();
+        let mut store = Store::open_with_oracle(&self.db()).unwrap();
         ingest_targets(&mut store, &[run], None, None, None).unwrap();
     }
 }

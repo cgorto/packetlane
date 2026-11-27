@@ -16,6 +16,7 @@ pub mod frame;
 pub mod http;
 pub mod ingest;
 pub mod limits;
+pub mod oracle;
 pub mod order;
 pub mod paths;
 pub mod pipeline;

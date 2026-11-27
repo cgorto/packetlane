@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use packetlane::pure::oracle;
 use packetlane::pure::sql::{self, Clock, Param, Query};
 use packetlane::pure::synth::{demo_run, packet};
 use packetlane::shell::ingest::ingest_targets;
@@ -57,7 +58,7 @@ fn stored(files: &[(String, Vec<u8>)]) -> Stored {
 
 fn ingest(db: &Path, run: &Path) {
     let run = std::fs::canonicalize(run).unwrap();
-    let mut store = Store::open(db).unwrap();
+    let mut store = Store::open_with_oracle(db).unwrap();
     ingest_targets(&mut store, &[run], None, None, None).unwrap();
 }
 
@@ -132,21 +133,21 @@ fn views_of_every_lane_find_their_packets_by_time() {
     for (clock, index) in [
         (
             Clock::Receive,
-            "packets_receive (receive_ns>? AND receive_ns<?)",
+            "oracle_packets_receive (receive_ns>? AND receive_ns<?)",
         ),
         (
             Clock::Packet,
-            "packets_packet (packet_ns>? AND packet_ns<?)",
+            "oracle_packets_packet (packet_ns>? AND packet_ns<?)",
         ),
         (Clock::Order, "INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
     ] {
         let queries = vec![
-            ("items", sql::packet_items(1, clock, from, to, 2000)),
-            ("density", sql::packet_density(1, clock, from, to, 400)),
+            ("items", oracle::packet_items(1, clock, from, to, 2000)),
+            ("density", oracle::packet_density(1, clock, from, to, 400)),
         ];
         for (name, q) in &queries {
             let plan = plan(&store.conn, q);
-            let step = step(&plan, "packets");
+            let step = step(&plan, "oracle_packets");
             assert!(
                 step.starts_with("SEARCH") && step.ends_with(index),
                 "{name}: {step}"
@@ -169,22 +170,25 @@ fn plots_find_one_lanes_packets_by_time() {
     for (clock, index) in [
         (
             Clock::Receive,
-            "packets_lane_receive (lane_id=? AND receive_ns>? AND receive_ns<?)",
+            "oracle_packets_lane_receive (lane_id=? AND receive_ns>? AND receive_ns<?)",
         ),
         (
             Clock::Packet,
-            "packets_lane_packet (lane_id=? AND packet_ns>? AND packet_ns<?)",
+            "oracle_packets_lane_packet (lane_id=? AND packet_ns>? AND packet_ns<?)",
         ),
     ] {
         // Arrival delay is answered from the index alone.
-        let plan_of = plan(&store.conn, &sql::lag_series(1, clock, 2, from, to, 1200));
+        let plan_of = plan(
+            &store.conn,
+            &oracle::lag_series(1, clock, 2, from, to, 1200),
+        );
         assert_eq!(
-            step(&plan_of, "packets"),
-            format!("SEARCH packets USING COVERING INDEX {index}")
+            step(&plan_of, "oracle_packets"),
+            format!("SEARCH oracle_packets USING COVERING INDEX {index}")
         );
         // A value plot finds the packets that way, then looks each one's
         // values up by packet, not by field.
-        let q = sql::value_series(1, clock, 2, "SIM_HK", "BUS_VOLTS", from, to, 1200);
+        let q = oracle::value_series(1, clock, 2, "SIM_HK", "BUS_VOLTS", from, to, 1200);
         let plan_of = plan(&store.conn, &q);
         assert_eq!(
             step(&plan_of, "p"),
@@ -192,7 +196,7 @@ fn plots_find_one_lanes_packets_by_time() {
         );
         assert_eq!(
             step(&plan_of, "v"),
-            "SEARCH v USING INDEX field_values_packet (packet_id=?)"
+            "SEARCH v USING INDEX oracle_field_values_packet (packet_id=?)"
         );
     }
     // On the order clock a window is a range of ids, which is the table's
@@ -201,10 +205,13 @@ fn plots_find_one_lanes_packets_by_time() {
     let by_id = "USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)";
     let plan_of = plan(
         &store.conn,
-        &sql::lag_series(1, Clock::Order, 2, 10, 500, 100),
+        &oracle::lag_series(1, Clock::Order, 2, 10, 500, 100),
     );
-    assert_eq!(step(&plan_of, "packets"), format!("SEARCH packets {by_id}"));
-    let q = sql::value_series(1, Clock::Order, 2, "SIM_HK", "BUS_VOLTS", 10, 500, 100);
+    assert_eq!(
+        step(&plan_of, "oracle_packets"),
+        format!("SEARCH oracle_packets {by_id}")
+    );
+    let q = oracle::value_series(1, Clock::Order, 2, "SIM_HK", "BUS_VOLTS", 10, 500, 100);
     assert_eq!(
         step(&plan(&store.conn, &q), "p"),
         format!("SEARCH p {by_id}")
@@ -216,7 +223,7 @@ fn plots_find_one_lanes_packets_by_time() {
 /// One lane's count and ranges, asked of its packets.
 const ONE_LANE: &str = "SELECT COUNT(*), MIN(receive_ns), MAX(receive_ns), COUNT(receive_ns),
             MIN(packet_ns), MAX(packet_ns), COUNT(packet_ns), MIN(id), MAX(id)
-     FROM packets WHERE lane_id = ?1";
+     FROM oracle_packets WHERE lane_id = ?1";
 
 /// Checks the stored count and ranges of every packet lane against
 /// [`ONE_LANE`]. Returns how many lanes there were.
@@ -329,7 +336,7 @@ fn a_lane_left_without_packets_reads_as_empty() {
 /// What a run has to plot, counted from every stored value: what the
 /// per-file counts replaced.
 const SERIES_FROM_VALUES: &str = "SELECT p.lane_id, v.packet, v.field, COUNT(*)
-     FROM field_values v JOIN packets p ON p.id = v.packet_id
+     FROM oracle_field_values v JOIN oracle_packets p ON p.id = v.packet_id
      WHERE v.num IS NOT NULL AND v.file_id IN (SELECT id FROM files WHERE run_id = 1)
      GROUP BY p.lane_id, v.packet, v.field
      ORDER BY p.lane_id, v.packet, v.field";
@@ -426,7 +433,7 @@ fn check_files(conn: &Connection) {
         "SELECT f.rel, f.packets, f.first_packet, f.last_packet, s.n, s.lo, s.hi
          FROM files f
          LEFT JOIN (SELECT file_id, COUNT(*) AS n, MIN(id) AS lo, MAX(id) AS hi
-                    FROM packets GROUP BY file_id) s ON s.file_id = f.id
+                    FROM oracle_packets GROUP BY file_id) s ON s.file_id = f.id
          WHERE f.packets != COALESCE(s.n, 0)
             OR f.first_packet IS NOT s.lo OR f.last_packet IS NOT s.hi",
     );
@@ -434,15 +441,15 @@ fn check_files(conn: &Connection) {
     for (what, sql) in [
         (
             "packets of no file",
-            "SELECT COUNT(*) FROM packets WHERE file_id NOT IN (SELECT id FROM files)",
+            "SELECT COUNT(*) FROM oracle_packets WHERE file_id NOT IN (SELECT id FROM files)",
         ),
         (
             "values of no packet",
-            "SELECT COUNT(*) FROM field_values WHERE packet_id NOT IN (SELECT id FROM packets)",
+            "SELECT COUNT(*) FROM oracle_field_values WHERE packet_id NOT IN (SELECT id FROM oracle_packets)",
         ),
         (
             "values of another file's packet",
-            "SELECT COUNT(*) FROM field_values v JOIN packets p ON p.id = v.packet_id
+            "SELECT COUNT(*) FROM oracle_field_values v JOIN oracle_packets p ON p.id = v.packet_id
              WHERE p.file_id != v.file_id",
         ),
     ] {
@@ -479,7 +486,7 @@ fn a_file_read_again_takes_only_its_own_rows_with_it() {
         rows(
             &store.conn,
             &Query {
-                sql: "SELECT COUNT(*) FROM packets WHERE file_id IN
+                sql: "SELECT COUNT(*) FROM oracle_packets WHERE file_id IN
                       (SELECT id FROM files WHERE run_id = ?)"
                     .to_string(),
                 params: vec![run.into()],
@@ -519,7 +526,7 @@ fn a_file_read_again_takes_only_its_own_rows_with_it() {
     check_lanes(&store.conn);
 
     // And the rows are found by id, not by reading every packet.
-    for statement in sql::delete_file_packets() {
+    for statement in oracle::delete_file_packets() {
         let steps = plan(
             &store.conn,
             &Query {
@@ -528,9 +535,9 @@ fn a_file_read_again_takes_only_its_own_rows_with_it() {
             },
         );
         let table = if statement.contains("field_values") {
-            "field_values"
+            "oracle_field_values"
         } else {
-            "packets"
+            "oracle_packets"
         };
         let step = step(&steps, table);
         assert!(
@@ -559,7 +566,7 @@ const OLD_REFRESH_PACKET_LANES: [&str; 2] = [
                   MIN(receive_ns) AS r_min, MAX(receive_ns) AS r_max, COUNT(receive_ns) AS r_n,
                   MIN(packet_ns) AS p_min, MAX(packet_ns) AS p_max, COUNT(packet_ns) AS p_n,
                   MIN(id) AS o_min, MAX(id) AS o_max
-           FROM packets INDEXED BY packets_lane_receive
+           FROM oracle_packets INDEXED BY oracle_packets_lane_receive
            WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?1)
            GROUP BY lane_id) AS s
      WHERE lanes.id = s.lane_id AND lanes.run_id = ?1 AND lanes.kind != 'log'",
@@ -606,7 +613,7 @@ fn lanes_match_the_old_counts(db: &Path) -> usize {
     let next = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
     assert_eq!(
         next(sql::NEXT_PACKET_ID),
-        next("SELECT COALESCE(MAX(id), 0) + 1 FROM packets")
+        next("SELECT COALESCE(MAX(id), 0) + 1 FROM oracle_packets")
     );
     check_files(&conn);
     stored

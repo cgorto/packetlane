@@ -343,35 +343,6 @@ impl Clock {
             Clock::Order => None,
         }
     }
-
-    /// What to write after `packets` and any alias in a query that reads a
-    /// window of every lane of a run: the index that finds packets by this clock, so
-    /// that the cost follows the width of the window.
-    ///
-    /// The index is named because SQLite, left to choose, takes a lane-first
-    /// index and visits the lanes one at a time, sorting afterwards.
-    fn all_lanes(self) -> &'static str {
-        match self {
-            Clock::Receive => "INDEXED BY packets_receive",
-            Clock::Packet => "INDEXED BY packets_packet",
-            // By id, which is the table's own order and needs no index.
-            Clock::Order => "NOT INDEXED",
-        }
-    }
-
-    /// What to write after `packets` and any alias in a query that reads a
-    /// window of one lane: the index that finds a lane's packets by this clock, so that
-    /// the cost follows that lane's packets and not everything else logged
-    /// at the same time.
-    fn one_lane(self) -> &'static str {
-        match self {
-            Clock::Receive => "INDEXED BY packets_lane_receive",
-            Clock::Packet => "INDEXED BY packets_lane_packet",
-            // By id, as for every lane: no index holds a lane's ids in
-            // order, and SQLite would otherwise read the whole lane.
-            Clock::Order => "NOT INDEXED",
-        }
-    }
 }
 
 const RUN_LANES: &str = "(SELECT id FROM lanes WHERE run_id = ?)";
@@ -418,18 +389,6 @@ pub fn run_files(run: i64) -> Query {
     )
 }
 
-pub fn run_findings(run: i64) -> Query {
-    Query::new(
-        "SELECT x.id, x.severity, x.kind, x.message, x.lane_id, x.file_id, x.packet_id,
-                p.receive_ns, p.packet_ns,
-                COALESCE((SELECT f.rel FROM files f WHERE f.id = x.file_id), '')
-         FROM findings x LEFT JOIN packets p ON p.id = x.packet_id
-         WHERE x.run_id = ?
-         ORDER BY x.severity = 'info', COALESCE(p.receive_ns, p.packet_ns, x.packet_id, 0), x.id",
-        vec![run.into()],
-    )
-}
-
 /// What a run's findings are ordered by, without their packets' times,
 /// which come from the segment files: id, whether it is only information,
 /// packet id. See [`run_findings`] for the order.
@@ -471,26 +430,6 @@ pub fn bucket_width(from: i64, to: i64, buckets: i64) -> i64 {
     (span / buckets + i64::from(span % buckets != 0)).max(1)
 }
 
-/// Packet counts per lane and bucket. Columns: lane, bucket, count.
-pub fn packet_density(run: i64, clock: Clock, from: i64, to: i64, buckets: i64) -> Query {
-    let c = clock.packet_column();
-    let index = clock.all_lanes();
-    Query::new(
-        format!(
-            "SELECT lane_id, ({c} - ?) / ? AS b, COUNT(*) FROM packets {index}
-             WHERE {c} BETWEEN ? AND ? AND lane_id IN {RUN_LANES}
-             GROUP BY lane_id, b"
-        ),
-        vec![
-            from.into(),
-            bucket_width(from, to, buckets).into(),
-            from.into(),
-            to.into(),
-            run.into(),
-        ],
-    )
-}
-
 /// Text log entry counts per lane and bucket, or `None` on a clock with no
 /// place for text logs.
 pub fn log_density(run: i64, clock: Clock, from: i64, to: i64, buckets: i64) -> Option<Query> {
@@ -527,95 +466,6 @@ pub fn run_series(run: i64) -> Query {
     )
 }
 
-/// One kept field of one lane over a window, reduced to the lowest and
-/// highest value in each bucket. Columns: bucket, min, max, count.
-///
-/// `CROSS JOIN` makes SQLite start from the lane's packets in the window
-/// and look their values up, so the cost follows the window. Left to
-/// itself it starts from every stored value of the field, however narrow
-/// the view.
-#[allow(clippy::too_many_arguments)]
-pub fn value_series(
-    run: i64,
-    clock: Clock,
-    lane: i64,
-    packet: &str,
-    field: &str,
-    from: i64,
-    to: i64,
-    buckets: i64,
-) -> Query {
-    let grid = (from, bucket_width(from, to, buckets));
-    series_range(run, clock, lane, Some((packet, field)), grid, from, to)
-}
-
-/// How long after its own time each packet of a lane was received, in
-/// milliseconds, by bucket. Columns: bucket, min, max, count.
-pub fn lag_series(run: i64, clock: Clock, lane: i64, from: i64, to: i64, buckets: i64) -> Query {
-    let grid = (from, bucket_width(from, to, buckets));
-    series_range(run, clock, lane, None, grid, from, to)
-}
-
-/// A series (a kept field, or arrival delay if `field` is `None`) read from
-/// the packets whose time lies in `lo..=hi`, into buckets counted from
-/// `grid.0` and `grid.1` wide.
-fn series_range(
-    run: i64,
-    clock: Clock,
-    lane: i64,
-    field: Option<(&str, &str)>,
-    grid: (i64, i64),
-    lo: i64,
-    hi: i64,
-) -> Query {
-    let c = clock.packet_column();
-    let index = clock.one_lane();
-    let mut params: Vec<Param> = vec![
-        grid.0.into(),
-        grid.1.into(),
-        lane.into(),
-        run.into(),
-        lo.into(),
-        hi.into(),
-    ];
-    let sql = match field {
-        Some((packet, field)) => {
-            params.push(packet.into());
-            params.push(field.into());
-            format!(
-                "SELECT (p.{c} - ?) / ? AS b, MIN(v.num), MAX(v.num), COUNT(*)
-                 FROM packets p {index} CROSS JOIN field_values v ON v.packet_id = p.id
-                 WHERE p.lane_id = ? AND p.lane_id IN {RUN_LANES} AND p.{c} BETWEEN ? AND ?
-                   AND v.packet = ? AND v.field = ? AND v.num IS NOT NULL
-                 GROUP BY b ORDER BY b"
-            )
-        }
-        None => format!(
-            "SELECT ({c} - ?) / ? AS b, MIN(receive_ns - packet_ns) / 1000000.0,
-                    MAX(receive_ns - packet_ns) / 1000000.0, COUNT(*)
-             FROM packets {index}
-             WHERE lane_id = ? AND lane_id IN {RUN_LANES} AND {c} BETWEEN ? AND ?
-               AND receive_ns IS NOT NULL AND packet_ns IS NOT NULL
-             GROUP BY b ORDER BY b"
-        ),
-    };
-    Query::new(sql, params)
-}
-
-/// Individual packets in a window. Columns: id, lane, time, seq, length.
-pub fn packet_items(run: i64, clock: Clock, from: i64, to: i64, limit: i64) -> Query {
-    let c = clock.packet_column();
-    let index = clock.all_lanes();
-    Query::new(
-        format!(
-            "SELECT id, lane_id, {c}, seq, length FROM packets {index}
-             WHERE {c} BETWEEN ? AND ? AND lane_id IN {RUN_LANES}
-             ORDER BY {c} LIMIT ?"
-        ),
-        vec![from.into(), to.into(), run.into(), limit.into()],
-    )
-}
-
 /// Individual log entries in a window. Columns: id, lane, time, text.
 pub fn log_items(run: i64, clock: Clock, from: i64, to: i64, limit: i64) -> Option<Query> {
     let c = clock.log_column()?;
@@ -627,16 +477,6 @@ pub fn log_items(run: i64, clock: Clock, from: i64, to: i64, limit: i64) -> Opti
         ),
         vec![from.into(), to.into(), run.into(), limit.into()],
     ))
-}
-
-pub fn packet_detail(id: i64) -> Query {
-    Query::new(
-        "SELECT p.id, p.idx, p.offset, p.length, p.receive_ns, p.packet_ns, p.apid, p.ptype,
-                p.seq, p.label, p.lane_id, f.path, f.rel, l.source, f.run_id, f.format, p.sum
-         FROM packets p JOIN files f ON f.id = p.file_id JOIN lanes l ON l.id = p.lane_id
-         WHERE p.id = ?",
-        vec![id.into()],
-    )
 }
 
 pub fn log_detail(id: i64) -> Query {
@@ -1120,12 +960,6 @@ mod tests {
         assert_eq!(Clock::parse("wall"), None);
         assert_eq!(Clock::Order.packet_column(), "id");
         assert!(log_density(1, Clock::Order, 0, 1, 10).is_none());
-        let q = packet_density(3, Clock::Packet, 100, 199, 10);
-        assert!(q.sql.contains("packet_ns BETWEEN"));
-        assert_eq!(
-            q.params,
-            vec![100.into(), 10.into(), 100.into(), 199.into(), 3.into()]
-        );
     }
 
     #[test]
