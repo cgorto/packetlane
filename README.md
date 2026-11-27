@@ -399,6 +399,11 @@ been built here.
   by how it changed from the packet before: green for up, red for down,
   stronger for a bigger change as a percentage of the value (with another
   measure for values at or near zero). Most useful with live ingest.
+- **Segment records described once**: each fixed-width record of a segment
+  file is written and read by code that keeps its byte offsets by hand, in
+  two places. One description per record, with the writer and the reader
+  both made from it, would rule out a field written at one offset and read
+  at another. For when the format has settled.
 - **Problem report export** to attach to a ticket.
 - Other channel codes: convolutional, turbo and LDPC (a file must hold hard
   decisions that are already frame-aligned; Reed-Solomon and BCH are the only
