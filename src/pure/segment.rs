@@ -56,7 +56,7 @@
 //!
 //! Clocks are numbered 0 receive, 1 packet, 2 order.
 //!
-//! Sections in version 3:
+//! Sections in version 4 (version 3 had all but kind 11):
 //!
 //! - kind 1, packets: one 56-byte record per logged item, in id order;
 //!   packet id = first packet id + index. Record: receive time (i64), packet
@@ -127,6 +127,19 @@
 //!   numbers). A plot takes them as density takes its buckets: whole only
 //!   when the plot's buckets are at least as wide and the stored bucket
 //!   lies wholly inside the window, the two ends read point by point.
+//!
+//! For the comparison of sources:
+//!
+//! - kind 11, checksum order: a 28-byte record for every logged item that
+//!   is a space packet (has a header): checksum (i64), length (i64), lane
+//!   (u32), index (u32), sequence count (u16), two zero bytes. Sorted by
+//!   checksum, sequence count, length, lane and index. The checksum comes
+//!   first because packets are matched across sources by it; the sequence
+//!   count and length come before the lane because the tracing of
+//!   interleaved streams matches on all three, so that the packets that
+//!   match lie together whatever their lanes and tracing needs no more than
+//!   a count per lane (see `pure::cross`). A run's
+//!   sections are merged in that order, with ids in place of indexes.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -136,7 +149,7 @@ use crate::pure::sql::Clock;
 
 pub const MAGIC: [u8; 8] = *b"PLSEGMNT";
 pub const TAIL_MAGIC: [u8; 8] = *b"PLSEGEND";
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 pub const PACKET_BYTES: usize = 56;
 pub const TIME_BYTES: usize = 16;
@@ -160,6 +173,7 @@ pub const KIND_TEXTS: u16 = 7;
 pub const KIND_SERIES: u16 = 8;
 pub const KIND_GROUPS: u16 = 9;
 pub const KIND_SERIES_BUCKETS: u16 = 10;
+pub const KIND_CHECKSUMS: u16 = 11;
 
 pub const VALUE_BYTES: usize = 24;
 pub const POINT_BYTES: usize = 20;
@@ -168,6 +182,10 @@ pub const SERIES_BUCKET_BYTES: usize = 32;
 /// The sort key of a point while a segment is written: lane, series, time,
 /// index, value.
 pub const POINT_KEY_BYTES: usize = 28;
+pub const CHECKSUM_BYTES: usize = 28;
+/// The sort key of a checksum record while a segment is written: checksum,
+/// sequence count, length, lane, index.
+pub const CHECKSUM_KEY_BYTES: usize = 26;
 
 /// The series number of arrival delay in the time-order sections.
 pub const DELAY: u32 = u32::MAX;
@@ -574,6 +592,67 @@ pub fn delay_ms(receive_ns: i64, packet_ns: i64) -> f64 {
     }
 }
 
+/// One space packet's place in the checksum-order section: the checksum of
+/// its bytes, its sequence count and length, its lane and its index in the
+/// segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChecksumRecord {
+    pub sum: i64,
+    pub seq: u16,
+    pub length: i64,
+    pub lane: u32,
+    pub index: u32,
+}
+
+impl ChecksumRecord {
+    pub fn encode(&self) -> [u8; CHECKSUM_BYTES] {
+        let mut b = [0u8; CHECKSUM_BYTES];
+        b[0..8].copy_from_slice(&self.sum.to_le_bytes());
+        b[8..16].copy_from_slice(&self.length.to_le_bytes());
+        b[16..20].copy_from_slice(&self.lane.to_le_bytes());
+        b[20..24].copy_from_slice(&self.index.to_le_bytes());
+        b[24..26].copy_from_slice(&self.seq.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> ChecksumRecord {
+        ChecksumRecord {
+            sum: i64_at(b, 0),
+            length: i64_at(b, 8),
+            lane: u32_at(b, 16),
+            index: u32_at(b, 20),
+            seq: u16_at(b, 24),
+        }
+    }
+
+    /// Bytes whose order is the section's order: checksum, sequence count,
+    /// length, lane, index.
+    pub fn sort_key(&self) -> [u8; CHECKSUM_KEY_BYTES] {
+        let mut b = [0u8; CHECKSUM_KEY_BYTES];
+        b[0..8].copy_from_slice(&(((self.sum as u64) ^ (1 << 63)).to_be_bytes()));
+        b[8..10].copy_from_slice(&self.seq.to_be_bytes());
+        b[10..18].copy_from_slice(&(((self.length as u64) ^ (1 << 63)).to_be_bytes()));
+        b[18..22].copy_from_slice(&self.lane.to_be_bytes());
+        b[22..26].copy_from_slice(&self.index.to_be_bytes());
+        b
+    }
+
+    pub fn from_sort_key(b: &[u8; CHECKSUM_KEY_BYTES]) -> ChecksumRecord {
+        let flipped = |at: usize| {
+            let mut v = [0u8; 8];
+            v.copy_from_slice(&b[at..at + 8]);
+            (u64::from_be_bytes(v) ^ (1 << 63)) as i64
+        };
+        ChecksumRecord {
+            sum: flipped(0),
+            seq: u16::from_be_bytes([b[8], b[9]]),
+            length: flipped(10),
+            lane: u32::from_be_bytes([b[18], b[19], b[20], b[21]]),
+            index: u32::from_be_bytes([b[22], b[23], b[24], b[25]]),
+        }
+    }
+}
+
 /// What one segment holds of one lane: how many packets, the lowest and
 /// highest time and how many have one on each time clock, and the first
 /// and last packet id. Kept while the segment is written and stored in the
@@ -769,6 +848,7 @@ pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<()
             KIND_SERIES => (POINT_BYTES as u32, &[0, 1]),
             KIND_GROUPS => (GROUP_BYTES as u32, &[0, 1]),
             KIND_SERIES_BUCKETS => (SERIES_BUCKET_BYTES as u32, &[0, 1]),
+            KIND_CHECKSUMS => (CHECKSUM_BYTES as u32, &[0]),
             // A section of a later version.
             _ => continue,
         };
@@ -1236,6 +1316,35 @@ impl SeriesBins {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checksum_records_sort_by_their_keys_and_survive_encoding() {
+        let mut records = Vec::new();
+        for sum in [i64::MIN, -5, 0, 7, i64::MAX] {
+            for seq in [0u16, 1, u16::MAX] {
+                for length in [i64::MIN, -1, 0, 9, i64::MAX] {
+                    for (lane, index) in [(0u32, 0u32), (0, u32::MAX), (3, 1), (u32::MAX, 2)] {
+                        records.push(ChecksumRecord {
+                            sum,
+                            seq,
+                            length,
+                            lane,
+                            index,
+                        });
+                    }
+                }
+            }
+        }
+        let mut by_key = records.clone();
+        by_key.reverse();
+        by_key.sort_by_key(|r| r.sort_key());
+        records.sort();
+        assert_eq!(by_key, records);
+        for r in &records {
+            assert_eq!(ChecksumRecord::from_sort_key(&r.sort_key()), *r);
+            assert_eq!(ChecksumRecord::decode(&r.encode()), *r);
+        }
+    }
 
     #[test]
     fn series_bins_follow_the_rule() {

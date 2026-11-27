@@ -14,12 +14,12 @@ use std::path::{Path, PathBuf};
 
 use crate::pure::ingest::{PacketRow, ptype_code};
 use crate::pure::segment::{
-    self as layout, BUCKET_BYTES, BucketRecord, DELAY, ENTRY_BYTES, Entry, FormatError,
-    GROUP_BYTES, GroupRecord, KIND_BUCKETS, KIND_GROUPS, KIND_LABELS, KIND_PACKETS, KIND_SERIES,
-    KIND_SERIES_BUCKETS, KIND_SERIES_NAMES, KIND_TEXTS, KIND_TIME, KIND_VALUES, LaneStats, MAGIC,
-    MixHasher, PACKET_BYTES, POINT_BYTES, POINT_KEY_BYTES, PacketRecord, PointRecord,
-    SERIES_BUCKET_BYTES, SeriesBucket, TAIL_BYTES, TIME_BYTES, Tail, TimeRecord, VALUE_BYTES,
-    ValueRecord,
+    self as layout, BUCKET_BYTES, BucketRecord, CHECKSUM_BYTES, CHECKSUM_KEY_BYTES, ChecksumRecord,
+    DELAY, ENTRY_BYTES, Entry, FormatError, GROUP_BYTES, GroupRecord, KIND_BUCKETS, KIND_CHECKSUMS,
+    KIND_GROUPS, KIND_LABELS, KIND_PACKETS, KIND_SERIES, KIND_SERIES_BUCKETS, KIND_SERIES_NAMES,
+    KIND_TEXTS, KIND_TIME, KIND_VALUES, LaneStats, MAGIC, MixHasher, PACKET_BYTES, POINT_BYTES,
+    POINT_KEY_BYTES, PacketRecord, PointRecord, SERIES_BUCKET_BYTES, SeriesBucket, TAIL_BYTES,
+    TIME_BYTES, Tail, TimeRecord, VALUE_BYTES, ValueRecord,
 };
 use crate::pure::sql::Clock;
 use crate::shell::store::Result;
@@ -30,6 +30,8 @@ use crate::shell::store::Result;
 const SORT_CHUNK: usize = (1 << 20) / TIME_BYTES;
 /// The same for the sorters of kept numbers and arrival delays.
 const POINT_CHUNK: usize = (1 << 20) / POINT_KEY_BYTES;
+/// The same for the sorter of checksums.
+const CHECKSUM_CHUNK: usize = (1 << 20) / CHECKSUM_KEY_BYTES;
 /// Buffer for each of the temporary files kept values and their texts are
 /// written to.
 const SPOOL_BUFFER: usize = 64 << 10;
@@ -75,13 +77,13 @@ pub fn remove(folder: &Path, name: &str) -> Result<()> {
 // ---- bounded sorting -----------------------------------------------------------
 
 /// A file that is removed when this is dropped.
-struct TempFile {
+pub(crate) struct TempFile {
     path: PathBuf,
-    file: File,
+    pub(crate) file: File,
 }
 
 impl TempFile {
-    fn create(path: PathBuf) -> Result<TempFile> {
+    pub(crate) fn create(path: PathBuf) -> Result<TempFile> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -333,6 +335,9 @@ pub struct Writer {
     current: Option<(u32, u32, [Option<i64>; 2])>,
     /// What has been added of each lane.
     lanes: HashMap<u32, LaneStats>,
+    /// Every space packet, to be sorted by checksum, sequence count,
+    /// length, lane and index.
+    sums: Option<Sorter<CHECKSUM_KEY_BYTES>>,
 }
 
 /// Bytes written one after another to a temporary file, to be copied into
@@ -468,6 +473,15 @@ impl Writer {
             points: vec![points("receive-kept"), points("packet-kept")],
             current: None,
             lanes: HashMap::new(),
+            sums: Some(Sorter::new(
+                folder.join(format!("{file_id}.sums")),
+                if chunk == SORT_CHUNK {
+                    CHECKSUM_CHUNK
+                } else {
+                    chunk
+                },
+                FAN_IN,
+            )),
         })
     }
 
@@ -581,6 +595,16 @@ impl Writer {
                 let point = PointRecord { ns, index, num };
                 self.points[c].push(layout::point_key(lane, DELAY, &point))?;
             }
+        }
+        if let (Some(h), Some(sums)) = (row.header, &mut self.sums) {
+            let record = ChecksumRecord {
+                sum: row.sum,
+                seq: h.seq_count,
+                length: row.length,
+                lane,
+                index,
+            };
+            sums.push(record.sort_key())?;
         }
         let id = self.first_packet + i64::from(index);
         self.lanes
@@ -710,6 +734,25 @@ impl Writer {
             let shift = times[c].map_or(0, |t| layout::series_shift(t.2));
             entries.extend(self.series_sections(c as u8, shift, sorter)?);
         }
+        // Every space packet by checksum, for the comparison of sources.
+        let sums = self.sums.take().ok_or("segment finished twice")?;
+        let start = self.at;
+        let out = &mut self.out;
+        let mut length = 0u64;
+        sums.finish(|key| {
+            out.write_all(&ChecksumRecord::from_sort_key(&key).encode())?;
+            length += CHECKSUM_BYTES as u64;
+            Ok(())
+        })?;
+        self.at += length;
+        entries.push(Entry {
+            kind: KIND_CHECKSUMS,
+            clock: 0,
+            record: CHECKSUM_BYTES as u32,
+            offset: start,
+            length,
+            param: 0,
+        });
 
         let tail = Tail {
             first_packet: self.first_packet,
@@ -1459,6 +1502,80 @@ impl Segment {
         let mut b = vec![0u8; len];
         self.file.read_exact_at(&mut b, e.offset)?;
         Ok(layout::decode_labels(&b)?)
+    }
+
+    /// The segment's space packets in checksum order, read through a
+    /// buffer of about `buffer` bytes on a handle of their own.
+    pub fn checksums(&self, buffer: usize) -> Result<Checksums> {
+        let e = self.section(KIND_CHECKSUMS, 0)?;
+        Ok(Checksums {
+            records: RecordFile::new(
+                self.file.try_clone()?,
+                e.offset,
+                e.offset + e.length,
+                buffer,
+            ),
+            packets: self.packets,
+        })
+    }
+}
+
+/// Fixed-width records from one range of a file it owns, through a buffer.
+pub(crate) struct RecordFile<const N: usize> {
+    file: File,
+    next: u64,
+    end: u64,
+    buf: Vec<u8>,
+    at: usize,
+}
+
+impl<const N: usize> RecordFile<N> {
+    pub(crate) fn new(file: File, start: u64, end: u64, buffer: usize) -> Self {
+        RecordFile {
+            file,
+            next: start,
+            end,
+            buf: Vec::with_capacity((buffer / N).max(1) * N),
+            at: 0,
+        }
+    }
+
+    pub(crate) fn read(&mut self) -> Result<Option<[u8; N]>> {
+        if self.at >= self.buf.len() {
+            let left = self.end.saturating_sub(self.next);
+            if left < N as u64 {
+                return Ok(None);
+            }
+            let want = (self.buf.capacity() as u64).min(left / N as u64 * N as u64) as usize;
+            self.buf.resize(want, 0);
+            self.file.read_exact_at(&mut self.buf, self.next)?;
+            self.next += want as u64;
+            self.at = 0;
+        }
+        let mut record = [0u8; N];
+        record.copy_from_slice(&self.buf[self.at..self.at + N]);
+        self.at += N;
+        Ok(Some(record))
+    }
+}
+
+/// A segment's space packets in checksum order.
+pub struct Checksums {
+    records: RecordFile<CHECKSUM_BYTES>,
+    packets: u64,
+}
+
+impl Checksums {
+    /// The next record, checked to name a packet of the segment.
+    pub fn next_record(&mut self) -> Result<Option<ChecksumRecord>> {
+        let Some(b) = self.records.read()? else {
+            return Ok(None);
+        };
+        let r = ChecksumRecord::decode(&b);
+        if u64::from(r.index) >= self.packets {
+            return Err(FormatError("a checksum record names no packet".into()).into());
+        }
+        Ok(Some(r))
     }
 }
 
