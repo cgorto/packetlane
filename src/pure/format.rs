@@ -91,7 +91,8 @@ pub struct Decoded {
 /// through the field's polynomial, if it has one. `None` for text, arrays
 /// and anything unreadable.
 pub fn engineering(field: &FieldDef, packet: &[u8]) -> Option<f64> {
-    if field.count != 1 {
+    // Text is not a number, whatever its bytes would read as.
+    if field.count != 1 || matches!(field.kind, FieldKind::Hex | FieldKind::Ascii) {
         return None;
     }
     engineering_of(
@@ -181,7 +182,8 @@ fn number(field: &FieldDef, packet: &[u8], bit_offset: u64) -> Result<Value, &'s
     match field.kind {
         FieldKind::Uint => Ok(Value::UInt(raw)),
         FieldKind::Int => Ok(Value::Int(sign_extend(raw, bits))),
-        _ => {
+        FieldKind::Hex | FieldKind::Ascii => Err("Not a number"),
+        FieldKind::Float => {
             let value = match bits {
                 // Through text, so a 32-bit value shows as 28.05, not as the
                 // nearest 64-bit number to it, 28.049999237060547.
@@ -488,6 +490,33 @@ mod tests {
     fn def(fields: &str) -> PacketDef {
         let text = format!("[[packet]]\napid = 1\nname = \"T\"\n{fields}");
         Config::parse(&text).unwrap().packets.remove(0)
+    }
+
+    #[test]
+    fn text_the_size_of_a_float_is_not_a_number() {
+        let def = def(r#"
+[[packet.field]]
+name = "TAG"
+bit_offset = 0
+bit_length = 32
+kind = "ascii"
+keep = true
+[[packet.field]]
+name = "KEY"
+bit_offset = 32
+bit_length = 64
+kind = "hex"
+keep = true
+"#);
+        let packet = *b"ABCD\x01\x02\x03\x04\x05\x06\x07\x08";
+        assert_eq!(
+            kept_values(&def, &packet),
+            [
+                ("TAG", None, Some("ABCD".to_string())),
+                ("KEY", None, Some("0102030405060708".to_string())),
+            ]
+        );
+        assert_eq!(engineering(&def.fields[0], &packet), None);
     }
 
     #[test]
