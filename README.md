@@ -178,8 +178,10 @@ Limits of working from counters alone are listed at the top of
   ingests faster with more, and 2 is enough for files of a few dozen.
 - An ingest writes temporary files in the segment folder, each removed
   when done with (or, after a crash, the next time the store is opened for
-  writing): while a file is read, the sorted runs of its segment's
-  sections, together up to about the size of that segment; and when a run
+  writing): while a file is read, its segment under a temporary name and
+  the sorted runs of its sections, together up to about twice the size
+  of that segment (measured: 1.1 GB for a file of 3.3 million packets,
+  420 MB for one of a million in 300 streams); and when a run
   that more than one source logged is compared, 12 bytes for each packet
   that a source holds and another source logging the same stream lacks,
   12 for each copy of a packet repeated more than 65,536 times, and for a
