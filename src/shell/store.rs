@@ -233,19 +233,7 @@ impl Store {
         to: i64,
         buckets: i64,
     ) -> Result<Table> {
-        let listed = self.query(&sql::segments_in_window(run, clock, from, to), usize::MAX)?;
-        let listed: Vec<segment::Listed> = listed
-            .rows
-            .iter()
-            .filter_map(|r| {
-                Some(segment::Listed {
-                    name: r[0].text()?.to_string(),
-                    first_packet: r[1].int()?,
-                    min: r[2].int()?,
-                    max: r[3].int()?,
-                })
-            })
-            .collect();
+        let listed = self.listed(run, clock, from, to)?;
         let width = sql::bucket_width(from, to, buckets);
         let rows = segment::density(&self.segments, &listed, clock, from, to, width)?;
         Ok(Table {
@@ -257,6 +245,73 @@ impl Store {
                 })
                 .collect(),
             truncated: false,
+        })
+    }
+
+    /// The segments of a run that may hold packets whose time on `clock`
+    /// lies in `from..=to`.
+    fn listed(
+        &self,
+        run: i64,
+        clock: sql::Clock,
+        from: i64,
+        to: i64,
+    ) -> Result<Vec<segment::Listed>> {
+        let listed = self.query(&sql::segments_in_window(run, clock, from, to), usize::MAX)?;
+        Ok(listed
+            .rows
+            .iter()
+            .filter_map(|r| {
+                Some(segment::Listed {
+                    name: r[0].text()?.to_string(),
+                    first_packet: r[1].int()?,
+                    min: r[2].int()?,
+                    max: r[3].int()?,
+                })
+            })
+            .collect())
+    }
+
+    /// Individual packets in a window, as `sql::packet_items` has them
+    /// (columns: id, lane, time, seq, length), from the segment files: at
+    /// most `limit`, in order of time and then id, `truncated` if there
+    /// were more.
+    pub fn packet_items(
+        &self,
+        run: i64,
+        clock: sql::Clock,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Table> {
+        let listed = self.listed(run, clock, from, to)?;
+        let mut items = segment::items(
+            &self.segments,
+            &listed,
+            clock,
+            from,
+            to,
+            limit.saturating_add(1),
+        )?;
+        let truncated = items.len() > limit;
+        items.truncate(limit);
+        Ok(Table {
+            columns: ["id", "lane_id", clock.packet_column(), "seq", "length"]
+                .map(str::to_string)
+                .to_vec(),
+            rows: items
+                .into_iter()
+                .map(|i| {
+                    vec![
+                        Cell::Int(i.id),
+                        Cell::Int(i64::from(i.lane)),
+                        Cell::Int(i.time),
+                        i.seq.map_or(Cell::Null, |s| Cell::Int(i64::from(s))),
+                        Cell::Int(i.length),
+                    ]
+                })
+                .collect(),
+            truncated,
         })
     }
 

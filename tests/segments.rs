@@ -350,6 +350,103 @@ fn check_logs(store: &Store) {
     }
 }
 
+/// One item row as (id, lane, time, seq, length); a missing seq is
+/// `i64::MIN`.
+fn item_rows(t: &sql::Table) -> Vec<[i64; 5]> {
+    t.rows
+        .iter()
+        .map(|r| {
+            let mut out = [0i64; 5];
+            for (o, c) in out.iter_mut().zip(r) {
+                *o = c.int().unwrap_or(i64::MIN);
+            }
+            out
+        })
+        .collect()
+}
+
+/// Item lists from the segments against the `packets` rows, on every clock,
+/// for windows whole, wider than the run, unaligned, empty, inverted and
+/// one instant wide, at limits that do and do not cut. Returns whether
+/// some limit cut through packets of equal time.
+fn check_items(store: &Store) -> bool {
+    let mut cut_a_tie = false;
+    for clock in Clock::ALL {
+        let Some((min, max)) = extent(store, clock) else {
+            continue;
+        };
+        let span = max - min + 1;
+        let c = clock.packet_column();
+        // Times held by more than one packet, for windows that start there.
+        let tied = ask(
+            store,
+            &format!(
+                "SELECT {c} FROM packets WHERE {c} IS NOT NULL
+                 GROUP BY {c} HAVING COUNT(*) > 1 ORDER BY {c} LIMIT 3"
+            ),
+            vec![],
+        );
+        let mut windows = vec![
+            (min, max),
+            (min - span, max + span),
+            (min + span / 7 + 3, max - span / 5 - 11),
+            (max + 1, max + span),
+            (max, min),
+            (min + span / 2, min + span / 2),
+            (i64::MIN, i64::MAX),
+        ];
+        windows.extend(tied.iter().map(|r| (r[0], max)));
+        for (from, to) in windows {
+            for limit in [1usize, 2, 37, 1_000_000] {
+                let got = store.packet_items(1, clock, from, to, limit).unwrap();
+                let lim = limit.min(i64::MAX as usize) as i64;
+                let old = store
+                    .query(
+                        &sql::packet_items(1, clock, from, to, lim.saturating_add(1)),
+                        limit,
+                    )
+                    .unwrap();
+                let what = format!("{clock:?} {from}..={to} limit {limit}");
+                assert_eq!(got.columns, old.columns, "{what}");
+                assert_eq!(got.truncated, old.truncated, "{what}");
+                let (g, o) = (item_rows(&got), item_rows(&old));
+                // The same times in the same order...
+                let times = |rows: &[[i64; 5]]| rows.iter().map(|r| r[2]).collect::<Vec<_>>();
+                assert_eq!(times(&g), times(&o), "{what}");
+                // ...the same packets when nothing is cut...
+                if !old.truncated {
+                    let (mut gs, mut os) = (g.clone(), o.clone());
+                    gs.sort_unstable();
+                    os.sort_unstable();
+                    assert_eq!(gs, os, "{what}");
+                }
+                // ...and exactly the first by time and then id.
+                let exact = ints(
+                    store,
+                    &Query::new(
+                        format!(
+                            "SELECT id, lane_id, {c}, seq, length FROM packets
+                             WHERE {c} BETWEEN ? AND ? ORDER BY {c}, id LIMIT ?"
+                        ),
+                        vec![from.into(), to.into(), lim.into()],
+                    ),
+                );
+                assert_eq!(
+                    g.iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+                    exact,
+                    "{what}"
+                );
+                cut_a_tie |= old.truncated
+                    && g.last().is_some_and(|last| {
+                        o.last().is_some_and(|l| l[0] != last[0])
+                            || tied.iter().any(|t| t[0] == last[2])
+                    });
+            }
+        }
+    }
+    cut_a_tie
+}
+
 fn demo(scratch: &Scratch, seconds: u32) {
     for file in demo_run(seconds) {
         scratch.write(file.rel, &file.bytes);
@@ -403,6 +500,19 @@ fn density_from_segments_matches_the_rows_on_a_run_of_several_sources() {
     let store = scratch.reader();
     assert!(ask(&store, "SELECT COUNT(*) FROM segments", vec![])[0][0] >= 9);
     assert_eq!(check_store(&store), [true; 3], "a clock had no fine window");
+}
+
+#[test]
+fn item_lists_from_segments_match_the_rows() {
+    let scratch = Scratch::new();
+    demo(&scratch, 60);
+    multi_source(&scratch);
+    // A copy of a file in another folder: the same times twice.
+    let copy = fs::read(scratch.0.join("run/bench-b/gen.bin")).unwrap();
+    scratch.write("copy/gen.bin", &copy);
+    scratch.ingest();
+    let store = scratch.reader();
+    assert!(check_items(&store), "no limit cut through equal times");
 }
 
 #[test]
@@ -690,6 +800,7 @@ fn a_file_read_again_after_it_grows_gets_a_new_segment() {
     assert!(!folder.join(&early_seg).exists());
     assert_eq!(files_in(&folder), listed(&store));
     assert_eq!((count("aa/early.bin"), count("zz/late.bin")), (350, 351));
+    check_items(&store);
     check_records(&scratch, &store);
     assert_eq!(check_store(&store), [true; 3], "a clock had no fine window");
 }

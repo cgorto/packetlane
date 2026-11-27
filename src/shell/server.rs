@@ -268,10 +268,8 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
             let store = reader()?;
             let w = &window;
             let limit_rows = usize::try_from(limit).unwrap_or(1);
-            let packets = store.query(
-                &sql::packet_items(w.run, w.clock, w.from, w.to, limit + 1),
-                limit_rows,
-            )?;
+            // Packets from their segment files, log entries from the store.
+            let packets = store.packet_items(w.run, w.clock, w.from, w.to, limit_rows)?;
             let logs = match sql::log_items(w.run, w.clock, w.from, w.to, limit + 1) {
                 Some(q) => Some(store.query(&q, limit_rows)?),
                 None => None,

@@ -1468,10 +1468,7 @@ pub fn density(
         if s.max < from || s.min > to {
             continue;
         }
-        let segment = Segment::open(&folder.join(&s.name))?;
-        if segment.first_packet() != s.first_packet {
-            return Err(format!("{}: replaced since it was listed", s.name).into());
-        }
+        let segment = open_listed(folder, s)?;
         // The coarsest level the view's buckets are wide enough for; with
         // none, every packet in the window is counted.
         let shift = layout::level_for(&segment.levels(clock), width);
@@ -1492,6 +1489,110 @@ pub fn density(
         }
     }
     Ok(counts.rows())
+}
+
+/// Opens a listed segment, checking it is still the one listed.
+fn open_listed(folder: &Path, s: &Listed) -> Result<Segment> {
+    let segment = Segment::open(&folder.join(&s.name))?;
+    if segment.first_packet() != s.first_packet {
+        return Err(format!("{}: replaced since it was listed", s.name).into());
+    }
+    Ok(segment)
+}
+
+/// One packet of an item list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Item {
+    pub id: i64,
+    pub lane: u32,
+    /// Its time on the clock asked about; its id on the order clock.
+    pub time: i64,
+    pub seq: Option<u16>,
+    pub length: i64,
+}
+
+/// The first `limit` packets whose time on `clock` lies in `from..=to`,
+/// from the listed segments, in order of time and then id. Each segment's
+/// time order is read from the start of the window and the segments are
+/// merged, so the cost follows `limit`, not the window.
+pub fn items(
+    folder: &Path,
+    listed: &[Listed],
+    clock: Clock,
+    from: i64,
+    to: i64,
+    limit: usize,
+) -> Result<Vec<Item>> {
+    let mut out = Vec::new();
+    if from > to || limit == 0 {
+        return Ok(out);
+    }
+    let mut segments = Vec::new();
+    for s in listed {
+        if s.max >= from && s.min <= to {
+            segments.push(open_listed(folder, s)?);
+        }
+    }
+    if clock == Clock::Order {
+        segments.sort_by_key(Segment::first_packet);
+        for seg in &segments {
+            let first = seg.first_packet();
+            let last = first + seg.packets() as i64 - 1;
+            let (lo, hi) = (from.max(first), to.min(last));
+            if lo > hi {
+                continue;
+            }
+            seg.packets_in((lo - first) as u64, (hi - first) as u64, |index, p| {
+                let id = first + index as i64;
+                out.push(item(id, id, &p));
+                Ok(out.len() < limit)
+            })?;
+            if out.len() >= limit {
+                break;
+            }
+        }
+        return Ok(out);
+    }
+    let mut cursors = Vec::with_capacity(segments.len());
+    let mut heap = BinaryHeap::new();
+    for (i, seg) in segments.iter().enumerate() {
+        let mut cursor = seg.times_from(clock, from)?;
+        if let Some(t) = cursor.next_time()? {
+            heap.push(Reverse((t.ns, seg.first_packet() + i64::from(t.index), i)));
+        }
+        cursors.push(cursor);
+    }
+    let mut chosen = Vec::new();
+    while let Some(Reverse((ns, id, i))) = heap.pop() {
+        if ns > to || chosen.len() >= limit {
+            break;
+        }
+        chosen.push((ns, id, i));
+        if let Some(t) = cursors[i].next_time()? {
+            heap.push(Reverse((
+                t.ns,
+                segments[i].first_packet() + i64::from(t.index),
+                i,
+            )));
+        }
+    }
+    drop(cursors);
+    for (ns, id, i) in chosen {
+        let seg = &segments[i];
+        let p = seg.packet((id - seg.first_packet()) as u64)?;
+        out.push(item(id, ns, &p));
+    }
+    Ok(out)
+}
+
+fn item(id: i64, time: i64, p: &PacketRecord) -> Item {
+    Item {
+        id,
+        lane: p.lane,
+        time,
+        seq: p.header.map(|h| h.1),
+        length: p.length,
+    }
 }
 
 #[cfg(test)]
