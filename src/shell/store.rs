@@ -248,6 +248,15 @@ impl Store {
                     }
                 }
             }
+            let file_ids: Vec<i64> = tx
+                .prepare(sql::RUN_FILE_IDS)?
+                .query_map(params![run_id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            for file_id in file_ids {
+                for statement in sql::delete_file_packets() {
+                    tx.execute(&statement, params![file_id])?;
+                }
+            }
             for statement in sql::RESET_RUN {
                 tx.execute(statement, params![run_id])?;
             }
@@ -393,6 +402,9 @@ impl Store {
             if (old_size, old_checksum) == (size, checksum) {
                 return Ok(outcome(Status::AlreadyIngested, "", 0, 0, String::new()));
             }
+            for statement in sql::delete_file_packets() {
+                tx.execute(&statement, params![file_id])?;
+            }
             for statement in sql::DELETE_FILE {
                 tx.execute(statement, params![file_id])?;
             }
@@ -428,6 +440,8 @@ impl Store {
         )?;
         let file_id = tx.last_insert_rowid();
         let mut lanes = Lanes::new(run_id, &source.name);
+        // The file's packets are numbered from here, with no gaps.
+        let first_packet: i64 = tx.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
 
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
@@ -472,7 +486,14 @@ impl Store {
 
         tx.execute(
             sql::FINISH_FILE,
-            params![packets as i64, entries as i64, note, file_id],
+            params![
+                packets as i64,
+                entries as i64,
+                note,
+                (packets > 0).then_some(first_packet),
+                (packets > 0).then(|| first_packet + packets as i64 - 1),
+                file_id
+            ],
         )?;
         tx.commit()?;
         Ok(outcome(

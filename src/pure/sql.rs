@@ -5,7 +5,7 @@
 use serde::Serialize;
 use serde::ser::Serializer;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS files (
   packets INTEGER NOT NULL DEFAULT 0,
   entries INTEGER NOT NULL DEFAULT 0,
   note TEXT NOT NULL DEFAULT '',
+  first_packet INTEGER,
+  last_packet INTEGER,
   UNIQUE (run_id, rel)
 );
 CREATE TABLE IF NOT EXISTS lanes (
@@ -630,13 +632,34 @@ pub const RUN_FILE_PATHS: &str = "SELECT path, rel FROM files WHERE run_id = ? O
 /// Statements that empty a run, each taking the run id. Used when its
 /// configuration changes, because names, clocks and time formats are
 /// applied as files are read.
-pub const RESET_RUN: [&str; 10] = [
-    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
-    "DELETE FROM field_values WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
+/// The ids of a file's packets, as `BETWEEN` wants them. A file's packets
+/// are numbered in one unbroken run as it is read, and the file's row keeps
+/// the first and last (`first_packet`, `last_packet`; null if it held
+/// none). What was read from a file is found by that range, which the
+/// tables are already in order of, and so needs no index by file.
+const FILE_PACKETS: &str = "(SELECT first_packet FROM files WHERE id = ?1)
+                                AND (SELECT last_packet FROM files WHERE id = ?1)";
+
+/// Removes the packets of one file and their kept values. Takes the file
+/// id; the file's row must still be there.
+pub fn delete_file_packets() -> [String; 2] {
+    [
+        format!("DELETE FROM field_values WHERE packet_id BETWEEN {FILE_PACKETS}"),
+        format!("DELETE FROM packets WHERE id BETWEEN {FILE_PACKETS}"),
+    ]
+}
+
+/// The files of a run. Columns: id.
+pub const RUN_FILE_IDS: &str = "SELECT id FROM files WHERE run_id = ?";
+
+/// Removes everything read for a run but the run itself, each taking the
+/// run id. The packets and kept values go first, file by file, with
+/// [`delete_file_packets`].
+pub const RESET_RUN: [&str; 8] = [
     "DELETE FROM file_series WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
-    "DELETE FROM packets WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM logs WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)",
     "DELETE FROM findings WHERE run_id = ?",
+    "DELETE FROM coarse_series WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
     "DELETE FROM coarse WHERE lane_id IN (SELECT id FROM lanes WHERE run_id = ?)",
     "DELETE FROM coarse_meta WHERE run_id = ?",
     "DELETE FROM lanes WHERE run_id = ?",
@@ -648,11 +671,10 @@ pub const RUN_ID: &str = "SELECT id FROM runs WHERE root = ?";
 /// A file of a run by its path within the run. Columns: id, size, checksum.
 pub const FILE_BY_REL: &str = "SELECT id, size, checksum FROM files WHERE run_id = ? AND rel = ?";
 /// Statements that remove one file and what was read from it, each taking
-/// the file id.
-pub const DELETE_FILE: [&str; 7] = [
-    "DELETE FROM field_values WHERE file_id = ?",
+/// the file id. Its packets and kept values go first, with
+/// [`delete_file_packets`].
+pub const DELETE_FILE: [&str; 5] = [
     "DELETE FROM file_series WHERE file_id = ?",
-    "DELETE FROM packets WHERE file_id = ?",
     "DELETE FROM logs WHERE file_id = ?",
     "DELETE FROM findings WHERE file_id = ?",
     "DELETE FROM lanes WHERE kind = 'log' AND file_id = ?",
@@ -661,7 +683,10 @@ pub const DELETE_FILE: [&str; 7] = [
 pub const INSERT_FILE: &str =
     "INSERT INTO files (run_id, path, rel, source, format, size, checksum)
      VALUES (?, ?, ?, ?, ?, ?, ?)";
-pub const FINISH_FILE: &str = "UPDATE files SET packets = ?, entries = ?, note = ? WHERE id = ?";
+/// Takes packets, entries, note, first packet id, last packet id, file id.
+pub const FINISH_FILE: &str = "UPDATE files
+     SET packets = ?, entries = ?, note = ?, first_packet = ?, last_packet = ?
+     WHERE id = ?";
 pub const INSERT_LANE: &str =
     "INSERT OR IGNORE INTO lanes (run_id, source, kind, apid, ptype, file_id)
      VALUES (?, ?, ?, ?, ?, ?)";

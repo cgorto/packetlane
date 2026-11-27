@@ -679,3 +679,134 @@ fn stored_buckets_give_what_reading_the_packets_gives() {
     // The order clock has no stored buckets.
     assert!(sql::build_coarse_series(1, Clock::Order, 0, 100, 1).is_empty());
 }
+
+// ---- what was read from a file is found by its packet ids -------------------------
+
+/// Every file's row says which packets are its own, and nothing is left in
+/// the store from a file that is gone or was read again.
+fn check_files(conn: &Connection) {
+    let one = |sql: &str| {
+        rows(
+            conn,
+            &Query {
+                sql: sql.to_string(),
+                params: vec![],
+            },
+        )
+    };
+    let wrong = one(
+        "SELECT f.rel, f.packets, f.first_packet, f.last_packet, s.n, s.lo, s.hi
+         FROM files f
+         LEFT JOIN (SELECT file_id, COUNT(*) AS n, MIN(id) AS lo, MAX(id) AS hi
+                    FROM packets GROUP BY file_id) s ON s.file_id = f.id
+         WHERE f.packets != COALESCE(s.n, 0)
+            OR f.first_packet IS NOT s.lo OR f.last_packet IS NOT s.hi",
+    );
+    assert!(wrong.is_empty(), "{wrong:?}");
+    for (what, sql) in [
+        (
+            "packets of no file",
+            "SELECT COUNT(*) FROM packets WHERE file_id NOT IN (SELECT id FROM files)",
+        ),
+        (
+            "values of no packet",
+            "SELECT COUNT(*) FROM field_values WHERE packet_id NOT IN (SELECT id FROM packets)",
+        ),
+        (
+            "values of another file's packet",
+            "SELECT COUNT(*) FROM field_values v JOIN packets p ON p.id = v.packet_id
+             WHERE p.file_id != v.file_id",
+        ),
+    ] {
+        assert_eq!(one(sql)[0][0], "0", "{what}");
+    }
+}
+
+/// Writes a second run beside the first and ingests it into the same store.
+fn add_run(store: &Stored, name: &str, files: &[(String, Vec<u8>)]) -> PathBuf {
+    let run = store.dir.join(name);
+    for (rel, bytes) in files {
+        let path = run.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    ingest(&store.dir.join("store.db"), &run);
+    run
+}
+
+/// Two runs in one store: reading a file of one again, and reading the
+/// whole of it again, must take away exactly that run's rows.
+#[test]
+fn a_file_read_again_takes_only_its_own_rows_with_it() {
+    let demo_files: Vec<(String, Vec<u8>)> = demo_run(120)
+        .into_iter()
+        .map(|f| (f.rel.to_string(), f.bytes))
+        .collect();
+    let store = stored(&demo_files);
+    let first = store.dir.join("run");
+    let db = store.dir.join("store.db");
+    add_run(&store, "second", &awkward_run());
+    check_files(&store.conn);
+    let count = |run: i64| -> i64 {
+        rows(
+            &store.conn,
+            &Query {
+                sql: "SELECT COUNT(*) FROM packets WHERE file_id IN
+                      (SELECT id FROM files WHERE run_id = ?)"
+                    .to_string(),
+                params: vec![run.into()],
+            },
+        )[0][0]
+            .parse()
+            .unwrap()
+    };
+    let (one, two) = (count(1), count(2));
+    assert!(one > 0 && two > 0);
+
+    // The first run's largest packet file, cut to a third: not the last
+    // file read, so its ids lie in the middle of the table.
+    let (rel, bytes) = demo_files
+        .iter()
+        .filter(|(rel, _)| rel.ends_with(".bin"))
+        .max_by_key(|(_, bytes)| bytes.len())
+        .unwrap();
+    std::fs::write(first.join(rel), &bytes[..bytes.len() / 3]).unwrap();
+    ingest(&db, &first);
+    check_files(&store.conn);
+    let fewer = count(1);
+    assert!(fewer > 0 && fewer < one, "{fewer} of {one}");
+    assert_eq!(count(2), two);
+    // Both runs still compare and count as lane by lane would.
+    check_lanes(&store.conn);
+
+    // The first run's configuration changes, so all of it is read again.
+    let config = first.join("packetlane.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{text}\n# changed\n")).unwrap();
+    ingest(&db, &first);
+    check_files(&store.conn);
+    assert_eq!(count(1), fewer);
+    assert_eq!(count(2), two);
+    check_lanes(&store.conn);
+
+    // And the rows are found by id, not by reading every packet.
+    for statement in sql::delete_file_packets() {
+        let steps = plan(
+            &store.conn,
+            &Query {
+                sql: statement.clone(),
+                params: vec![1i64.into()],
+            },
+        );
+        let table = if statement.contains("field_values") {
+            "field_values"
+        } else {
+            "packets"
+        };
+        let step = step(&steps, table);
+        assert!(
+            step.starts_with("SEARCH") && (step.contains("rowid>") || step.contains("packet_id>")),
+            "{statement}: {steps:#?}"
+        );
+    }
+}
