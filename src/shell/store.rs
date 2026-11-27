@@ -14,13 +14,14 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_ite
 use serde::Serialize;
 
 use crate::pure::config::{Config, SourceInfo};
-use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
+use crate::pure::cross::{Comparison, CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
 use crate::pure::finding::{Kind, Severity};
 use crate::pure::ingest::{LaneKey, ptype_code};
 use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
+use crate::shell::cross;
 use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
 use crate::shell::segment::{self, Writer, Written};
 
@@ -721,7 +722,7 @@ impl Store {
             );
             phases.last = Instant::now();
             tx.execute(sql::DELETE_CROSS_FINDINGS, params![run_id])?;
-            for finding in cross_findings(&tx, run_id, &mut phases)? {
+            for finding in cross_findings(&tx, &self.segments, run_id, &mut phases)? {
                 tx.execute(
                     sql::INSERT_FINDING,
                     params![
@@ -1217,74 +1218,93 @@ fn ingest_text(
     Ok(count)
 }
 
+/// The findings that compare one source's log with another's, from the
+/// checksum sections of the run's segments: for each pair of lanes that
+/// carry the same stream from two sources (`sql::lane_pairs`, in its
+/// order), what one holds that the other lacks; then, for each stream with
+/// interleaved counters (`sql::lanes_with_finding`, in its order), which
+/// other sources hold copies of its packets. A run from one source has no
+/// pairs, and no section is read.
 fn cross_findings(
     conn: &Connection,
+    folder: &Path,
     run_id: i64,
     phases: &mut Phases,
 ) -> Result<Vec<CrossFinding>> {
     let mut out = Vec::new();
-
-    // Every pair is compared in one query; the findings are then made in
-    // the order the pairs are listed, which is the order they are stored in.
-    // A run from one source has no pairs, and its packets are not read.
     let pairs = run_query(conn, &sql::lane_pairs(run_id), usize::MAX)?;
-    if pairs.rows.is_empty() {
-        return Ok(out);
-    }
-    conn.execute_batch(sql::HOP_UNSTAGE)?;
-    for q in sql::hop_stage(run_id) {
-        conn.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
-    }
-    phases.mark("indexing packets by content");
-    let compared = run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?.rows;
-    let compared: HashMap<(i64, i64), &Vec<Cell>> = compared
-        .iter()
-        .filter_map(|r| Some(((r[0].int()?, r[1].int()?), r)))
-        .collect();
+    let lane = |c: &Cell| -> Result<u32> {
+        c.int()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| "lane id out of range".into())
+    };
+    let mut listed: Vec<(i64, &str, i64, &str)> = Vec::with_capacity(pairs.rows.len());
+    let mut lane_pairs: Vec<(u32, u32)> = Vec::with_capacity(pairs.rows.len());
     for row in &pairs.rows {
         let (Some(a), Some(source_a), Some(b), Some(source_b)) =
             (row[0].int(), row[1].text(), row[2].int(), row[3].text())
         else {
             continue;
         };
-        if let Some(r) = compared.get(&(a, b)) {
-            let shared = r[2].int().unwrap_or(0);
-            let missing = r[3].int().unwrap_or(0);
-            out.extend(hop_finding(
-                a,
-                source_a,
-                source_b,
-                shared,
-                missing,
-                r[4].int(),
-            ));
-        }
+        listed.push((a, source_a, b, source_b));
+        lane_pairs.push((lane(&row[0])?, lane(&row[2])?));
     }
-
-    phases.mark("comparing sources");
+    if lane_pairs.is_empty() {
+        return Ok(out);
+    }
     let mixed = run_query(
         conn,
         &sql::lanes_with_finding(run_id, Kind::Interleaved.name()),
         usize::MAX,
     )?;
+    let mut traced = Vec::new();
     for row in &mixed.rows {
-        let (Some(lane), Some(apid), Some(ptype)) = (row[0].int(), row[2].int(), row[3].int())
-        else {
-            continue;
-        };
-        let origins = run_query(
-            conn,
-            &sql::lane_origins(run_id, lane, apid, ptype),
-            usize::MAX,
-        )?;
-        let list: Vec<(String, i64)> = origins
+        if let Ok(x) = lane(&row[0]) {
+            traced.push(x);
+        }
+    }
+    let segments: Vec<(String, i64)> =
+        run_query(conn, &sql::run_segment_ranges(run_id), usize::MAX)?
             .rows
             .iter()
             .filter_map(|r| Some((r[0].text()?.to_string(), r[1].int()?)))
             .collect();
-        out.extend(origin_finding(lane, row[4].int(), &list));
+
+    let mut cmp = Comparison::new(&lane_pairs, &traced);
+    let replay = cross::compare(folder, &segments, &mut cmp, cross::FAN_IN)?;
+    phases.mark("merging the checksum sections");
+    replay.run(&mut cmp)?;
+    phases.mark("counting packets a partner lacks");
+
+    for (&(a, source_a, _, source_b), c) in listed.iter().zip(cmp.counts()) {
+        out.extend(hop_finding(
+            a,
+            source_a,
+            source_b,
+            c.shared,
+            c.missing,
+            c.first_missing,
+        ));
     }
-    phases.mark("tracing interleaved streams");
-    conn.execute_batch(sql::HOP_UNSTAGE)?;
+    for row in &mixed.rows {
+        let (Some(x), Ok(traced)) = (row[0].int(), lane(&row[0])) else {
+            continue;
+        };
+        // Per source, the packets of the stream that source's lanes hold.
+        let mut found: Vec<(String, i64)> = Vec::new();
+        for (&(a, _, _, source_b), &(_, other)) in listed.iter().zip(&lane_pairs) {
+            if a != x {
+                continue;
+            }
+            let n = cmp.copies(traced, other);
+            match found.iter_mut().find(|f| f.0 == source_b) {
+                Some(f) => f.1 += n,
+                None => found.push((source_b.to_string(), n)),
+            }
+        }
+        found.retain(|f| f.1 > 0);
+        found.sort();
+        out.extend(origin_finding(x, row[4].int(), &found));
+    }
     Ok(out)
 }

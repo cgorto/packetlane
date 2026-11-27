@@ -1,6 +1,6 @@
 //! Two things about the store's SQL that no answer on a small run shows:
-//! which index SQLite uses for it, and that the statements which read all
-//! packets in one pass give what asking lane by lane gave.
+//! which index SQLite uses for it, and that what it keeps per file adds up
+//! to what counting the packets gives.
 //!
 //! A new index can make an existing query slow without changing a single
 //! answer, because SQLite may prefer it. The load tests show that as
@@ -220,134 +220,12 @@ fn plots_find_one_lanes_packets_by_time() {
     );
 }
 
-/// Makes the temporary table the comparison of sources reads, as an
-/// ingest does, on this connection.
-fn stage(conn: &Connection, run: i64) {
-    conn.execute_batch(sql::HOP_UNSTAGE).unwrap();
-    for q in sql::hop_stage(run) {
-        conn.execute(&q.sql, params_from_iter(bound(&q))).unwrap();
-    }
-}
+// ---- lane counts against lane by lane -------------------------------------------
 
-/// The comparison of sources reads the run's packets once to copy them, by
-/// their files' id ranges, then the copy twice, whatever the number of
-/// streams, and answers "is this packet in that lane" from an index.
-#[test]
-fn sources_are_compared_in_two_passes_over_the_packets() {
-    let store = demo();
-    // Copying: each file's packets by id, and no other index.
-    let copy = &sql::hop_stage(1)[1];
-    stage(&store.conn, 1);
-    store.conn.execute_batch("DELETE FROM temp.hop").unwrap();
-    let steps = plan(&store.conn, copy);
-    assert_eq!(
-        step(&steps, "p"),
-        "SEARCH p USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)",
-        "{steps:#?}"
-    );
-    // Comparing.
-    let steps = plan(&store.conn, &sql::hop_compare_all(1));
-    let scans: Vec<&String> = steps.iter().filter(|s| s.starts_with("SCAN")).collect();
-    // The copy is kept in checksum order, so reading it from end to end
-    // makes each lookup below land beside the last.
-    assert_eq!(scans, ["SCAN p"; 2], "{steps:#?}");
-    let lookups = steps
-        .iter()
-        .filter(|s| s.ends_with("USING PRIMARY KEY (sum=? AND lane_id=?)"))
-        .count();
-    assert_eq!(lookups, 2, "{steps:#?}");
-    // Tracing an interleaved stream reads that lane's packets by lane, and
-    // asks the same index about each.
-    let steps = plan(&store.conn, &sql::lane_origins(1, 2, 100, 0));
-    let reads: Vec<&String> = steps
-        .iter()
-        .filter(|s| s.split_whitespace().nth(1) == Some("p"))
-        .collect();
-    assert!(
-        !reads.is_empty()
-            && reads
-                .iter()
-                .all(|s| *s == "SEARCH p USING INDEX packets_lane_receive (lane_id=?)"),
-        "{steps:#?}"
-    );
-    assert!(
-        steps
-            .iter()
-            .any(|s| s.ends_with("USING PRIMARY KEY (sum=? AND lane_id=?)")),
-        "{steps:#?}"
-    );
-}
-
-// ---- one pass against lane by lane --------------------------------------------
-
-/// How lane `a` compares with lane `b`, asked for one pair: what
-/// `hop_compare_all` replaced, kept here to check it against.
-const ONE_PAIR: &str = "WITH m AS MATERIALIZED (
-       SELECT p.id AS id,
-              EXISTS (SELECT 1 FROM packets q
-                      WHERE q.sum = p.sum AND q.lane_id = ?1) AS hit
-       FROM packets p WHERE p.lane_id = ?2),
-     w AS (SELECT MIN(id) AS lo, MAX(id) AS hi FROM m WHERE hit = 1)
-     SELECT (SELECT COUNT(*) FROM m WHERE hit = 1),
-            (SELECT COUNT(*) FROM m, w WHERE hit = 0 AND id BETWEEN w.lo AND w.hi),
-            (SELECT MIN(id) FROM m, w WHERE hit = 0 AND id BETWEEN w.lo AND w.hi)";
-
-/// One lane's count and ranges, asked for one lane: what the one-pass
-/// refresh replaced.
+/// One lane's count and ranges, asked of its packets.
 const ONE_LANE: &str = "SELECT COUNT(*), MIN(receive_ns), MAX(receive_ns), COUNT(receive_ns),
             MIN(packet_ns), MAX(packet_ns), COUNT(packet_ns), MIN(id), MAX(id)
      FROM packets WHERE lane_id = ?1";
-
-/// Checks every pair of the run against [`ONE_PAIR`]. Returns the pairs
-/// that have something missing, as (source a, source b, apid, shared,
-/// missing).
-fn check_pairs(conn: &Connection) -> Vec<(String, String, i64, i64, i64)> {
-    check_pairs_of(conn, 1)
-}
-
-/// The same for any run of the store.
-fn check_pairs_of(conn: &Connection, run: i64) -> Vec<(String, String, i64, i64, i64)> {
-    stage(conn, run);
-    let all = rows(conn, &sql::hop_compare_all(run));
-    let pairs = rows(conn, &sql::lane_pairs(run));
-    assert!(!pairs.is_empty());
-    let mut with_missing = Vec::new();
-    for pair in &pairs {
-        let (a, b) = (&pair[0], &pair[2]);
-        let old = rows(
-            conn,
-            &Query {
-                sql: ONE_PAIR.to_string(),
-                params: vec![
-                    b.parse::<i64>().unwrap().into(),
-                    a.parse::<i64>().unwrap().into(),
-                ],
-            },
-        );
-        let old = &old[0];
-        let new: Vec<&Vec<String>> = all.iter().filter(|r| &r[0] == a && &r[1] == b).collect();
-        let (shared, missing): (i64, i64) = (old[0].parse().unwrap(), old[1].parse().unwrap());
-        if shared > 0 && missing > 0 {
-            assert_eq!(new.len(), 1, "pair {a} {b}");
-            assert_eq!(&new[0][2..], &old[..], "pair {a} {b}");
-            with_missing.push((
-                pair[1].clone(),
-                pair[3].clone(),
-                pair[4].parse().unwrap(),
-                shared,
-                missing,
-            ));
-        } else {
-            // Nothing to report for the pair, and the one pass says nothing.
-            assert!(
-                new.is_empty(),
-                "pair {a} {b}: {new:?}, lane by lane {old:?}"
-            );
-        }
-    }
-    assert_eq!(all.len(), with_missing.len());
-    with_missing
-}
 
 /// Checks the stored count and ranges of every packet lane against
 /// [`ONE_LANE`]. Returns how many lanes there were.
@@ -376,7 +254,7 @@ fn check_lanes(conn: &Connection) -> usize {
 }
 
 /// Three sources logging the same streams, with everything that could make
-/// one pass differ from lane by lane.
+/// counting go wrong.
 fn awkward_run() -> Vec<(String, Vec<u8>)> {
     let p = |apid: u16, seq: u16, body: &[u8]| packet(apid, seq, body);
     let mut a = Vec::new();
@@ -423,26 +301,11 @@ fn awkward_run() -> Vec<(String, Vec<u8>)> {
 }
 
 #[test]
-fn one_pass_gives_what_lane_by_lane_gave() {
+fn lanes_count_as_lane_by_lane_gave() {
     let store = stored(&awkward_run());
     assert_eq!(check_lanes(&store.conn), 8);
-    let mut missing = check_pairs(&store.conn);
-    missing.sort();
-    assert_eq!(
-        missing,
-        [
-            // Of a's 41 packets on APID 10, b has 32 (the one a holds twice
-            // counts twice); 10, 11 and 30 are missing within what they
-            // share, and those before and after are not counted.
-            ("a".to_string(), "b".to_string(), 10, 32, 3),
-            // Of c's 20 on APID 13, a has 9; 9 is missing between them.
-            ("c".to_string(), "a".to_string(), 13, 9, 1),
-        ]
-    );
-
     let demo = demo();
     assert!(check_lanes(&demo.conn) > 3);
-    assert!(!check_pairs(&demo.conn).is_empty());
 }
 
 /// A lane keeps its row when its file is read again and no longer holds
@@ -822,11 +685,9 @@ fn a_file_read_again_takes_only_its_own_rows_with_it() {
     let fewer = count(1);
     assert!(fewer > 0 && fewer < one, "{fewer} of {one}");
     assert_eq!(count(2), two);
-    // Both runs still compare and count as lane by lane would, each from
-    // its own packets only.
+    // Both runs still count as lane by lane would, each from its own
+    // packets only.
     check_lanes(&store.conn);
-    check_pairs_of(&store.conn, 1);
-    assert_eq!(check_pairs_of(&store.conn, 2).len(), 2);
 
     // The first run's configuration changes, so all of it is read again.
     let config = first.join("packetlane.toml");
@@ -858,74 +719,6 @@ fn a_file_read_again_takes_only_its_own_rows_with_it() {
             "{statement}: {steps:#?}"
         );
     }
-}
-
-// ---- which sources hold copies of an interleaved stream -----------------------------
-
-/// Which other sources hold copies of a lane's packets, asked of the
-/// packets themselves: what the lookup in the temporary table replaced.
-const ORIGINS_FROM_PACKETS: &str = "SELECT l.source,
-            SUM((SELECT COUNT(*) FROM packets p
-                 WHERE p.lane_id = ?1 AND EXISTS (
-                   SELECT 1 FROM packets q
-                   WHERE q.sum = p.sum AND q.lane_id = l.id
-                     AND q.seq = p.seq AND q.length = p.length))) AS n
-     FROM lanes l
-     WHERE l.run_id = ?2 AND l.kind = 'packet' AND l.apid = ?3 AND l.ptype = ?4
-       AND l.id != ?1
-     GROUP BY l.source HAVING n > 0 ORDER BY l.source";
-
-/// Checks the lookup for every interleaved stream of a run. Returns how
-/// many sources were named in all.
-fn check_origins(conn: &Connection, run: i64) -> usize {
-    stage(conn, run);
-    let mixed = rows(conn, &sql::lanes_with_finding(run, "interleaved"));
-    assert!(!mixed.is_empty(), "no interleaved stream to trace");
-    let mut named = 0;
-    for row in &mixed {
-        let n = |i: usize| row[i].parse::<i64>().unwrap();
-        let (lane, apid, ptype) = (n(0), n(2), n(3));
-        let staged = rows(conn, &sql::lane_origins(run, lane, apid, ptype));
-        let direct = rows(
-            conn,
-            &Query {
-                sql: ORIGINS_FROM_PACKETS.to_string(),
-                params: vec![lane.into(), run.into(), apid.into(), ptype.into()],
-            },
-        );
-        assert_eq!(staged, direct, "lane {lane}");
-        named += staged.len();
-    }
-    named
-}
-
-#[test]
-fn an_interleaved_stream_is_traced_as_the_packets_say() {
-    // Two units send on one APID by mistake, each logging its own packets;
-    // a collector logs both, so its copy has two counters running at once.
-    let mut first = packetlane::pure::synth::Source::new(300, 9000, 8);
-    let mut second = packetlane::pure::synth::Source::new(300, 12, 8);
-    let (mut a, mut b, mut c) = (Vec::new(), Vec::new(), Vec::new());
-    for i in 0..40 {
-        let packet = first.emit();
-        a.extend(&packet);
-        c.extend(&packet);
-        if i >= 10 {
-            let packet = second.emit();
-            b.extend(&packet);
-            c.extend(&packet);
-        }
-    }
-    let store = stored(&[
-        ("unit-a/a.bin".to_string(), a),
-        ("unit-b/b.bin".to_string(), b),
-        ("collector/c.bin".to_string(), c),
-    ]);
-    // Both units are named for the collector's stream.
-    assert_eq!(check_origins(&store.conn, 1), 2);
-    // With another run in the store, the answer is the same.
-    add_run(&store, "second", &awkward_run());
-    assert_eq!(check_origins(&store.conn, 1), 2);
 }
 
 // ---- lane totals from what each segment holds ---------------------------------------

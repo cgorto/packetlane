@@ -4,6 +4,7 @@
 
 pub mod browse;
 pub mod cli;
+pub mod cross;
 pub mod files;
 pub mod ingest;
 pub mod segment;
