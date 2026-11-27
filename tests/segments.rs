@@ -885,7 +885,6 @@ fn plots_from_segments_match_the_rows() {
     kept_run(&scratch);
     multi_source(&scratch);
     scratch.ingest();
-    let store = scratch.reader();
     let (mixed, skipped, fine) = check_series(&scratch.db());
     assert!(fine > 0, "no fine plot on a time clock");
     assert!(mixed > 0, "no plot read partly from stored buckets");
