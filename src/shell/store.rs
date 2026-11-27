@@ -352,6 +352,203 @@ impl Store {
         })
     }
 
+    /// The segment holding a packet, opened, with the packet's index in it
+    /// and its file's row (path, rel, run id, format); `None` if no
+    /// segment holds it.
+    fn packet_segment(&self, id: i64) -> Result<Option<(segment::Segment, u64, Vec<Cell>)>> {
+        let found = self.query(&sql::packet_segment(id), 1)?;
+        let Some(row) = found.rows.into_iter().next() else {
+            return Ok(None);
+        };
+        let (Some(name), Some(first)) = (row[0].text(), row[1].int()) else {
+            return Err("segment row without a name or first packet".into());
+        };
+        let listed = segment::Listed {
+            name: name.to_string(),
+            first_packet: first,
+            min: first,
+            max: first,
+        };
+        let seg = segment::open_listed(&self.segments, &listed)?;
+        let index = u64::try_from(id - first).map_err(|_| "packet before its segment")?;
+        Ok(Some((seg, index, row[2..].to_vec())))
+    }
+
+    /// One packet, as `sql::packet_detail` has it: its record from its
+    /// segment file, its file and source from the store. No rows if there
+    /// is no such packet.
+    pub fn packet_detail(&self, id: i64) -> Result<Table> {
+        let columns = [
+            "id",
+            "idx",
+            "offset",
+            "length",
+            "receive_ns",
+            "packet_ns",
+            "apid",
+            "ptype",
+            "seq",
+            "label",
+            "lane_id",
+            "path",
+            "rel",
+            "source",
+            "run_id",
+            "format",
+            "sum",
+        ];
+        let mut table = Table {
+            columns: columns.map(str::to_string).to_vec(),
+            rows: Vec::new(),
+            truncated: false,
+        };
+        let Some((seg, index, file)) = self.packet_segment(id)? else {
+            return Ok(table);
+        };
+        let p = seg.packet(index)?;
+        let label = match p.label {
+            Some(n) => Some(
+                seg.labels()?
+                    .get(n as usize)
+                    .cloned()
+                    .ok_or("packet label out of range")?,
+            ),
+            None => None,
+        };
+        let lane = i64::from(p.lane);
+        let source = self.query(&sql::lane_source(lane), 1)?;
+        let source = source
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .cloned()
+            .unwrap_or(Cell::Null);
+        let int = |v: Option<i64>| v.map_or(Cell::Null, Cell::Int);
+        let header = p.header;
+        table.rows.push(vec![
+            Cell::Int(id),
+            Cell::Int(index as i64),
+            Cell::Int(p.offset),
+            Cell::Int(p.length),
+            int(p.receive_ns),
+            int(p.packet_ns),
+            int(header.map(|h| i64::from(h.0))),
+            int(header.map(|h| i64::from(h.2))),
+            int(header.map(|h| i64::from(h.1))),
+            label.map_or(Cell::Null, Cell::Text),
+            Cell::Int(lane),
+            file[0].clone(),
+            file[1].clone(),
+            source,
+            file[2].clone(),
+            file[3].clone(),
+            Cell::Int(p.sum),
+        ]);
+        Ok(table)
+    }
+
+    /// A packet's kept values, as its `field_values` rows have them
+    /// (columns: packet, field, num, text), in the order they were kept,
+    /// from its segment file.
+    pub fn packet_values(&self, id: i64) -> Result<Table> {
+        let mut table = Table {
+            columns: ["packet", "field", "num", "text"]
+                .map(str::to_string)
+                .to_vec(),
+            rows: Vec::new(),
+            truncated: false,
+        };
+        let Some((seg, index, _)) = self.packet_segment(id)? else {
+            return Ok(table);
+        };
+        for v in seg.values_of(index)? {
+            table.rows.push(vec![
+                Cell::Text(v.packet),
+                Cell::Text(v.field),
+                v.num.map_or(Cell::Null, Cell::Real),
+                v.text.map_or(Cell::Null, Cell::Text),
+            ]);
+        }
+        Ok(table)
+    }
+
+    /// A run's findings, as `sql::run_findings` has them (columns: id,
+    /// severity, kind, message, lane, file, packet, the packet's receive
+    /// and packet time, the file's rel), in its order: problems first, then
+    /// by the packet's time (receive, else packet, else its id), then by
+    /// id. The times come from the segment files. At most `limit`,
+    /// `truncated` if there were more.
+    pub fn run_findings(&self, run: i64, limit: usize) -> Result<Table> {
+        let mut found = self.query(&sql::run_findings_untimed(run), usize::MAX)?;
+        let ranges = self.query(&sql::run_segment_ranges(run), usize::MAX)?;
+        let ranges: Vec<segment::Listed> = ranges
+            .rows
+            .iter()
+            .filter_map(|r| {
+                Some(segment::Listed {
+                    name: r[0].text()?.to_string(),
+                    first_packet: r[1].int()?,
+                    min: r[1].int()?,
+                    max: r[2].int()?,
+                })
+            })
+            .collect();
+        // The packets asked about, segment by segment.
+        let mut wanted: Vec<(usize, i64)> = found
+            .rows
+            .iter()
+            .filter_map(|r| r[6].int())
+            .filter_map(|id| {
+                let at = ranges.partition_point(|s| s.max < id);
+                ranges
+                    .get(at)
+                    .filter(|s| s.first_packet <= id)
+                    .map(|_| (at, id))
+            })
+            .collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut times: HashMap<i64, (Option<i64>, Option<i64>)> = HashMap::new();
+        let mut open: Option<(usize, segment::Segment)> = None;
+        for (at, id) in wanted {
+            if open.as_ref().is_none_or(|(i, _)| *i != at) {
+                open = Some((at, segment::open_listed(&self.segments, &ranges[at])?));
+            }
+            if let Some((_, seg)) = &open {
+                let p = seg.packet((id - seg.first_packet()) as u64)?;
+                times.insert(id, (p.receive_ns, p.packet_ns));
+            }
+        }
+        let mut rows: Vec<(bool, i64, i64, Vec<Cell>)> = std::mem::take(&mut found.rows)
+            .into_iter()
+            .map(|mut r| {
+                let packet = r[6].int();
+                let (receive, time) = packet
+                    .and_then(|id| times.get(&id).copied())
+                    .unwrap_or((None, None));
+                let order = receive.or(time).or(packet).unwrap_or(0);
+                let info = r[1].text() == Some("info");
+                let id = r[0].int().unwrap_or(0);
+                let rel = r.pop().unwrap_or(Cell::Null);
+                r.push(receive.map_or(Cell::Null, Cell::Int));
+                r.push(time.map_or(Cell::Null, Cell::Int));
+                r.push(rel);
+                (info, order, id, r)
+            })
+            .collect();
+        rows.sort_by_key(|r| (r.0, r.1, r.2));
+        let truncated = rows.len() > limit;
+        rows.truncate(limit);
+        let mut columns = found.columns;
+        let rel = columns.pop().unwrap_or_default();
+        columns.extend(["receive_ns".to_string(), "packet_ns".to_string(), rel]);
+        Ok(Table {
+            columns,
+            rows: rows.into_iter().map(|r| r.3).collect(),
+            truncated,
+        })
+    }
+
     /// The folder of segment files beside the store.
     pub fn segment_folder(&self) -> &Path {
         &self.segments

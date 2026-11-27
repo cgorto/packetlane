@@ -1523,7 +1523,7 @@ pub fn density(
 }
 
 /// Opens a listed segment, checking it is still the one listed.
-fn open_listed(folder: &Path, s: &Listed) -> Result<Segment> {
+pub fn open_listed(folder: &Path, s: &Listed) -> Result<Segment> {
     let segment = Segment::open(&folder.join(&s.name))?;
     if segment.first_packet() != s.first_packet {
         return Err(format!("{}: replaced since it was listed", s.name).into());

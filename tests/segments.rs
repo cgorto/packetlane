@@ -562,7 +562,11 @@ fn kept_entry(apid: u16, i: u32, receive_ns: i64, packet_ns: i64) -> Vec<u8> {
     time.extend_from_slice(&(((packet_ns % 1_000_000_000) / 1_000) as u32).to_be_bytes());
     let mut body = ((i * 7_919 % 65_536) as u16).to_be_bytes().to_vec();
     body.push((i % 2) as u8);
-    body.extend_from_slice(if i.is_multiple_of(3) { b"UNIT" } else { b"spar" });
+    body.extend_from_slice(if i.is_multiple_of(3) {
+        b"UNIT"
+    } else {
+        b"spar"
+    });
     body.extend_from_slice(&[(i % 5) as u8, 7, (i % 251) as u8]);
     let f = if i.is_multiple_of(97) {
         f32::NAN
@@ -696,60 +700,52 @@ fn series_rule_in_sql(
 ) -> Vec<(i64, f64, f64, i64)> {
     let c = clock.packet_column();
     let width = bucket_width(from, to, buckets);
-    let mut params: Vec<sql::Param> = vec![from.into(), to.into(), width.into(), lane.into()];
-    let mut rows = Vec::new();
-    for (a, z, s, kept, _) in series_levels(store, clock, lane, field) {
-        let n = params.len() + 1;
-        rows.push(format!("(?{n}, ?{}, ?{}, ?{})", n + 1, n + 2, n + 3));
-        params.extend([
-            a.into(),
-            z.into(),
-            i64::from(s).into(),
-            i64::from(kept).into(),
-        ]);
-    }
     let (value, join, filter) = match field {
         None => (
             "(p.receive_ns - p.packet_ns) / 1000000.0",
-            String::new(),
-            "p.receive_ns IS NOT NULL AND p.packet_ns IS NOT NULL".to_string(),
+            "",
+            "p.receive_ns IS NOT NULL AND p.packet_ns IS NOT NULL",
         ),
-        Some((packet, name)) => {
-            let n = params.len() + 1;
-            params.extend([packet.into(), name.into()]);
-            (
-                "v.num",
-                "JOIN field_values v ON v.packet_id = p.id".to_string(),
-                format!(
-                    "v.packet = ?{n} AND v.field = ?{} AND v.num IS NOT NULL",
-                    n + 1
-                ),
-            )
-        }
+        Some(_) => (
+            "v.num",
+            "CROSS JOIN field_values v INDEXED BY field_values_packet ON v.packet_id = p.id",
+            "v.packet = ?8 AND v.field = ?9 AND v.num IS NOT NULL",
+        ),
     };
-    let table = store
-        .query(
-            &Query::new(
-                format!(
-                    "WITH lv(a, z, s, kept) AS (VALUES {}),
-                     x AS (
-                       SELECT p.{c} AS t, {value} AS num, lv.s AS s, lv.kept AS kept,
-                              ((p.{c} >> lv.s) << lv.s) AS b0
-                       FROM packets p {join} JOIN lv ON p.id BETWEEN lv.a AND lv.z
-                       WHERE p.lane_id = ?4 AND p.{c} BETWEEN ?1 AND ?2 AND {filter})
-                     SELECT CASE WHEN kept AND ?3 >= (1 << s) AND b0 >= ?1
-                                      AND b0 + (1 << s) - 1 <= ?2
-                                 THEN (b0 - ?1) / ?3 ELSE (t - ?1) / ?3 END AS bin,
-                            MIN(num), MAX(num), COUNT(*)
-                     FROM x GROUP BY bin ORDER BY bin",
-                    rows.join(", ")
-                ),
-                params,
+    // Segment by segment, each read by its range of ids, then merged as
+    // `merge_series` merges.
+    let mut parts = Vec::new();
+    for (a, z, s, kept, _) in series_levels(store, clock, lane, field) {
+        let (packet, name) = field.unwrap_or(("", ""));
+        let q = Query::new(
+            format!(
+                "SELECT CASE WHEN ?7 AND ?3 >= (1 << ?6) AND ((t >> ?6) << ?6) >= ?1
+                              AND ((t >> ?6) << ?6) + (1 << ?6) - 1 <= ?2
+                         THEN (((t >> ?6) << ?6) - ?1) / ?3 ELSE (t - ?1) / ?3 END AS bin,
+                        MIN(num), MAX(num), COUNT(*)
+                 FROM (SELECT p.{c} AS t, {value} AS num
+                       FROM packets p {join}
+                       WHERE p.id BETWEEN ?4 AND ?5 AND p.lane_id = ?10
+                         AND p.{c} BETWEEN ?1 AND ?2 AND {filter})
+                 GROUP BY bin"
             ),
-            usize::MAX,
-        )
-        .unwrap();
-    series_rows(&table)
+            vec![
+                from.into(),
+                to.into(),
+                width.into(),
+                a.into(),
+                z.into(),
+                i64::from(s).into(),
+                i64::from(kept).into(),
+                packet.into(),
+                name.into(),
+                lane.into(),
+            ],
+        );
+        parts.push(store.query(&q, usize::MAX).unwrap());
+    }
+    let parts: Vec<&sql::Table> = parts.iter().collect();
+    series_rows(&sql::merge_series(&parts))
 }
 
 /// Plots from the segments against the rows, for every lane and kept field
@@ -760,7 +756,8 @@ fn series_rule_in_sql(
 /// series were read partly from stored buckets and partly point by point,
 /// how many had buckets that were not kept, and how many fine plots on a
 /// time clock were compared.
-fn check_series(store: &Store) -> (usize, usize, usize) {
+fn check_series(db: &Path) -> (usize, usize, usize) {
+    let store = &Store::open_read_only(db, Duration::from_secs(600)).unwrap();
     let mut mixed = 0;
     let mut fine = 0;
     let mut skipped = 0;
@@ -795,6 +792,7 @@ fn check_series(store: &Store) -> (usize, usize, usize) {
     }
     assert!(!series.is_empty());
     for (lane, name) in &series {
+        let store = &Store::open_read_only(db, Duration::from_secs(600)).unwrap();
         let field = name.as_ref().map(|(p, f)| (p.as_str(), f.as_str()));
         for clock in Clock::ALL {
             let c = clock.packet_column();
@@ -858,7 +856,11 @@ fn check_series(store: &Store) -> (usize, usize, usize) {
                 let want = series_rule_in_sql(store, clock, *lane, field, from, to, buckets);
                 assert_eq!(got, want, "rule {}", what(from, to, buckets));
                 // Totals, lowest and highest are those of the window.
-                let all = series_rule_in_sql(store, clock, *lane, field, from, to, 1);
+                let q = match field {
+                    Some((p, f)) => sql::value_series(1, clock, *lane, p, f, from, to, 1),
+                    None => sql::lag_series(1, clock, *lane, from, to, 1),
+                };
+                let all = series_rows(&store.query(&q, usize::MAX).unwrap());
                 let sum = |rows: &[(i64, f64, f64, i64)]| rows.iter().map(|r| r.3).sum::<i64>();
                 assert_eq!(sum(&got), sum(&all), "total {}", what(from, to, buckets));
                 let lo = got.iter().map(|r| r.1).fold(f64::INFINITY, f64::min);
@@ -881,13 +883,229 @@ fn check_series(store: &Store) -> (usize, usize, usize) {
 fn plots_from_segments_match_the_rows() {
     let scratch = Scratch::new();
     kept_run(&scratch);
-    demo(&scratch, 60);
+    multi_source(&scratch);
     scratch.ingest();
     let store = scratch.reader();
-    let (mixed, skipped, fine) = check_series(&store);
+    let (mixed, skipped, fine) = check_series(&scratch.db());
     assert!(fine > 0, "no fine plot on a time clock");
     assert!(mixed > 0, "no plot read partly from stored buckets");
     assert!(skipped > 0, "no series with buckets not kept");
+    // The demo's own kept fields.
+    let scratch = Scratch::new();
+    demo(&scratch, 60);
+    scratch.ingest();
+    check_series(&scratch.db());
+}
+
+/// Packet detail and kept values from the segments against the rows, for
+/// the first, last and every 97th packet of each segment and for packets
+/// picked out by what they hold. Returns how many were compared.
+fn check_details(store: &Store) -> usize {
+    let mut ids: Vec<i64> = Vec::new();
+    for (first, last, _) in listed_segments(store) {
+        ids.extend([first, last, first + (last - first) / 2]);
+        ids.extend((first..=last).step_by(97));
+    }
+    for pick in [
+        // No packet time; neither time; a text; a text and a number; an
+        // array; a number that is not one.
+        "SELECT id FROM packets WHERE packet_ns IS NULL LIMIT 5",
+        "SELECT id FROM packets WHERE packet_ns IS NULL AND receive_ns IS NULL LIMIT 5",
+        "SELECT packet_id FROM field_values WHERE text IS NOT NULL AND num IS NULL LIMIT 5",
+        "SELECT packet_id FROM field_values WHERE text IS NOT NULL AND num IS NOT NULL LIMIT 5",
+        "SELECT packet_id FROM field_values WHERE text LIKE '[%' LIMIT 5",
+        "SELECT packet_id FROM field_values WHERE field = 'F' AND num IS NULL LIMIT 5",
+    ] {
+        ids.extend(ask(store, pick, vec![]).iter().map(|r| r[0]));
+    }
+    // And packets that are not there.
+    ids.extend([0, -1, i64::MAX]);
+    for &id in &ids {
+        assert_eq!(
+            store.packet_detail(id).unwrap(),
+            store.query(&sql::packet_detail(id), 1).unwrap(),
+            "packet {id}"
+        );
+        let rows = store
+            .query(
+                &Query::new(
+                    "SELECT packet, field, num, text FROM field_values
+                     WHERE packet_id = ? ORDER BY rowid",
+                    vec![id.into()],
+                ),
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(store.packet_values(id).unwrap(), rows, "values of {id}");
+    }
+    ids.len()
+}
+
+/// A run's findings with their packets' times from the segments against
+/// `sql::run_findings`, whole and cut short.
+fn check_findings(store: &Store) -> usize {
+    let all = store.query(&sql::run_findings(1), usize::MAX).unwrap();
+    for limit in [usize::MAX, all.rows.len(), 3, 1] {
+        assert_eq!(
+            store.run_findings(1, limit).unwrap(),
+            store.query(&sql::run_findings(1), limit).unwrap(),
+            "limit {limit}"
+        );
+    }
+    all.rows.len()
+}
+
+#[test]
+fn packet_details_values_and_findings_from_segments_match_the_rows() {
+    let scratch = Scratch::new();
+    kept_run(&scratch);
+    multi_source(&scratch);
+    scratch.ingest();
+    let store = scratch.reader();
+    // Values on packets with neither time are kept.
+    let timeless = ask(
+        &store,
+        "SELECT COUNT(*) FROM field_values v JOIN packets p ON p.id = v.packet_id
+         WHERE p.receive_ns IS NULL AND p.packet_ns IS NULL",
+        vec![],
+    );
+    assert!(timeless[0][0] > 0);
+    assert!(check_details(&store) > 100);
+    check_findings(&store);
+    // The demo, whose findings point at packets of every file.
+    let scratch = Scratch::new();
+    demo(&scratch, 60);
+    scratch.ingest();
+    let store = scratch.reader();
+    check_details(&store);
+    assert!(check_findings(&store) > 3, "too few findings to compare");
+}
+
+/// The directory of a segment's bytes: (kind, clock, record size, offset,
+/// length, where the entry starts).
+fn directory(bytes: &[u8]) -> Vec<(u16, u8, u32, u64, u64, usize)> {
+    let len = bytes.len();
+    let n = u32::from_le_bytes(bytes[len - 16..len - 12].try_into().unwrap()) as usize;
+    let at = len - 32 - n * 32;
+    (0..n)
+        .map(|i| {
+            let e = &bytes[at + i * 32..at + i * 32 + 32];
+            (
+                u16::from_le_bytes([e[0], e[1]]),
+                e[2],
+                u32::from_le_bytes(e[4..8].try_into().unwrap()),
+                u64::from_le_bytes(e[8..16].try_into().unwrap()),
+                u64::from_le_bytes(e[16..24].try_into().unwrap()),
+                at + i * 32,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn damaged_kept_value_sections_are_errors_not_panics() {
+    let scratch = Scratch::new();
+    kept_run(&scratch);
+    scratch.ingest();
+    let store = scratch.reader();
+    let folder = segment::folder_for(&scratch.db());
+    // The dense file's segment, its first packet and lane.
+    let r = ask(
+        &store,
+        "SELECT s.first_packet, p.lane_id FROM segments s
+         JOIN files f ON f.id = s.file_id JOIN packets p ON p.id = s.first_packet
+         WHERE f.rel = 'bench/dense.bin'",
+        vec![],
+    );
+    let (first, lane) = (r[0][0], r[0][1]);
+    let name = format!(
+        "{}.seg",
+        ask(
+            &store,
+            "SELECT file_id FROM segments WHERE first_packet = ?",
+            vec![first.into()]
+        )[0][0]
+    );
+    let path = folder.join(&name);
+    let good = fs::read(&path).unwrap();
+    let reads = |store: &Store| -> [bool; 4] {
+        [
+            store
+                .series(
+                    1,
+                    Clock::Receive,
+                    lane,
+                    Some(("HK", "V")),
+                    i64::MIN,
+                    i64::MAX,
+                    100,
+                )
+                .is_ok(),
+            store
+                .series(1, Clock::Packet, lane, None, i64::MIN, i64::MAX, 100)
+                .is_ok(),
+            store.packet_values(first).is_ok(),
+            store
+                .packet_items(1, Clock::Receive, i64::MIN, i64::MAX, 10)
+                .is_ok(),
+        ]
+    };
+    assert_eq!(reads(&store), [true; 4]);
+    let entry = |kind: u16, clock: u8| {
+        *directory(&good)
+            .iter()
+            .find(|e| e.0 == kind && e.1 == clock)
+            .unwrap()
+    };
+    let put_u64 =
+        |b: &mut Vec<u8>, at: usize, v: u64| b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    let mut cases: Vec<(String, Vec<u8>)> = Vec::new();
+    // Each new section with a wrong record size, and cut short by a byte.
+    for kind in 5..=10u16 {
+        for e in directory(&good).into_iter().filter(|e| e.0 == kind) {
+            let mut b = good.clone();
+            b[e.5 + 4] ^= 1;
+            cases.push((format!("kind {kind} record size"), b));
+            if e.2 != 0 && e.4 > 0 {
+                let mut b = good.clone();
+                put_u64(&mut b, e.5 + 16, e.4 - 1);
+                cases.push((format!("kind {kind} cut short"), b));
+            }
+        }
+    }
+    // Records that pass the directory but point outside their sections:
+    // a group running past its points and its buckets, a value naming no
+    // series, a text past the texts section, a series name cut short.
+    let groups = entry(9, 0);
+    let mut b = good.clone();
+    put_u64(&mut b, groups.3 as usize + 16, u64::MAX - 3);
+    cases.push(("group count".into(), b));
+    let mut b = good.clone();
+    put_u64(&mut b, groups.3 as usize + 24, u64::MAX);
+    cases.push(("group buckets".into(), b));
+    let values = entry(6, 0);
+    let mut b = good.clone();
+    b[values.3 as usize + 4..values.3 as usize + 7].copy_from_slice(&[0xFF, 0xFF, 0x7F]);
+    cases.push(("value series".into(), b));
+    let texts = entry(7, 0);
+    let first_text = (0..values.4 / 24)
+        .map(|i| values.3 as usize + i as usize * 24)
+        .find(|&at| good[at + 7] & 2 != 0)
+        .unwrap();
+    let mut b = good.clone();
+    put_u64(&mut b, first_text + 16, texts.4 - 2);
+    cases.push(("text offset".into(), b));
+    let names = entry(5, 0);
+    let mut b = good.clone();
+    put_u64(&mut b, names.5 + 16, names.4 - 1);
+    cases.push(("series names cut".into(), b));
+    for (what, bytes) in &cases {
+        fs::write(&path, bytes).unwrap();
+        let got = reads(&scratch.reader());
+        assert!(got.iter().any(|ok| !ok), "{what}: {got:?}");
+    }
+    fs::write(&path, &good).unwrap();
+    assert_eq!(reads(&scratch.reader()), [true; 4]);
 }
 
 #[test]

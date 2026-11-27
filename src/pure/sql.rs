@@ -424,6 +424,29 @@ pub fn run_findings(run: i64) -> Query {
     )
 }
 
+/// A run's findings without their packets' times, which come from the
+/// segment files; see [`run_findings`] for the order they are shown in.
+/// Columns: id, severity, kind, message, lane, file, packet, file's rel.
+pub fn run_findings_untimed(run: i64) -> Query {
+    Query::new(
+        "SELECT x.id, x.severity, x.kind, x.message, x.lane_id, x.file_id, x.packet_id,
+                COALESCE((SELECT f.rel FROM files f WHERE f.id = x.file_id), '')
+         FROM findings x WHERE x.run_id = ? ORDER BY x.id",
+        vec![run.into()],
+    )
+}
+
+/// The segments of a run, in id order. Columns: name, first packet id,
+/// last packet id.
+pub fn run_segment_ranges(run: i64) -> Query {
+    Query::new(
+        "SELECT name, first_packet, last_packet FROM segments
+         WHERE file_id IN (SELECT id FROM files WHERE run_id = ?)
+         ORDER BY first_packet",
+        vec![run.into()],
+    )
+}
+
 /// Bucket width that divides `from..=to` into at most `buckets` buckets.
 pub fn bucket_width(from: i64, to: i64, buckets: i64) -> i64 {
     let span = to.saturating_sub(from).saturating_add(1).max(1);
@@ -758,6 +781,22 @@ pub fn segments_in_window(run: i64, clock: Clock, from: i64, to: i64) -> Query {
         ),
         vec![run.into(), to.into(), from.into()],
     )
+}
+
+/// The segment holding a packet, and its file. Columns: name, first packet
+/// id, path, rel, run id, format.
+pub fn packet_segment(id: i64) -> Query {
+    Query::new(
+        "SELECT s.name, s.first_packet, f.path, f.rel, f.run_id, f.format
+         FROM segments s JOIN files f ON f.id = s.file_id
+         WHERE ?1 BETWEEN s.first_packet AND s.last_packet",
+        vec![id.into()],
+    )
+}
+
+/// A lane's source. Columns: source.
+pub fn lane_source(lane: i64) -> Query {
+    Query::new("SELECT source FROM lanes WHERE id = ?", vec![lane.into()])
 }
 
 /// Recomputes the per-lane totals and time ranges for a run.

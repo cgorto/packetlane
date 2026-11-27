@@ -243,7 +243,7 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
                 &store.query(&sql::run_row(run), 1)?,
                 &store.query(&sql::run_lanes(run), 100_000)?,
                 &store.query(&sql::run_files(run), 100_000)?,
-                &store.query(&sql::run_findings(run), 10_000)?,
+                &store.run_findings(run, 10_000)?,
                 &series,
             )
         }
@@ -292,7 +292,9 @@ fn execute(shared: &Shared, command: Command) -> Result<Response> {
         }
         Command::Packet { id } => {
             let store = reader()?;
-            let detail = store.query(&sql::packet_detail(id), 1)?;
+            // The packet's record from its segment file, its file and
+            // source from the store.
+            let detail = store.packet_detail(id)?;
             match packet_location(&detail) {
                 None => render_packet(&detail, Err("Packet not found"), ""),
                 Some((path, offset, length, sum, run)) => {
