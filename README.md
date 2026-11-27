@@ -342,6 +342,10 @@ been built here.
 - **Compare two runs** of the same scenario on a shared time axis.
 - **Live tail** of a log that is still being written, and **live ingest**
   from a TCP or UDP port a simulator sends telemetry on.
+- **A watch panel**: choose a packet (or APID) and see its fields as a
+  table that follows the cursor or the newest packet, each value coloured
+  by how it changed from the packet before: green for up, red for down,
+  stronger for a bigger change. Most useful with live ingest.
 - **Problem report export** to attach to a ticket.
 - Other channel codes: convolutional, turbo and LDPC (a file must hold hard
   decisions that are already frame-aligned; Reed-Solomon and BCH are the only
