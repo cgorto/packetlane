@@ -510,3 +510,60 @@ fn one_packet_repeated_is_compared_in_bounded_memory() {
         .collect();
     assert_eq!(missing.len(), 2, "{:?}", runs[0]);
 }
+
+/// Each file read commits on its own, and the end of an ingest (lane
+/// totals, the comparison of sources) commits after them. If that end
+/// fails, the next ingest of the run does it, though no file has changed.
+#[test]
+fn an_ingest_that_did_not_finish_is_finished_by_the_next() {
+    let scratch = Scratch::new();
+    let run = scratch.ingest("run", &awkward_run());
+    check(&scratch.db());
+    let lanes_agree = |db: &Path| -> bool {
+        let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM lanes l WHERE l.kind = 'packet'
+               AND l.count != (SELECT COUNT(*) FROM oracle_packets p WHERE p.lane_id = l.id)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 0
+    };
+    assert!(lanes_agree(&scratch.db()));
+    // One file shrinks; while it is read again, another file's segment is
+    // away, so the comparison of sources fails after the file committed.
+    std::fs::write(run.join("b/tlm.bin"), &awkward_run()[1].1[..100]).unwrap();
+    let away = {
+        let conn =
+            Connection::open_with_flags(scratch.db(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let name: String = conn
+            .query_row(
+                "SELECT s.name FROM segments s JOIN files f ON f.id = s.file_id
+                 WHERE f.rel = 'a/tlm.bin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        packetlane::shell::segment::folder_for(&scratch.db()).join(name)
+    };
+    let kept = scratch.0.join("kept.seg");
+    std::fs::rename(&away, &kept).unwrap();
+    {
+        let mut store = Store::open_with_oracle(&scratch.db()).unwrap();
+        let canonical = std::fs::canonicalize(&run).unwrap();
+        assert!(ingest_targets(&mut store, &[canonical], None, None, None).is_err());
+    }
+    std::fs::rename(&kept, &away).unwrap();
+    // The file's rows are in, its findings and lane totals are not.
+    {
+        let conn =
+            Connection::open_with_flags(scratch.db(), OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_ne!(stored(&conn, 1), oracle(&conn, 1));
+    }
+    assert!(!lanes_agree(&scratch.db()));
+    // Nothing changes now, and the run is finished all the same.
+    scratch.ingest_again(&run);
+    check(&scratch.db());
+    assert!(lanes_agree(&scratch.db()));
+}

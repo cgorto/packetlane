@@ -14,6 +14,11 @@ CREATE TABLE IF NOT EXISTS runs (
   config TEXT NOT NULL DEFAULT '',
   ingested_ns INTEGER NOT NULL DEFAULT 0
 );
+-- Runs whose end-of-ingest step (lane totals, the comparison of sources)
+-- is owed: a file of theirs changed and that step has not committed since.
+CREATE TABLE IF NOT EXISTS unfinished (
+  run_id INTEGER PRIMARY KEY REFERENCES runs(id)
+);
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY,
   run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -552,6 +557,15 @@ pub const INSERT_FILE_SERIES: &str =
 pub const INSERT_FINDING: &str = "INSERT INTO findings
      (run_id, file_id, lane_id, packet_id, severity, kind, message) VALUES (?, ?, ?, ?, ?, ?, ?)";
 pub const DELETE_CROSS_FINDINGS: &str = "DELETE FROM findings WHERE run_id = ? AND file_id IS NULL";
+/// Records that a run's end-of-ingest step is owed; in the transaction
+/// that changes one of its files. Takes the run id.
+pub const MARK_UNFINISHED: &str = "INSERT OR IGNORE INTO unfinished (run_id) VALUES (?)";
+/// Whether a run's end-of-ingest step is owed. Takes the run id; one row if
+/// so.
+pub const IS_UNFINISHED: &str = "SELECT 1 FROM unfinished WHERE run_id = ?";
+/// Clears the debt; in the transaction of the end-of-ingest step. Takes the
+/// run id.
+pub const CLEAR_UNFINISHED: &str = "DELETE FROM unfinished WHERE run_id = ?";
 
 // ---- segments ------------------------------------------------------------------
 //

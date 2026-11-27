@@ -735,6 +735,7 @@ impl Store {
             for statement in sql::RESET_RUN {
                 tx.execute(statement, params![run_id])?;
             }
+            tx.execute(sql::MARK_UNFINISHED, params![run_id])?;
             tx.commit()?;
             for name in old_segments {
                 discard_segment(&self.segments, &name);
@@ -770,7 +771,14 @@ impl Store {
         }
 
         phases.mark("reading files");
-        if changed {
+        // Also when no file changed now but the step did not finish after
+        // an earlier ingest that changed one.
+        let owed = self
+            .conn
+            .query_row(sql::IS_UNFINISHED, params![run_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if changed || owed {
             let tx = self.conn.transaction()?;
             tx.execute(sql::LANES_FROM_SEGMENTS, params![run_id])?;
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
@@ -809,6 +817,7 @@ impl Store {
                     ],
                 )?;
             }
+            tx.execute(sql::CLEAR_UNFINISHED, params![run_id])?;
             tx.commit()?;
             phases.mark("storing the findings");
         }
@@ -879,6 +888,9 @@ impl Store {
         let decoder = decoder_for(format, config);
         if format != Format::Text && decoder.is_none() {
             // Nothing to store. Keep the removal of an earlier version, if any.
+            if known.is_some() {
+                tx.execute(sql::MARK_UNFINISHED, params![run_id])?;
+            }
             tx.commit()?;
             if let Some(name) = &old_segment {
                 discard_segment(&self.segments, name);
@@ -1019,6 +1031,8 @@ impl Store {
                 ])?;
             }
         }
+        // The run's end-of-ingest step is owed until it commits.
+        tx.execute(sql::MARK_UNFINISHED, params![run_id])?;
         if let Err(e) = tx.commit() {
             if let Some(w) = &written {
                 discard_segment(&self.segments, &w.name);
