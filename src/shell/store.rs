@@ -16,7 +16,8 @@ use serde::Serialize;
 use crate::pure::config::{Config, SourceInfo};
 use crate::pure::cross::{CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Decoder, Format, decoder_for};
-use crate::pure::ingest::{LaneKey, SEVERITY_PROBLEM, ptype_code};
+use crate::pure::finding::{Kind, Severity};
+use crate::pure::ingest::{LaneKey, ptype_code};
 use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
@@ -112,6 +113,9 @@ fn collect(stmt: &mut rusqlite::Statement<'_>, params: &[Param], limit: usize) -
     })
 }
 
+/// See where it is set, in [`Store::open`].
+const WRITE_CACHE_KIB: i64 = 32 * 1024;
+
 fn run_query(conn: &Connection, q: &Query, limit: usize) -> Result<Table> {
     let mut stmt = conn.prepare_cached(&q.sql)?;
     collect(&mut stmt, &q.params, limit)
@@ -123,6 +127,11 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Pages of the store held in memory while writing, in KiB (negative
+        // means a size, not a page count). SQLite's own 2 MB is less than
+        // one index of a large run, and a run with many lanes writes all
+        // over its lane-first indexes.
+        conn.pragma_update(None, "cache_size", -WRITE_CACHE_KIB)?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 0 && version != sql::SCHEMA_VERSION {
             return Err(format!(
@@ -245,10 +254,13 @@ impl Store {
 
         if changed {
             let tx = self.conn.transaction()?;
-            tx.execute(sql::REFRESH_PACKET_LANES, params![run_id])?;
+            for statement in sql::REFRESH_PACKET_LANES {
+                tx.execute(statement, params![run_id])?;
+            }
             tx.execute(sql::REFRESH_LOG_LANES, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE, params![run_id])?;
             tx.execute(sql::CLEAR_COARSE_META, params![run_id])?;
+            tx.execute(sql::CLEAR_COARSE_SERIES, params![run_id])?;
             let extents = run_query(&tx, &sql::run_extents(run_id), 1)?;
             if let Some(row) = extents.rows.first() {
                 for (i, clock) in sql::Clock::ALL.into_iter().enumerate() {
@@ -257,7 +269,18 @@ impl Store {
                     if let (Some(min), Some(max)) = (row[i * 2].int(), row[i * 2 + 1].int())
                         && max.checked_sub(min).is_some()
                     {
-                        for q in sql::build_coarse(run_id, clock, min, max) {
+                        let width = sql::bucket_width(min, max, sql::COARSE_BUCKETS);
+                        let series = sql::build_coarse_series(
+                            run_id,
+                            clock,
+                            min,
+                            width,
+                            sql::SERIES_MIN_PACKETS,
+                        );
+                        for q in sql::build_coarse(run_id, clock, min, max)
+                            .iter()
+                            .chain(&series)
+                        {
                             tx.execute(&q.sql, params_from_iter(q.params.iter().map(bind)))?;
                         }
                     }
@@ -270,10 +293,10 @@ impl Store {
                     params![
                         run_id,
                         Option::<i64>::None,
-                        finding.lane_id,
-                        finding.packet_id,
-                        finding.severity,
-                        finding.kind,
+                        finding.lane,
+                        finding.packet,
+                        finding.severity.as_str(),
+                        finding.kind.name(),
                         finding.message
                     ],
                 )?;
@@ -398,8 +421,8 @@ impl Store {
                     file_id,
                     None::<i64>,
                     None::<i64>,
-                    SEVERITY_PROBLEM,
-                    "truncated",
+                    Severity::Problem.as_str(),
+                    Kind::Truncated.name(),
                     message
                 ],
             )?;
@@ -473,6 +496,9 @@ fn ingest_packets(
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut check = FileCheck::new(config, source);
     let mut end = None;
+    // How many numbers were kept of each field of each lane, for the list
+    // of what the run has to plot.
+    let mut series: HashMap<(i64, &str, &str), i64> = HashMap::new();
 
     let mut records = Records::new(BufReader::new(file), decoder);
     for item in &mut records {
@@ -507,11 +533,18 @@ fn ingest_packets(
             insert_value.execute(params![
                 packet_id, file_id, v.packet, v.field, v.num, v.text
             ])?;
+            if v.num.is_some() {
+                *series.entry((lane_id, v.packet, v.field)).or_default() += 1;
+            }
         }
+    }
+    let mut insert_series = conn.prepare_cached(sql::INSERT_FILE_SERIES)?;
+    for ((lane_id, packet, field), count) in series {
+        insert_series.execute(params![file_id, lane_id, packet, field, count])?;
     }
 
     let report = check.finish();
-    let findings = report.rows(&records.notices(), end.as_ref());
+    let findings = report.findings(&records.notices(), end.as_ref());
     let mut insert_finding = conn.prepare_cached(sql::INSERT_FINDING)?;
     for finding in &findings {
         let lane_id = match finding.lane {
@@ -519,7 +552,7 @@ fn ingest_packets(
             None => None,
         };
         let packet_id = finding
-            .packet_index
+            .packet
             .and_then(|i| i64::try_from(i).ok())
             .map(|i| base_id + i);
         insert_finding.execute(params![
@@ -527,8 +560,8 @@ fn ingest_packets(
             file_id,
             lane_id,
             packet_id,
-            finding.severity,
-            finding.kind,
+            finding.severity.as_str(),
+            finding.kind.name(),
             finding.message
         ])?;
     }
@@ -620,31 +653,42 @@ fn ingest_text(
 fn cross_findings(conn: &Connection, run_id: i64) -> Result<Vec<CrossFinding>> {
     let mut out = Vec::new();
 
+    // Every pair is compared in one query; the findings are then made in
+    // the order the pairs are listed, which is the order they are stored in.
+    // A run from one source has no pairs, and its packets are not read.
     let pairs = run_query(conn, &sql::lane_pairs(run_id), usize::MAX)?;
+    let compared = if pairs.rows.is_empty() {
+        Vec::new()
+    } else {
+        run_query(conn, &sql::hop_compare_all(run_id), usize::MAX)?.rows
+    };
+    let compared: HashMap<(i64, i64), &Vec<Cell>> = compared
+        .iter()
+        .filter_map(|r| Some(((r[0].int()?, r[1].int()?), r)))
+        .collect();
     for row in &pairs.rows {
         let (Some(a), Some(source_a), Some(b), Some(source_b)) =
             (row[0].int(), row[1].text(), row[2].int(), row[3].text())
         else {
             continue;
         };
-        let compared = run_query(conn, &sql::hop_compare(a, b), 1)?;
-        if let Some(r) = compared.rows.first() {
-            let shared = r[0].int().unwrap_or(0);
-            let missing = r[1].int().unwrap_or(0);
+        if let Some(r) = compared.get(&(a, b)) {
+            let shared = r[2].int().unwrap_or(0);
+            let missing = r[3].int().unwrap_or(0);
             out.extend(hop_finding(
                 a,
                 source_a,
                 source_b,
                 shared,
                 missing,
-                r[2].int(),
+                r[4].int(),
             ));
         }
     }
 
     let mixed = run_query(
         conn,
-        &sql::lanes_with_finding(run_id, "interleaved"),
+        &sql::lanes_with_finding(run_id, Kind::Interleaved.name()),
         usize::MAX,
     )?;
     for row in &mixed.rows {

@@ -148,6 +148,10 @@ Limits of working from counters alone are listed at the top of
   file by name and times as text.
 - `packetlane query` and the SQL box in the UI accept one statement that
   reads. The connection they use cannot write.
+- A store made by an earlier build with a different layout is refused, and
+  says so: delete it and ingest again. Nothing in it is not in the logs.
+- Writing uses up to about 80 MB of memory whatever the size of the run,
+  most of it the store's page cache.
 
 ### Timeline
 
@@ -179,11 +183,12 @@ Limits of working from counters alone are listed at the top of
   findings are drawn as vertical lines, and the pointer marks the same
   moment on every plot.
 
-  A plot reads the packets in view each time the view moves; nothing is
-  precomputed for it as it is for the lanes. On a run of 900,000 packets
-  with a million kept values, a whole-run plot takes 0.1 to 0.2 s and a
-  zoomed-in one a few milliseconds, and opening the run takes 0.4 s longer
-  than without kept values. Expect ten times that at ten times the size.
+  A plot reads only its own lane's packets in view. For a lane with more
+  than about 130,000 packets the store also keeps, at ingest, the lowest
+  and highest value in each of 16,384 buckets across the run, and a view
+  wide enough is drawn from those: a whole-run plot takes about 5 ms on a
+  run of ten million packets. A stored bucket is drawn in the plot column
+  its start falls in, so a value can sit one column early.
 - The view (run, clock, range, lanes, plots, selection, search) is kept in
   the address, so it can be bookmarked while the server is running.
 
@@ -376,13 +381,52 @@ been built here.
 ```
 src/pure/     functional core: decoders, frames and codes, checks, config, SQL text, HTTP and API as values.
               pipeline.rs is where a file's records become rows and findings, for the store and for `check` alike
+              finding.rs is the one shape every check reports in, and the list of finding kinds
 src/shell/    imperative shell: files, SQLite, sockets, command line
 web/          the page: structure, style, script (embedded at build time)
 tests/        end-to-end tests, decoders against damaged input, and the test
               that keeps I/O out of src/pure
+              load.rs measures large runs and is run only when asked for;
+              store_sql.rs pins which index each view of the timeline uses
+tools/        ui-load.js measures the page in a headless Chrome
 docs/         architecture.md, parsing.md
 container/    development container stub and editor settings
 ```
+
+## Load tests
+
+Two tests measure large runs. Neither runs with `cargo test`, because they
+take minutes and gigabytes.
+
+```
+cargo test --release --test load -- --ignored --nocapture --test-threads 1
+```
+
+generates a long run (few streams, a million packets) and a wide one (900
+lanes from three hosts, values kept and limits on every stream), ingests
+each with the built program, and prints how long ingest took, the memory it
+held, and how long the server took to answer each request the page makes,
+at four zoom levels and while another ingest is running. `LOAD_PACKETS`
+sets the size and `LOAD_DIR` keeps the stores; the top of `tests/load.rs`
+lists the other settings. It fails on what does not depend on the machine:
+packets not stored, an answer too large to send, ingest holding a run in
+memory. Times fail it only if `LOAD_BUDGET_MS` is set.
+
+To see what a change did, run once with `LOAD_DIR=before`, make the
+change, and run again with `LOAD_DIR=after LOAD_BASELINE=before`: each
+time is printed with its change, and marked where that is more than the
+times move on their own. `LOAD_PACKETS=300000` does both runs in under a
+minute.
+
+```
+packetlane serve --db store.db --root <run folder>
+node tools/ui-load.js '<the URL that printed>' [--run N] [--budget ms]
+```
+
+drives the page in a headless Chrome through opening, zooming, panning,
+plots, hovering, jumping to a problem and searching, and prints for each
+how long the page took to settle and the longest it could not respond. It
+needs Node 22 or later and Chrome, and nothing else.
 
 ## Licence
 

@@ -191,7 +191,10 @@ fn the_read_only_store_cannot_be_made_to_write() {
         assert!(reader.query_user(&sql, 10).is_err(), "{sql}");
     }
     assert!(!other.exists());
-    assert_eq!(count(&reader, "pragma user_version"), 1);
+    assert_eq!(
+        count(&reader, "pragma user_version"),
+        packetlane::pure::sql::SCHEMA_VERSION
+    );
     // A statement that would run forever is stopped by the time budget.
     let endless =
         "with recursive c(x) as (select 1 union all select x + 1 from c) select count(*) from c";

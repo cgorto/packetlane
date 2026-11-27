@@ -10,6 +10,7 @@ pub mod continuity;
 pub mod cosmos_defs;
 pub mod cross;
 pub mod decode;
+pub mod finding;
 pub mod format;
 pub mod frame;
 pub mod http;

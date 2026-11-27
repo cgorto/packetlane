@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::pure::ccsds::{IDLE_APID, PacketType, PrimaryHeader, SEQ_MODULUS};
+use crate::pure::finding::{Finding, Kind, Severity};
 
 /// Largest forward jump still treated as lost packets, not a new counter.
 const MAX_GAP: u16 = 1024;
@@ -66,7 +67,7 @@ impl fmt::Display for StreamKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FindingKind {
+pub enum SeqKind {
     Gap {
         expected: u16,
         got: u16,
@@ -95,29 +96,53 @@ pub enum FindingKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Finding {
+pub struct SeqFinding {
     pub key: StreamKey,
-    pub kind: FindingKind,
+    pub kind: SeqKind,
     /// Zero-based position of the packet in the source.
     pub packet_index: u64,
     /// Byte offset of that packet in the source file.
     pub offset: u64,
 }
 
-impl Finding {
+impl SeqFinding {
     /// False for what is only worth knowing: a stream that does not count,
     /// or how many findings were left out of the list.
     pub fn is_problem(&self) -> bool {
         !matches!(
             self.kind,
-            FindingKind::Suppressed { .. } | FindingKind::Constant { .. }
+            SeqKind::Suppressed { .. } | SeqKind::Constant { .. }
         )
+    }
+
+    /// The kind this is stored and listed as.
+    pub fn kind(&self) -> Kind {
+        match self.kind {
+            SeqKind::Gap { .. } => Kind::Gap,
+            SeqKind::Duplicate { .. } => Kind::Duplicate,
+            SeqKind::Reset { .. } => Kind::Reset,
+            SeqKind::Interleaved { .. } => Kind::Interleaved,
+            SeqKind::Stray { .. } => Kind::Stray,
+            SeqKind::Suppressed { .. } => Kind::Suppressed,
+            SeqKind::Constant { .. } => Kind::ConstantCount,
+        }
+    }
+
+    /// As every check reports: the same finding without its numbers.
+    pub fn finding(&self) -> Finding<StreamKey> {
+        Finding {
+            lane: self.key,
+            packet: Some(self.packet_index),
+            severity: Severity::problem_if(self.is_problem()),
+            kind: self.kind(),
+            message: self.summary(),
+        }
     }
 
     /// What was found, without the stream name or the position.
     pub fn summary(&self) -> String {
         match &self.kind {
-            FindingKind::Gap {
+            SeqKind::Gap {
                 expected,
                 got,
                 missing,
@@ -125,13 +150,13 @@ impl Finding {
                 let unit = if *missing == 1 { "packet" } else { "packets" };
                 format!("{missing} {unit} missing (expected sequence count {expected}, got {got})")
             }
-            FindingKind::Duplicate { seq } => format!("Sequence count {seq} repeated"),
-            FindingKind::Reset { got } => format!("Sequence count restarted at {got}"),
-            FindingKind::Interleaved { counters } => {
+            SeqKind::Duplicate { seq } => format!("Sequence count {seq} repeated"),
+            SeqKind::Reset { got } => format!("Sequence count restarted at {got}"),
+            SeqKind::Interleaved { counters } => {
                 format!("{counters} sequence counts running at once")
             }
-            FindingKind::Stray { seq } => format!("Out-of-order packet (sequence count {seq})"),
-            FindingKind::Suppressed { what, more } => {
+            SeqKind::Stray { seq } => format!("Out-of-order packet (sequence count {seq})"),
+            SeqKind::Suppressed { what, more } => {
                 let label = if *more == 1 {
                     what.strip_suffix('s').unwrap_or(what)
                 } else {
@@ -139,18 +164,18 @@ impl Finding {
                 };
                 format!("{more} more {label} not listed")
             }
-            FindingKind::Constant { seq } => {
+            SeqKind::Constant { seq } => {
                 format!("Sequence count is always {seq}: this stream does not count its packets")
             }
         }
     }
 }
 
-impl fmt::Display for Finding {
+impl fmt::Display for SeqFinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let place = match self.kind {
-            FindingKind::Suppressed { .. } => ", last at",
-            FindingKind::Constant { .. } => ", from",
+            SeqKind::Suppressed { .. } => ", last at",
+            SeqKind::Constant { .. } => ", from",
             _ => " at",
         };
         write!(
@@ -238,7 +263,7 @@ struct Stream {
 #[derive(Debug, Default)]
 pub struct Checker {
     streams: BTreeMap<StreamKey, Stream>,
-    findings: Vec<Finding>,
+    findings: Vec<SeqFinding>,
     /// Findings withdrawn after the fact, by position.
     retracted: Vec<usize>,
     index: u64,
@@ -249,7 +274,7 @@ pub struct Report {
     /// Packet count per stream, idle packets excluded.
     pub streams: Vec<(StreamKey, u64)>,
     /// In packet order.
-    pub findings: Vec<Finding>,
+    pub findings: Vec<SeqFinding>,
 }
 
 fn succ(seq: u16) -> u16 {
@@ -325,9 +350,9 @@ impl Checker {
             run.last_pos = pos;
             if stream.duplicates.add(index, offset) {
                 stream.duplicate_findings.push(self.findings.len());
-                self.findings.push(Finding {
+                self.findings.push(SeqFinding {
                     key,
-                    kind: FindingKind::Duplicate { seq },
+                    kind: SeqKind::Duplicate { seq },
                     packet_index: index,
                     offset,
                 });
@@ -349,9 +374,9 @@ impl Checker {
         {
             let expected = run.next;
             let listed = stream.gaps.add(index, offset).then(|| {
-                self.findings.push(Finding {
+                self.findings.push(SeqFinding {
                     key,
-                    kind: FindingKind::Gap {
+                    kind: SeqKind::Gap {
                         expected,
                         got: seq,
                         missing,
@@ -419,9 +444,9 @@ impl Checker {
             let run = stream.active.swap_remove(oldest);
             if run.hits < MIN_RUN {
                 if stream.strays.add(run.first_index, run.first_offset) {
-                    self.findings.push(Finding {
+                    self.findings.push(SeqFinding {
                         key,
-                        kind: FindingKind::Stray { seq: run.first_seq },
+                        kind: SeqKind::Stray { seq: run.first_seq },
                         packet_index: run.first_index,
                         offset: run.first_offset,
                     });
@@ -467,9 +492,9 @@ impl Checker {
             {
                 self.retracted.extend(duplicate_findings);
                 duplicates = Tally::default();
-                self.findings.push(Finding {
+                self.findings.push(SeqFinding {
                     key,
-                    kind: FindingKind::Constant { seq },
+                    kind: SeqKind::Constant { seq },
                     packet_index,
                     offset,
                 });
@@ -504,9 +529,9 @@ impl Checker {
                 new.first_offset = old.first_offset;
                 new.last_index = new.last_index.max(old.last_index);
                 if strays.add(late_index, late_offset) {
-                    self.findings.push(Finding {
+                    self.findings.push(SeqFinding {
                         key,
-                        kind: FindingKind::Stray { seq: late_seq },
+                        kind: SeqKind::Stray { seq: late_seq },
                         packet_index: late_index,
                         offset: late_offset,
                     });
@@ -523,9 +548,9 @@ impl Checker {
             for run in &runs {
                 if run.hits < MIN_RUN {
                     if judge_strays && strays.add(run.first_index, run.first_offset) {
-                        self.findings.push(Finding {
+                        self.findings.push(SeqFinding {
                             key,
-                            kind: FindingKind::Stray { seq: run.first_seq },
+                            kind: SeqKind::Stray { seq: run.first_seq },
                             packet_index: run.first_index,
                             offset: run.first_offset,
                         });
@@ -538,9 +563,9 @@ impl Checker {
                         overlapping += 1;
                         first_overlap.get_or_insert((run.first_index, run.first_offset));
                     }
-                    Some(_) => self.findings.push(Finding {
+                    Some(_) => self.findings.push(SeqFinding {
                         key,
-                        kind: FindingKind::Reset { got: run.first_seq },
+                        kind: SeqKind::Reset { got: run.first_seq },
                         packet_index: run.first_index,
                         offset: run.first_offset,
                     }),
@@ -548,9 +573,9 @@ impl Checker {
                 latest_end = Some(latest_end.map_or(run.last_index, |e| e.max(run.last_index)));
             }
             if let Some((packet_index, offset)) = first_overlap {
-                self.findings.push(Finding {
+                self.findings.push(SeqFinding {
                     key,
-                    kind: FindingKind::Interleaved {
+                    kind: SeqKind::Interleaved {
                         counters: overlapping + 1,
                     },
                     packet_index,
@@ -563,9 +588,9 @@ impl Checker {
                 (&strays, "out-of-order packets"),
             ] {
                 if tally.count > tally.listed {
-                    self.findings.push(Finding {
+                    self.findings.push(SeqFinding {
                         key,
-                        kind: FindingKind::Suppressed {
+                        kind: SeqKind::Suppressed {
                             what,
                             more: tally.count - tally.listed,
                         },
@@ -605,24 +630,18 @@ mod tests {
     fn a_stream_that_never_counts_is_noted_once() {
         for n in [3usize, 12, 500] {
             let report = counts(&vec![0; n]);
-            assert_eq!(kinds(&report), [&FindingKind::Constant { seq: 0 }], "{n}");
+            assert_eq!(kinds(&report), [&SeqKind::Constant { seq: 0 }], "{n}");
             assert!(!report.findings[0].is_problem());
             assert_eq!(report.findings[0].packet_index, 0);
         }
         // Any one count will do, not only 0.
-        assert_eq!(
-            kinds(&counts(&[9; 40])),
-            [&FindingKind::Constant { seq: 9 }]
-        );
+        assert_eq!(kinds(&counts(&[9; 40])), [&SeqKind::Constant { seq: 9 }]);
     }
 
     #[test]
     fn repeats_in_a_stream_that_counts_stay_problems() {
         // Two packets could be one and its repeat.
-        assert_eq!(
-            kinds(&counts(&[0, 0])),
-            [&FindingKind::Duplicate { seq: 0 }]
-        );
+        assert_eq!(kinds(&counts(&[0, 0])), [&SeqKind::Duplicate { seq: 0 }]);
         // One other count anywhere, and the stream counts.
         let mut seqs = vec![0u16; 30];
         seqs.push(1);
@@ -632,20 +651,20 @@ mod tests {
             report
                 .findings
                 .iter()
-                .all(|f| !matches!(f.kind, FindingKind::Constant { .. }))
+                .all(|f| !matches!(f.kind, SeqKind::Constant { .. }))
         );
         assert!(
             report
                 .findings
                 .iter()
-                .any(|f| matches!(f.kind, FindingKind::Suppressed { more: 9, .. }))
+                .any(|f| matches!(f.kind, SeqKind::Suppressed { more: 9, .. }))
         );
         let report = counts(&[5, 6, 7, 7, 7, 8]);
         assert_eq!(
             kinds(&report),
             [
-                &FindingKind::Duplicate { seq: 7 },
-                &FindingKind::Duplicate { seq: 7 }
+                &SeqKind::Duplicate { seq: 7 },
+                &SeqKind::Duplicate { seq: 7 }
             ]
         );
     }
@@ -664,11 +683,11 @@ mod tests {
         assert_eq!(report.findings.len(), 2, "{:?}", report.findings);
         assert!(matches!(
             report.findings[0].kind,
-            FindingKind::Constant { seq: 0 }
+            SeqKind::Constant { seq: 0 }
         ));
         assert!(matches!(
             report.findings[1].kind,
-            FindingKind::Gap { missing: 1, .. }
+            SeqKind::Gap { missing: 1, .. }
         ));
     }
 
@@ -683,7 +702,7 @@ mod tests {
         checker.finish()
     }
 
-    fn kinds(report: &Report) -> Vec<&FindingKind> {
+    fn kinds(report: &Report) -> Vec<&SeqKind> {
         report.findings.iter().map(|f| &f.kind).collect()
     }
 
@@ -702,7 +721,7 @@ mod tests {
         let mut old = Source::new(0x1A3, 9000, 4);
         let mut new = Source::new(0x1A3, 12, 4);
         let report = check(&interleaved(&mut old, &mut new, 10));
-        assert_eq!(kinds(&report), [&FindingKind::Interleaved { counters: 2 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Interleaved { counters: 2 }]);
         // The second source's first packet: index 1, right after one 10-byte packet.
         assert_eq!(report.findings[0].packet_index, 1);
         assert_eq!(report.findings[0].offset, 10);
@@ -713,7 +732,7 @@ mod tests {
         let mut a = Source::new(0x1A3, 100, 4);
         let mut b = Source::new(0x1A3, 105, 4);
         let report = check(&interleaved(&mut a, &mut b, 10));
-        assert_eq!(kinds(&report), [&FindingKind::Interleaved { counters: 2 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Interleaved { counters: 2 }]);
     }
 
     #[test]
@@ -724,7 +743,7 @@ mod tests {
         let mut data: Vec<u8> = (0..5).flat_map(|_| old.emit()).collect();
         data.extend(interleaved(&mut new, &mut old, 20));
         let report = check(&data);
-        assert_eq!(kinds(&report), [&FindingKind::Interleaved { counters: 2 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Interleaved { counters: 2 }]);
     }
 
     #[test]
@@ -735,7 +754,7 @@ mod tests {
             .flat_map(|&s| packet(0x1A3, s, &[0; 4]))
             .collect();
         let report = check(&data);
-        assert_eq!(kinds(&report), [&FindingKind::Stray { seq: 6 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Stray { seq: 6 }]);
     }
 
     #[test]
@@ -756,7 +775,7 @@ mod tests {
         let report = check(&data);
         assert_eq!(
             kinds(&report),
-            [&FindingKind::Gap {
+            [&SeqKind::Gap {
                 expected: 55,
                 got: 58,
                 missing: 3
@@ -771,7 +790,7 @@ mod tests {
         let mut data: Vec<u8> = (0..20).flat_map(|_| first.emit()).collect();
         data.extend((0..20).flat_map(|_| second.emit()));
         let report = check(&data);
-        assert_eq!(kinds(&report), [&FindingKind::Reset { got: 0 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Reset { got: 0 }]);
         assert_eq!(report.findings[0].packet_index, 20);
     }
 
@@ -782,7 +801,7 @@ mod tests {
         data.extend(packet(0x1A3, 9, &[0; 4]));
         data.extend((0..3).flat_map(|_| src.emit()));
         let report = check(&data);
-        assert_eq!(kinds(&report), [&FindingKind::Duplicate { seq: 9 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Duplicate { seq: 9 }]);
     }
 
     #[test]
@@ -810,8 +829,8 @@ mod tests {
         assert_eq!(
             kinds(&report),
             [
-                &FindingKind::Reset { got: 0 },
-                &FindingKind::Gap {
+                &SeqKind::Reset { got: 0 },
+                &SeqKind::Gap {
                     expected: 518,
                     got: 523,
                     missing: 5
@@ -830,7 +849,7 @@ mod tests {
             data.extend(slow.emit());
         }
         let report = check(&data);
-        assert_eq!(kinds(&report), [&FindingKind::Interleaved { counters: 2 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Interleaved { counters: 2 }]);
     }
 
     #[test]
@@ -843,7 +862,7 @@ mod tests {
         assert_eq!(report.findings.len(), 21, "{:?}", report.findings.len());
         assert_eq!(
             report.findings.last().map(|f| &f.kind),
-            Some(&FindingKind::Suppressed {
+            Some(&SeqKind::Suppressed {
                 what: "repeated sequence counts",
                 more: 979
             })
@@ -861,20 +880,20 @@ mod tests {
     #[test]
     fn one_packet_ahead_of_the_counter_is_a_stray_not_a_reset() {
         let report = check_seqs(&[100, 101, 102, 110, 103, 104, 105]);
-        assert_eq!(kinds(&report), [&FindingKind::Stray { seq: 110 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Stray { seq: 110 }]);
         assert_eq!(report.findings[0].packet_index, 3);
     }
 
     #[test]
     fn two_packets_ahead_of_the_counter_are_not_a_second_emitter() {
         let report = check_seqs(&[100, 101, 102, 110, 103, 111, 104, 105]);
-        assert_eq!(kinds(&report), [&FindingKind::Stray { seq: 110 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Stray { seq: 110 }]);
     }
 
     #[test]
     fn several_late_packets_are_reported_once() {
         let report = check_seqs(&[1, 2, 3, 4, 5, 8, 6, 7, 9, 10, 11]);
-        assert_eq!(kinds(&report), [&FindingKind::Stray { seq: 6 }]);
+        assert_eq!(kinds(&report), [&SeqKind::Stray { seq: 6 }]);
     }
 
     #[test]
@@ -893,13 +912,13 @@ mod tests {
         let listed = report
             .findings
             .iter()
-            .filter(|f| matches!(f.kind, FindingKind::Gap { .. }))
+            .filter(|f| matches!(f.kind, SeqKind::Gap { .. }))
             .count() as u64;
         let suppressed: u64 = report
             .findings
             .iter()
             .map(|f| match f.kind {
-                FindingKind::Suppressed { what: "gaps", more } => more,
+                SeqKind::Suppressed { what: "gaps", more } => more,
                 _ => 0,
             })
             .sum();

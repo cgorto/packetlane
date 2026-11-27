@@ -1,0 +1,681 @@
+//! Two things about the store's SQL that no answer on a small run shows:
+//! which index SQLite uses for it, and that the statements which read all
+//! packets in one pass give what asking lane by lane gave.
+//!
+//! A new index can make an existing query slow without changing a single
+//! answer, because SQLite may prefer it. The load tests show that as
+//! seconds lost. Here it shows at once, on a small store: the store never
+//! runs ANALYZE, so SQLite chooses the same plan at any size.
+//!
+//! The plans are compared as SQLite words them. SQLite is built in with
+//! rusqlite, so the wording changes only when that dependency does; if
+//! these tests fail after such a change and the same indexes are still
+//! named, it is the wording, and the expected text here is what to update.
+
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use packetlane::pure::sql::{self, Clock, Param, Query};
+use packetlane::pure::synth::{demo_run, packet};
+use packetlane::shell::ingest::ingest_targets;
+use packetlane::shell::store::Store;
+use rusqlite::types::Value;
+use rusqlite::{Connection, OpenFlags, params_from_iter};
+
+/// A store holding one run, in a folder removed when the test ends.
+struct Stored {
+    dir: PathBuf,
+    conn: Connection,
+}
+
+impl Drop for Stored {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Ingests the files, given as (path within the run, bytes).
+fn stored(files: &[(String, Vec<u8>)]) -> Stored {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "packetlane-sql-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let run = dir.join("run");
+    for (rel, bytes) in files {
+        let path = run.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    let db = dir.join("store.db");
+    ingest(&db, &run);
+    let conn = Connection::open_with_flags(&db, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    Stored { dir, conn }
+}
+
+fn ingest(db: &Path, run: &Path) {
+    let run = std::fs::canonicalize(run).unwrap();
+    let mut store = Store::open(db).unwrap();
+    ingest_targets(&mut store, &[run], None, None, None).unwrap();
+}
+
+fn demo() -> Stored {
+    let files: Vec<(String, Vec<u8>)> = demo_run(120)
+        .into_iter()
+        .map(|f| (f.rel.to_string(), f.bytes))
+        .collect();
+    stored(&files)
+}
+
+fn bound(q: &Query) -> impl Iterator<Item = Value> + '_ {
+    q.params.iter().map(|p| match p {
+        Param::Null => Value::Null,
+        Param::Int(v) => Value::Integer(*v),
+        Param::Text(v) => Value::Text(v.clone()),
+    })
+}
+
+/// Every row of the answer, each cell as text.
+fn rows(conn: &Connection, q: &Query) -> Vec<Vec<String>> {
+    let mut stmt = conn.prepare(&q.sql).unwrap();
+    let n = stmt.column_count();
+    stmt.query_map(params_from_iter(bound(q)), |row| {
+        (0..n)
+            .map(|i| {
+                row.get::<_, Value>(i).map(|v| match v {
+                    Value::Null => "null".to_string(),
+                    Value::Integer(i) => i.to_string(),
+                    Value::Real(f) => f.to_string(),
+                    Value::Text(t) => t,
+                    Value::Blob(_) => "blob".to_string(),
+                })
+            })
+            .collect()
+    })
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect()
+}
+
+/// The steps of SQLite's plan for the query.
+fn plan(conn: &Connection, q: &Query) -> Vec<String> {
+    let explain = Query {
+        sql: format!("EXPLAIN QUERY PLAN {}", q.sql),
+        params: q.params.clone(),
+    };
+    rows(conn, &explain)
+        .into_iter()
+        .map(|r| r[3].clone())
+        .collect()
+}
+
+/// The one step of the plan that reads the table, by name or alias.
+fn step<'a>(plan: &'a [String], table: &str) -> &'a str {
+    let found: Vec<&String> = plan
+        .iter()
+        .filter(|s| s.split_whitespace().nth(1) == Some(table))
+        .collect();
+    assert_eq!(found.len(), 1, "steps reading {table} in {plan:#?}");
+    found[0]
+}
+
+// ---- plans ------------------------------------------------------------------
+
+/// A view of every lane must find its packets by time, so that what it
+/// costs follows the width of the view and not the size of the run.
+#[test]
+fn views_of_every_lane_find_their_packets_by_time() {
+    let store = demo();
+    let (from, to) = (1_767_225_600_000_000_000, 1_767_225_700_000_000_000);
+    for (clock, index) in [
+        (
+            Clock::Receive,
+            "packets_receive (receive_ns>? AND receive_ns<?)",
+        ),
+        (
+            Clock::Packet,
+            "packets_packet (packet_ns>? AND packet_ns<?)",
+        ),
+        (Clock::Order, "INTEGER PRIMARY KEY (rowid>? AND rowid<?)"),
+    ] {
+        let mut queries = vec![
+            ("items", sql::packet_items(1, clock, from, to, 2000)),
+            ("density", sql::packet_density(1, clock, from, to, 400)),
+        ];
+        // With pre-counted buckets, the two ends of the window are still
+        // counted from the packets.
+        let before = queries.len();
+        for q in sql::density(1, clock, from + 7, to + 7, 400, Some((from, 1_000_000_000))) {
+            if q.sql.contains("FROM packets") {
+                queries.push(("density, ends", q));
+            }
+        }
+        assert!(queries.len() > before, "no end of the window was counted");
+        for (name, q) in &queries {
+            let plan = plan(&store.conn, q);
+            let step = step(&plan, "packets");
+            assert!(
+                step.starts_with("SEARCH") && step.ends_with(index),
+                "{name}: {step}"
+            );
+            // In time order as found: nothing is sorted afterwards.
+            assert!(
+                !plan.iter().any(|s| s.contains("ORDER BY")),
+                "{name}: {plan:#?}"
+            );
+        }
+    }
+}
+
+/// A plot of one lane must find that lane's packets by time, so that what
+/// it costs follows that lane and not everything logged alongside it.
+#[test]
+fn plots_find_one_lanes_packets_by_time() {
+    let store = demo();
+    let (from, to) = (1_767_225_600_000_000_000, 1_767_225_700_000_000_000);
+    for (clock, index) in [
+        (
+            Clock::Receive,
+            "packets_lane_receive (lane_id=? AND receive_ns>? AND receive_ns<?)",
+        ),
+        (
+            Clock::Packet,
+            "packets_lane_packet (lane_id=? AND packet_ns>? AND packet_ns<?)",
+        ),
+    ] {
+        // Arrival delay is answered from the index alone.
+        let plan_of = plan(&store.conn, &sql::lag_series(1, clock, 2, from, to, 1200));
+        assert_eq!(
+            step(&plan_of, "packets"),
+            format!("SEARCH packets USING COVERING INDEX {index}")
+        );
+        // A value plot finds the packets that way, then looks each one's
+        // values up by packet, not by field.
+        let q = sql::value_series(1, clock, 2, "SIM_HK", "BUS_VOLTS", from, to, 1200);
+        let plan_of = plan(&store.conn, &q);
+        assert_eq!(
+            step(&plan_of, "p"),
+            format!("SEARCH p USING COVERING INDEX {index}")
+        );
+        assert_eq!(
+            step(&plan_of, "v"),
+            "SEARCH v USING INDEX field_values_packet (packet_id=?)"
+        );
+    }
+    // On the order clock a window is a range of ids, which is the table's
+    // own order. The lane-first indexes do not hold ids in order, and
+    // taking one would read the whole lane for any window.
+    let by_id = "USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)";
+    let plan_of = plan(
+        &store.conn,
+        &sql::lag_series(1, Clock::Order, 2, 10, 500, 100),
+    );
+    assert_eq!(step(&plan_of, "packets"), format!("SEARCH packets {by_id}"));
+    let q = sql::value_series(1, Clock::Order, 2, "SIM_HK", "BUS_VOLTS", 10, 500, 100);
+    assert_eq!(
+        step(&plan(&store.conn, &q), "p"),
+        format!("SEARCH p {by_id}")
+    );
+}
+
+/// The comparison of sources reads the packets twice, whatever the number
+/// of streams, and answers "is this packet in that lane" from an index.
+#[test]
+fn sources_are_compared_in_two_passes_over_the_packets() {
+    let store = demo();
+    let plan = plan(&store.conn, &sql::hop_compare_all(1));
+    let scans: Vec<&String> = plan.iter().filter(|s| s.starts_with("SCAN")).collect();
+    assert_eq!(
+        scans, ["SCAN p USING COVERING INDEX packets_sum"; 2],
+        "{plan:#?}"
+    );
+    let lookups = plan
+        .iter()
+        .filter(|s| s.ends_with("USING COVERING INDEX packets_sum (sum=? AND lane_id=?)"))
+        .count();
+    assert_eq!(lookups, 2, "{plan:#?}");
+}
+
+// ---- one pass against lane by lane --------------------------------------------
+
+/// How lane `a` compares with lane `b`, asked for one pair: what
+/// `hop_compare_all` replaced, kept here to check it against.
+const ONE_PAIR: &str = "WITH m AS MATERIALIZED (
+       SELECT p.id AS id,
+              EXISTS (SELECT 1 FROM packets q
+                      WHERE q.sum = p.sum AND q.lane_id = ?1) AS hit
+       FROM packets p WHERE p.lane_id = ?2),
+     w AS (SELECT MIN(id) AS lo, MAX(id) AS hi FROM m WHERE hit = 1)
+     SELECT (SELECT COUNT(*) FROM m WHERE hit = 1),
+            (SELECT COUNT(*) FROM m, w WHERE hit = 0 AND id BETWEEN w.lo AND w.hi),
+            (SELECT MIN(id) FROM m, w WHERE hit = 0 AND id BETWEEN w.lo AND w.hi)";
+
+/// One lane's count and ranges, asked for one lane: what the one-pass
+/// refresh replaced.
+const ONE_LANE: &str = "SELECT COUNT(*), MIN(receive_ns), MAX(receive_ns), COUNT(receive_ns),
+            MIN(packet_ns), MAX(packet_ns), COUNT(packet_ns), MIN(id), MAX(id)
+     FROM packets WHERE lane_id = ?1";
+
+/// Checks every pair of the run against [`ONE_PAIR`]. Returns the pairs
+/// that have something missing, as (source a, source b, apid, shared,
+/// missing).
+fn check_pairs(conn: &Connection) -> Vec<(String, String, i64, i64, i64)> {
+    let all = rows(conn, &sql::hop_compare_all(1));
+    let pairs = rows(conn, &sql::lane_pairs(1));
+    assert!(!pairs.is_empty());
+    let mut with_missing = Vec::new();
+    for pair in &pairs {
+        let (a, b) = (&pair[0], &pair[2]);
+        let old = rows(
+            conn,
+            &Query {
+                sql: ONE_PAIR.to_string(),
+                params: vec![
+                    b.parse::<i64>().unwrap().into(),
+                    a.parse::<i64>().unwrap().into(),
+                ],
+            },
+        );
+        let old = &old[0];
+        let new: Vec<&Vec<String>> = all.iter().filter(|r| &r[0] == a && &r[1] == b).collect();
+        let (shared, missing): (i64, i64) = (old[0].parse().unwrap(), old[1].parse().unwrap());
+        if shared > 0 && missing > 0 {
+            assert_eq!(new.len(), 1, "pair {a} {b}");
+            assert_eq!(&new[0][2..], &old[..], "pair {a} {b}");
+            with_missing.push((
+                pair[1].clone(),
+                pair[3].clone(),
+                pair[4].parse().unwrap(),
+                shared,
+                missing,
+            ));
+        } else {
+            // Nothing to report for the pair, and the one pass says nothing.
+            assert!(
+                new.is_empty(),
+                "pair {a} {b}: {new:?}, lane by lane {old:?}"
+            );
+        }
+    }
+    assert_eq!(all.len(), with_missing.len());
+    with_missing
+}
+
+/// Checks the stored count and ranges of every packet lane against
+/// [`ONE_LANE`]. Returns how many lanes there were.
+fn check_lanes(conn: &Connection) -> usize {
+    let stored = rows(
+        conn,
+        &Query {
+            sql: "SELECT id, count, receive_min, receive_max, receive_count,
+                         packet_min, packet_max, packet_count, order_min, order_max
+                  FROM lanes WHERE kind != 'log' ORDER BY id"
+                .to_string(),
+            params: vec![],
+        },
+    );
+    for lane in &stored {
+        let direct = rows(
+            conn,
+            &Query {
+                sql: ONE_LANE.to_string(),
+                params: vec![lane[0].parse::<i64>().unwrap().into()],
+            },
+        );
+        assert_eq!(&lane[1..], &direct[0][..], "lane {}", lane[0]);
+    }
+    stored.len()
+}
+
+/// Three sources logging the same streams, with everything that could make
+/// one pass differ from lane by lane.
+fn awkward_run() -> Vec<(String, Vec<u8>)> {
+    let p = |apid: u16, seq: u16, body: &[u8]| packet(apid, seq, body);
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    let mut c = Vec::new();
+    // APID 10: b lacks packets before the first shared one, in the middle,
+    // and after the last; each side holds one packet twice; c logs the
+    // stream with other bytes, so shares nothing.
+    for seq in 0..40u16 {
+        let one = p(10, seq, &[seq as u8, 1, 2]);
+        a.extend(&one);
+        if seq == 20 {
+            a.extend(&one);
+        }
+        if !matches!(seq, 0..=2 | 10 | 11 | 30 | 37..=39) {
+            b.extend(&one);
+            if seq == 25 {
+                b.extend(&one);
+            }
+        }
+        c.extend(p(10, seq, &[seq as u8, 9, 9]));
+    }
+    // APID 11: a stream that sends the same bytes every time.
+    for _ in 0..5 {
+        a.extend(p(11, 0, &[7; 4]));
+    }
+    for _ in 0..3 {
+        b.extend(p(11, 0, &[7; 4]));
+    }
+    // APID 12: one source only. APID 13: c has all of it, a the middle.
+    for seq in 0..20u16 {
+        a.extend(p(12, seq, &[seq as u8]));
+        let one = p(13, seq, &[seq as u8, 5]);
+        c.extend(&one);
+        if (5..15).contains(&seq) && seq != 9 {
+            a.extend(&one);
+        }
+    }
+    vec![
+        ("a/tlm.bin".to_string(), a),
+        ("b/tlm.bin".to_string(), b),
+        ("c/tlm.bin".to_string(), c),
+    ]
+}
+
+#[test]
+fn one_pass_gives_what_lane_by_lane_gave() {
+    let store = stored(&awkward_run());
+    assert_eq!(check_lanes(&store.conn), 8);
+    let mut missing = check_pairs(&store.conn);
+    missing.sort();
+    assert_eq!(
+        missing,
+        [
+            // Of a's 41 packets on APID 10, b has 32 (the one a holds twice
+            // counts twice); 10, 11 and 30 are missing within what they
+            // share, and those before and after are not counted.
+            ("a".to_string(), "b".to_string(), 10, 32, 3),
+            // Of c's 20 on APID 13, a has 9; 9 is missing between them.
+            ("c".to_string(), "a".to_string(), 13, 9, 1),
+        ]
+    );
+
+    let demo = demo();
+    assert!(check_lanes(&demo.conn) > 3);
+    assert!(!check_pairs(&demo.conn).is_empty());
+}
+
+/// A lane keeps its row when its file is read again and no longer holds
+/// the stream; its count must go to nothing.
+#[test]
+fn a_lane_left_without_packets_reads_as_empty() {
+    let store = stored(&awkward_run());
+    let run = store.dir.join("run");
+    // The file from c again, now with one stream of its two.
+    let only: Vec<u8> = (0..40u16)
+        .flat_map(|seq| packet(10, seq, &[seq as u8, 9, 9]))
+        .collect();
+    std::fs::write(run.join("c/tlm.bin"), only).unwrap();
+    ingest(&store.dir.join("store.db"), &run);
+    assert_eq!(check_lanes(&store.conn), 8);
+    let empty = rows(
+        &store.conn,
+        &Query {
+            sql: "SELECT COUNT(*) FROM lanes WHERE source = 'c' AND apid = 13 AND count = 0
+                  AND receive_count = 0 AND order_min IS NULL"
+                .to_string(),
+            params: vec![],
+        },
+    );
+    assert_eq!(empty[0][0], "1");
+}
+
+// ---- the list of what a run has to plot ----------------------------------------
+
+/// What a run has to plot, counted from every stored value: what the
+/// per-file counts replaced.
+const SERIES_FROM_VALUES: &str = "SELECT p.lane_id, v.packet, v.field, COUNT(*)
+     FROM field_values v JOIN packets p ON p.id = v.packet_id
+     WHERE v.num IS NOT NULL AND v.file_id IN (SELECT id FROM files WHERE run_id = 1)
+     GROUP BY p.lane_id, v.packet, v.field
+     ORDER BY p.lane_id, v.packet, v.field";
+
+/// Checks the list against the stored values. Returns how long it is.
+fn check_series(conn: &Connection) -> usize {
+    let counted = rows(conn, &sql::run_series(1));
+    let from_values = rows(
+        conn,
+        &Query {
+            sql: SERIES_FROM_VALUES.to_string(),
+            params: vec![],
+        },
+    );
+    assert_eq!(counted, from_values);
+    // And nothing is left behind from a file that was read again.
+    let left = rows(
+        conn,
+        &Query {
+            sql: "SELECT COUNT(*) FROM file_series WHERE file_id NOT IN (SELECT id FROM files)"
+                .to_string(),
+            params: vec![],
+        },
+    );
+    assert_eq!(left[0][0], "0");
+    counted.len()
+}
+
+/// The list is kept as files are read, so it has to follow every way a
+/// file's values can change.
+#[test]
+fn the_list_of_kept_fields_follows_the_stored_values() {
+    let files: Vec<(String, Vec<u8>)> = demo_run(120)
+        .into_iter()
+        .map(|f| (f.rel.to_string(), f.bytes))
+        .collect();
+    let store = stored(&files);
+    let run = store.dir.join("run");
+    let db = store.dir.join("store.db");
+    let whole = check_series(&store.conn);
+    assert!(whole >= 2, "the demo keeps two fields");
+
+    // A file that holds kept values, read again with a third of it left.
+    let one = |sql: &str| {
+        rows(
+            &store.conn,
+            &Query {
+                sql: sql.to_string(),
+                params: vec![],
+            },
+        )[0][0]
+            .clone()
+    };
+    let rel = one(
+        "SELECT f.rel FROM file_series s JOIN files f ON f.id = s.file_id
+         ORDER BY s.count DESC LIMIT 1",
+    );
+    let total = "SELECT SUM(count) FROM file_series";
+    let before: i64 = one(total).parse().unwrap();
+    let bytes = &files.iter().find(|(r, _)| *r == rel).unwrap().1;
+    std::fs::write(run.join(&rel), &bytes[..bytes.len() / 3]).unwrap();
+    ingest(&db, &run);
+    assert!(check_series(&store.conn) > 0);
+    let after: i64 = one(total).parse().unwrap();
+    assert!(after > 0 && after < before, "{after} of {before}");
+
+    // The configuration changed, so the whole run is read again: one field
+    // is no longer kept.
+    let config = run.join("packetlane.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let at = text.find("keep = true").expect("a kept field");
+    let fewer = format!("{}keep = false{}", &text[..at], &text[at + 11..]);
+    std::fs::write(&config, fewer).unwrap();
+    ingest(&db, &run);
+    let after = check_series(&store.conn);
+    assert!(after > 0 && after < whole, "{after} of {whole}");
+}
+
+// ---- stored series buckets -------------------------------------------------------
+
+use packetlane::pure::sql::{Cell, Table};
+
+/// The answer to a statement, as the store gives it.
+fn table(conn: &Connection, q: &Query) -> Table {
+    let mut stmt = conn.prepare(&q.sql).unwrap();
+    let n = stmt.column_count();
+    let rows = stmt
+        .query_map(params_from_iter(bound(q)), |row| {
+            (0..n)
+                .map(|i| {
+                    row.get::<_, Value>(i).map(|v| match v {
+                        Value::Integer(i) => Cell::Int(i),
+                        Value::Real(f) => Cell::Real(f),
+                        Value::Text(t) => Cell::Text(t),
+                        _ => Cell::Null,
+                    })
+                })
+                .collect()
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    Table {
+        columns: Vec::new(),
+        rows,
+        truncated: false,
+    }
+}
+
+/// A series over a window as the server works it out: bucket, min, max,
+/// count. `stored` says whether to use the stored buckets.
+#[allow(clippy::too_many_arguments)]
+fn series_rows(
+    conn: &Connection,
+    clock: Clock,
+    lane: i64,
+    field: Option<(&str, &str)>,
+    from: i64,
+    to: i64,
+    buckets: i64,
+    stored: Option<(i64, i64)>,
+) -> (usize, Vec<(i64, f64, f64, i64)>) {
+    let queries = sql::series(1, clock, lane, field, from, to, buckets, stored);
+    let parts: Vec<Table> = queries.iter().map(|q| table(conn, q)).collect();
+    let parts: Vec<&Table> = parts.iter().collect();
+    let real = |c: &Cell| match c {
+        Cell::Real(v) => *v,
+        Cell::Int(v) => *v as f64,
+        other => panic!("{other:?}"),
+    };
+    let rows = sql::merge_series(&parts)
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].int().unwrap(),
+                real(&r[1]),
+                real(&r[2]),
+                r[3].int().unwrap(),
+            )
+        })
+        .collect();
+    (queries.len(), rows)
+}
+
+/// Count, lowest and highest over all buckets.
+fn totals(rows: &[(i64, f64, f64, i64)]) -> (i64, f64, f64) {
+    rows.iter()
+        .fold((0, f64::INFINITY, f64::NEG_INFINITY), |(n, lo, hi), r| {
+            (n + r.3, lo.min(r.1), hi.max(r.2))
+        })
+}
+
+/// The demo's lanes are far too short to be given stored buckets, so this
+/// builds them for every lane, as an ingest does for long ones, and checks
+/// them against reading the packets.
+#[test]
+fn stored_buckets_give_what_reading_the_packets_gives() {
+    let store = demo();
+    // An ordinary ingest stored none.
+    let none = rows(
+        &store.conn,
+        &Query {
+            sql: "SELECT COUNT(*) FROM coarse_series".to_string(),
+            params: vec![],
+        },
+    );
+    assert_eq!(none[0][0], "0");
+
+    let writer = Connection::open(store.dir.join("store.db")).unwrap();
+    let lane: i64 = writer
+        .query_row(
+            "SELECT lane_id FROM file_series WHERE packet = 'SIM_HK' AND field = 'BUS_VOLTS'
+             ORDER BY count DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    for clock in [Clock::Receive, Clock::Packet] {
+        let meta = table(&store.conn, &sql::coarse_meta(1, clock));
+        let (origin, real_width) = (
+            meta.rows[0][0].int().unwrap(),
+            meta.rows[0][1].int().unwrap(),
+        );
+        // Two minutes of data would put one packet in a bucket. Buckets
+        // 512 times as wide, 32 across the run, hold several each, as a
+        // long run's do.
+        let coarse_width = real_width * 512;
+        for q in sql::build_coarse_series(1, clock, origin, coarse_width, 1) {
+            writer.execute(&q.sql, params_from_iter(bound(&q))).unwrap();
+        }
+        let stored = Some((origin, coarse_width));
+        let width = sql::series_width(coarse_width);
+        let span = real_width * sql::COARSE_BUCKETS;
+
+        for field in [Some(("SIM_HK", "BUS_VOLTS")), None] {
+            let has = table(&store.conn, &sql::has_coarse_series(lane, clock, field));
+            assert_eq!(has.rows.len(), 1, "{field:?}");
+            let ask = |from: i64, to: i64, buckets: i64, stored| {
+                series_rows(&store.conn, clock, lane, field, from, to, buckets, stored)
+            };
+
+            // Buckets that line up with the stored ones: the same answer,
+            // bucket for bucket, from one statement.
+            let (from, buckets) = (origin + 2 * width, 5);
+            let to = from + 2 * width * buckets - 1;
+            let (statements, from_stored) = ask(from, to, buckets, stored);
+            let (_, direct) = ask(from, to, buckets, None);
+            assert_eq!(statements, 1);
+            assert_eq!(direct.len(), 5, "{direct:?}");
+            assert!(direct.iter().all(|r| r.3 > 1), "{direct:?}");
+            assert_eq!(from_stored, direct, "{clock:?} {field:?}");
+
+            // Any other window wide enough: the ends are read directly, and
+            // nothing is lost or counted twice. A stored bucket may land
+            // one requested bucket early, never further.
+            for (from, to, buckets) in [
+                (origin - span / 7, origin + span + span / 5, 20),
+                (origin + span / 3 + 12_345, origin + span - 999, 12),
+                (origin + 1, origin + span / 2, 8),
+            ] {
+                let (statements, from_stored) = ask(from, to, buckets, stored);
+                let (_, direct) = ask(from, to, buckets, None);
+                assert!(statements > 1, "{from} {to}");
+                assert_eq!(totals(&from_stored), totals(&direct), "{from} {to}");
+                let last = direct.last().unwrap().0;
+                assert!(from_stored.iter().all(|r| (0..=last).contains(&r.0)));
+            }
+
+            // A window whose buckets are narrower than the stored ones, even
+            // by a nanosecond, is read directly.
+            assert_eq!(ask(origin, origin + width * 10 - 11, 10, stored).0, 1);
+            assert!(ask(origin, origin + width * 10 - 1, 10, stored).0 >= 1);
+            let (statements, narrow) = ask(origin, origin + span / 20, 4000, stored);
+            assert_eq!(statements, 1);
+            assert_eq!(narrow, ask(origin, origin + span / 20, 4000, None).1);
+        }
+
+        // The stored part is found by its key.
+        let q = &sql::series(1, clock, lane, None, origin, origin + span, 10, stored)[0];
+        let steps = plan(&store.conn, q);
+        assert!(
+            step(&steps, "coarse_series").starts_with("SEARCH coarse_series USING PRIMARY KEY"),
+            "{steps:#?}"
+        );
+    }
+    // The order clock has no stored buckets.
+    assert!(sql::build_coarse_series(1, Clock::Order, 0, 100, 1).is_empty());
+}
