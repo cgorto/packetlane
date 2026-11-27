@@ -345,7 +345,8 @@ been built here.
 - **A watch panel**: choose a packet (or APID) and see its fields as a
   table that follows the cursor or the newest packet, each value coloured
   by how it changed from the packet before: green for up, red for down,
-  stronger for a bigger change. Most useful with live ingest.
+  stronger for a bigger change as a percentage of the value (with another
+  measure for values at or near zero). Most useful with live ingest.
 - **Problem report export** to attach to a ticket.
 - Other channel codes: convolutional, turbo and LDPC (a file must hold hard
   decisions that are already frame-aligned; Reed-Solomon and BCH are the only
