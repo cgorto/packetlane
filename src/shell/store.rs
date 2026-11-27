@@ -142,8 +142,14 @@ impl Phases {
     }
 }
 
-/// See where it is set, in [`Store::open`].
-const WRITE_CACHE_KIB: i64 = 32 * 1024;
+/// The page cache to write with, in KiB. A file's packets are written to
+/// the end of each lane's part of the two lane-first indexes, so what must
+/// stay in memory is a couple of pages for every lane the file holds: 4 MB
+/// was enough for a file of 300 lanes, measured, and this leaves room for
+/// about twice that. With less, each packet pushes out a page another lane
+/// is about to need. With more, nothing is gained. Peak memory while
+/// writing is about four times this.
+const WRITE_CACHE_KIB: i64 = 8 * 1024;
 
 /// The page cache to write with: [`WRITE_CACHE_KIB`], or as many megabytes
 /// as the environment variable `PACKETLANE_CACHE_MB` says (1 to 4096).
@@ -168,10 +174,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Sorting and temporary tables go to a file, not to memory.
         conn.pragma_update(None, "temp_store", "FILE")?;
-        // Pages of the store held in memory while writing, in KiB (negative
-        // means a size, not a page count). SQLite's own 2 MB is less than
-        // one index of a large run, and a run with many lanes writes all
-        // over its lane-first indexes.
+        // Negative means a size in KiB, not a count of pages.
         conn.pragma_update(None, "cache_size", -write_cache_kib())?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version != 0 && version != sql::SCHEMA_VERSION {

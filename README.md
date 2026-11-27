@@ -150,8 +150,11 @@ Limits of working from counters alone are listed at the top of
   reads. The connection they use cannot write.
 - A store made by an earlier build with a different layout is refused, and
   says so: delete it and ingest again. Nothing in it is not in the logs.
-- Writing uses up to about 80 MB of memory whatever the size of the run,
-  most of it the store's page cache.
+- Writing uses about 35 MB of memory whatever the size of the run, most of
+  it the store's page cache (8 MB, which is enough for files of several
+  hundred streams each). Set `PACKETLANE_CACHE_MB` to change it: a file
+  with more streams than that ingests faster with more, and 2 is enough
+  for files of a few dozen.
 
 ### Timeline
 
