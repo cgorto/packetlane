@@ -759,43 +759,44 @@ pub fn lane_pairs(run: i64) -> Query {
 // page for every packet read: it was most of the time an ingest took, and
 // what made ingest need a large page cache. Instead, once the files are
 // read, the packets of the streams that more than one source logged are
-// copied to a temporary table and indexed there in one sorted build. The
+// copied to a temporary table, sorted by checksum as they are written. The
 // comparisons below read that table, and it is dropped when they are done.
 
 /// Drops the temporary table of [`hop_stage`], if a failed ingest left one.
 pub const HOP_UNSTAGE: &str = "DROP TABLE IF EXISTS temp.hop";
 
 /// The statements that make `temp.hop`: the packets of a run's lanes that
-/// have a counterpart from another source, and an index of them by
-/// checksum and lane. The run's packets are found by its files'
-/// id ranges, so no other run is read.
+/// have a counterpart from another source, kept in order of checksum and
+/// lane. The run's packets are found by its files' id ranges, so no other
+/// run is read.
+///
+/// The table is its own index (`WITHOUT ROWID`) and is filled in its own
+/// order, from one sort: nothing is written twice, and reading it from end
+/// to end asks about each checksum beside the last. The sequence count and
+/// length are there for the tracing of interleaved streams, which matches
+/// on them too.
 pub fn hop_stage(run: i64) -> Vec<Query> {
     vec![
         Query::new(
-            "CREATE TEMP TABLE hop
-               (id INTEGER, lane_id INTEGER, sum INTEGER, seq INTEGER, length INTEGER)",
+            "CREATE TEMP TABLE hop (
+               sum INTEGER NOT NULL, lane_id INTEGER NOT NULL, id INTEGER NOT NULL,
+               seq INTEGER, length INTEGER,
+               PRIMARY KEY (sum, lane_id, id)
+             ) WITHOUT ROWID",
             vec![],
         ),
         Query::new(
-            "INSERT INTO temp.hop (id, lane_id, sum, seq, length)
-             SELECT p.id, p.lane_id, p.sum, p.seq, p.length
+            "INSERT INTO temp.hop (sum, lane_id, id, seq, length)
+             SELECT p.sum, p.lane_id, p.id, p.seq, p.length
              FROM files f CROSS JOIN packets p NOT INDEXED
                ON p.id BETWEEN f.first_packet AND f.last_packet
              WHERE f.run_id = ?1 AND p.lane_id IN (
                SELECT a.id FROM lanes a JOIN lanes b
                  ON b.run_id = a.run_id AND b.kind = 'packet' AND b.apid = a.apid
                 AND b.ptype = a.ptype AND b.source != a.source
-               WHERE a.run_id = ?1 AND a.kind = 'packet')",
+               WHERE a.run_id = ?1 AND a.kind = 'packet')
+             ORDER BY p.sum, p.lane_id, p.id",
             vec![run.into()],
-        ),
-        // With the id, so that the comparison reads this index alone, in
-        // checksum order: each packet it asks about is then beside the
-        // last, and little of the index need be in memory at once.
-        Query::new(
-            // The sequence count and length are there for the tracing of
-            // interleaved streams, which matches on them too.
-            "CREATE INDEX temp.hop_sum ON hop (sum, lane_id, seq, length, id)",
-            vec![],
         ),
     ]
 }
@@ -823,12 +824,12 @@ pub fn hop_compare_all(run: i64) -> Query {
            WHERE a.run_id = ?1 AND a.kind = 'packet'),
          shared AS MATERIALIZED (
            SELECT pair.a AS a, pair.b AS b, COUNT(*) AS n, MIN(p.id) AS lo, MAX(p.id) AS hi
-           FROM temp.hop p INDEXED BY hop_sum CROSS JOIN pair ON pair.a = p.lane_id
+           FROM temp.hop p CROSS JOIN pair ON pair.a = p.lane_id
            WHERE EXISTS (SELECT 1 FROM temp.hop q
                          WHERE q.sum = p.sum AND q.lane_id = pair.b)
            GROUP BY pair.a, pair.b)
          SELECT shared.a, shared.b, shared.n, COUNT(*), MIN(p.id)
-         FROM temp.hop p INDEXED BY hop_sum CROSS JOIN shared ON shared.a = p.lane_id
+         FROM temp.hop p CROSS JOIN shared ON shared.a = p.lane_id
          WHERE p.id BETWEEN shared.lo AND shared.hi
            AND NOT EXISTS (SELECT 1 FROM temp.hop q
                            WHERE q.sum = p.sum AND q.lane_id = shared.b)

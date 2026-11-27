@@ -461,7 +461,15 @@ impl Store {
         let (packets, entries, note) = match decoder {
             Some(decoder) => {
                 let (packets, note) = ingest_packets(
-                    &tx, &mut file, decoder, config, file_id, run_id, &source, &mut lanes,
+                    &tx,
+                    &mut file,
+                    decoder,
+                    config,
+                    file_id,
+                    run_id,
+                    &source,
+                    &mut lanes,
+                    first_packet,
                 )?;
                 (packets, 0, note)
             }
@@ -568,8 +576,9 @@ fn ingest_packets(
     run_id: i64,
     source: &SourceInfo,
     lanes: &mut Lanes<'_>,
+    // The id of the file's first packet; the rest follow with no gaps.
+    base_id: i64,
 ) -> Result<(u64, String)> {
-    let base_id: i64 = conn.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
     let mut insert = conn.prepare_cached(sql::INSERT_PACKET)?;
     let mut insert_value = conn.prepare_cached(sql::INSERT_VALUE)?;
     let mut check = FileCheck::new(config, source);

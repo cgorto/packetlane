@@ -248,15 +248,12 @@ fn sources_are_compared_in_two_passes_over_the_packets() {
     // Comparing.
     let steps = plan(&store.conn, &sql::hop_compare_all(1));
     let scans: Vec<&String> = steps.iter().filter(|s| s.starts_with("SCAN")).collect();
-    // In checksum order, from the index alone: each lookup below then
-    // lands beside the last.
-    assert_eq!(
-        scans, ["SCAN p USING COVERING INDEX hop_sum"; 2],
-        "{steps:#?}"
-    );
+    // The copy is kept in checksum order, so reading it from end to end
+    // makes each lookup below land beside the last.
+    assert_eq!(scans, ["SCAN p"; 2], "{steps:#?}");
     let lookups = steps
         .iter()
-        .filter(|s| s.ends_with("USING COVERING INDEX hop_sum (sum=? AND lane_id=?)"))
+        .filter(|s| s.ends_with("USING PRIMARY KEY (sum=? AND lane_id=?)"))
         .count();
     assert_eq!(lookups, 2, "{steps:#?}");
     // Tracing an interleaved stream reads that lane's packets by lane, and
@@ -274,9 +271,9 @@ fn sources_are_compared_in_two_passes_over_the_packets() {
         "{steps:#?}"
     );
     assert!(
-        steps.iter().any(|s| s.ends_with(
-            "USING COVERING INDEX hop_sum (sum=? AND lane_id=? AND seq=? AND length=?)"
-        )),
+        steps
+            .iter()
+            .any(|s| s.ends_with("USING PRIMARY KEY (sum=? AND lane_id=?)")),
         "{steps:#?}"
     );
 }
