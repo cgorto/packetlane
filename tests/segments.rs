@@ -502,7 +502,7 @@ fn density_from_segments_matches_the_rows_on_a_run_of_several_sources() {
     assert_eq!(check_store(&store), [true; 3], "a clock had no fine window");
 }
 
-/// A run with kept fields of every kind: a dense lane (30,000 packets in
+/// A run with kept fields of every kind: a dense lane (100,000 packets in
 /// three seconds, enough for its series buckets to pay), a sparse one
 /// (whose buckets do not), and packets with no time on either clock.
 const KEPT_CONFIG: &str = r#"
@@ -582,8 +582,8 @@ fn kept_run(scratch: &Scratch) {
     scratch.write("packetlane.toml", KEPT_CONFIG.as_bytes());
     let t0 = 1_767_225_600_000_000_000i64;
     let mut dense = cosmos4_header(true, "kept", "bench");
-    for i in 0..30_000u32 {
-        let r = t0 + i64::from(i) * 100_000;
+    for i in 0..100_000u32 {
+        let r = t0 + i64::from(i) * 30_000;
         dense.extend(kept_entry(
             16,
             i,
@@ -1548,4 +1548,136 @@ fn damaged_segments_are_refused() {
             .packet_density(1, Clock::Order, 0, i64::MAX, 100)
             .is_ok()
     );
+}
+
+/// The old way of reading a plot: from the store's stored series buckets
+/// where they fit, the rest from its rows.
+#[allow(clippy::too_many_arguments)]
+fn series_from_sql(
+    store: &Store,
+    run: i64,
+    clock: Clock,
+    lane: i64,
+    field: Option<(&str, &str)>,
+    from: i64,
+    to: i64,
+    buckets: i64,
+) -> sql::Table {
+    let kept = !store
+        .query(&sql::has_coarse_series(lane, clock, field), 1)
+        .unwrap()
+        .rows
+        .is_empty();
+    let stored = if kept {
+        let meta = store.query(&sql::coarse_meta(run, clock), 1).unwrap();
+        meta.rows
+            .first()
+            .and_then(|r| Some((r[0].int()?, r[1].int()?)))
+    } else {
+        None
+    };
+    let parts: Vec<sql::Table> = sql::series(run, clock, lane, field, from, to, buckets, stored)
+        .iter()
+        .map(|q| store.query(q, 4001).unwrap())
+        .collect();
+    let parts: Vec<&sql::Table> = parts.iter().collect();
+    sql::merge_series(&parts)
+}
+
+#[test]
+#[ignore = "times item lists and plots; give it a store in SEG_TIMING_DB"]
+fn reads_timing() {
+    let db = PathBuf::from(std::env::var("SEG_TIMING_DB").unwrap());
+    let store = Store::open_read_only(&db, Duration::from_secs(600)).unwrap();
+    let run = ask(&store, "SELECT id FROM runs ORDER BY id", vec![])[0][0];
+    let median = |f: &mut dyn FnMut() -> usize| -> (f64, usize) {
+        let mut times = Vec::new();
+        let mut n = 0;
+        for _ in 0..7 {
+            let started = Instant::now();
+            n = f();
+            times.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        (times[3], n)
+    };
+    // The kept field with the most numbers on one lane, and the lane with
+    // the most packets with both times.
+    let r = store
+        .query(
+            &Query::new(
+                "SELECT lane_id, packet, field, SUM(count) AS n FROM file_series
+                 GROUP BY lane_id, packet, field ORDER BY n DESC LIMIT 1",
+                vec![],
+            ),
+            1,
+        )
+        .unwrap();
+    let (kept_lane, packet, field) = (
+        r.rows[0][0].int().unwrap(),
+        r.rows[0][1].text().unwrap().to_string(),
+        r.rows[0][2].text().unwrap().to_string(),
+    );
+    let delay_lane = ask(
+        &store,
+        "SELECT id FROM lanes WHERE kind = 'packet' ORDER BY packet_count DESC LIMIT 1",
+        vec![],
+    )[0][0];
+    for clock in Clock::ALL {
+        let c = clock.packet_column();
+        let r = ask(
+            &store,
+            &format!("SELECT MIN({c}), MAX({c}) FROM packets"),
+            vec![],
+        );
+        let (min, max) = (r[0][0], r[0][1]);
+        let span = max - min + 1;
+        let window = |zoom: i64| {
+            let width = span / zoom;
+            let from = min + (span - width) / 2;
+            (from, from + width - 1)
+        };
+        for zoom in [1i64, 100, 1000] {
+            let (from, to) = window(zoom);
+            let (seg, n) = median(&mut || {
+                store
+                    .packet_items(run, clock, from, to, 1000)
+                    .unwrap()
+                    .rows
+                    .len()
+            });
+            let (old, m) = median(&mut || {
+                store
+                    .query(&sql::packet_items(run, clock, from, to, 1001), 1000)
+                    .unwrap()
+                    .rows
+                    .len()
+            });
+            assert_eq!(n, m);
+            println!(
+                "items {} 1/{zoom}: segments {seg:.2} ms, sql {old:.2} ms; {n} rows",
+                clock.name()
+            );
+        }
+        for (what, lane, key) in [
+            ("kept", kept_lane, Some((packet.as_str(), field.as_str()))),
+            ("delay", delay_lane, None),
+        ] {
+            for zoom in [1i64, 10, 100, 1000] {
+                let (from, to) = window(zoom);
+                let (seg, n) = median(&mut || {
+                    let t = store.series(run, clock, lane, key, from, to, 1000).unwrap();
+                    t.rows.iter().map(|r| r[3].int().unwrap() as usize).sum()
+                });
+                let (old, m) = median(&mut || {
+                    let t = series_from_sql(&store, run, clock, lane, key, from, to, 1000);
+                    t.rows.iter().map(|r| r[3].int().unwrap() as usize).sum()
+                });
+                println!(
+                    "plot {what} {} 1/{zoom}: segments {seg:.2} ms, sql {old:.2} ms; {n} values (sql {m})",
+                    clock.name()
+                );
+            }
+        }
+    }
 }

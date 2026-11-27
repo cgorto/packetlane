@@ -696,7 +696,7 @@ impl Writer {
             });
         }
         for (c, sorter) in std::mem::take(&mut self.points).into_iter().enumerate() {
-            let shift = times[c].map_or(0, |t| t.2);
+            let shift = times[c].map_or(0, |t| layout::series_shift(t.2));
             entries.extend(self.series_sections(c as u8, shift, sorter)?);
         }
 
@@ -1289,12 +1289,35 @@ impl Segment {
     }
 
     /// The group of one lane's one series on a time clock, if there is one.
+    /// Found by binary search, and checked to lie within its sections.
     pub fn group(&self, clock: Clock, lane: u32, series: u32) -> Result<Option<GroupRecord>> {
-        let groups = self.groups(clock)?;
-        Ok(groups
-            .binary_search_by(|g| (g.lane, g.series).cmp(&(lane, series)))
-            .ok()
-            .map(|i| groups[i]))
+        let code = layout::clock_code(clock);
+        let e = self.section(KIND_GROUPS, code)?;
+        let key = |b: &[u8]| (u32_le(b), u32_le(&b[4..]));
+        let at = self.search(&e, (0, e.records()), 8, |b| key(b) < (lane, series))?;
+        let mut found = None;
+        self.each::<GROUP_BYTES>(&e, at, at + 1, |rec| {
+            let g = GroupRecord::decode(rec);
+            found = Some(g).filter(|g| (g.lane, g.series) == (lane, series));
+            Ok(false)
+        })?;
+        let Some(g) = found else {
+            return Ok(None);
+        };
+        let points = self.section(KIND_SERIES, code)?.records();
+        let buckets = self.section(KIND_SERIES_BUCKETS, code)?.records();
+        let ends = |first: u64, n: u64, of: u64| first.checked_add(n).is_some_and(|end| end <= of);
+        if !ends(g.first, g.count, points) || !ends(g.bucket_first, g.buckets, buckets) {
+            return Err(FormatError("a group of kept numbers is out of range".into()).into());
+        }
+        Ok(Some(g))
+    }
+
+    /// How many packets have a time on a time clock.
+    pub fn timed(&self, clock: Clock) -> Result<u64> {
+        Ok(self
+            .section(KIND_TIME, layout::clock_code(clock))?
+            .records())
     }
 
     /// The grid shift of a time clock's series buckets.
@@ -1699,6 +1722,28 @@ fn order_series(
         return Ok(());
     }
     let (lo, hi) = ((lo - first) as u64, (hi - first) as u64);
+    // The lane's group on a time clock holds all of the series if every
+    // packet has that time (and every delay, which needs both); if it
+    // holds fewer points than the window has packets, it is read instead.
+    for clock in [Clock::Receive, Clock::Packet] {
+        let whole = series == DELAY || seg.timed(clock)? == seg.packets();
+        if !whole {
+            continue;
+        }
+        let Some(g) = seg.group(clock, lane, series)? else {
+            // None of the lane's packets here has a value of the series.
+            return Ok(());
+        };
+        if g.count <= hi - lo + 1 {
+            return seg.group_points(clock, &g, i64::MIN, i64::MAX, |p| {
+                let index = u64::from(p.index);
+                if (lo..=hi).contains(&index) {
+                    bins.point(first + index as i64, p.num);
+                }
+            });
+        }
+        break;
+    }
     if series == DELAY {
         return seg.packets_in(lo, hi, |index, p| {
             if p.lane == lane
@@ -2034,7 +2079,7 @@ mod tests {
             let want_keys: Vec<_> = by_id.keys().copied().collect();
             assert_eq!(keys, want_keys, "{clock:?}");
             let shift = seg.series_shift(clock).unwrap();
-            assert_eq!(shift, written.times[c].unwrap().2);
+            assert_eq!(shift, layout::series_shift(written.times[c].unwrap().2));
             for g in &groups {
                 let mut want = by_id[&(g.lane, g.series)].clone();
                 want.sort_by_key(|a| (a.0, a.1));

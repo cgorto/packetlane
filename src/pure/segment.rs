@@ -119,8 +119,8 @@
 //!   and how many (u64 each), first record in kind 10 and how many (u64
 //!   each; none if the group's buckets were not worth keeping). One lane's
 //!   one series over a window is a binary search in its group and a scan.
-//! - kind 10, series buckets, one per time clock, whose parameter is the
-//!   clock's base grid shift: a 32-byte record (bucket i64, lowest f64,
+//! - kind 10, series buckets, one per time clock, whose parameter is their
+//!   grid shift, two less than the clock's base grid ([`series_shift`]): a 32-byte record (bucket i64, lowest f64,
 //!   highest f64, count u64) per bucket of a group that holds numbers, in
 //!   bucket order, for the groups whose buckets pay
 //!   ([`series_buckets_pay`]: at most a quarter as many as the group's
@@ -554,6 +554,14 @@ impl SeriesBucket {
 /// the numbers.
 pub fn series_buckets_pay(buckets: u64, numbers: u64) -> bool {
     buckets > 0 && buckets.saturating_mul(4) <= numbers
+}
+
+/// The grid of a clock's series buckets: four times finer than its base
+/// grid, so up to 16,384 buckets across the segment's span. A plot reads a
+/// lane's values alone, so finer buckets than density's still pay where
+/// a lane has many values; where it has few they are not kept.
+pub fn series_shift(base: u32) -> u32 {
+    base.saturating_sub(2)
 }
 
 /// Arrival delay in milliseconds, as SQLite works it out from
