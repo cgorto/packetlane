@@ -19,7 +19,6 @@ use std::collections::BinaryHeap;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::pure::cross::{Comparison, Logged};
 use crate::shell::segment::{self, Checksums, RecordFile, TempFile};
@@ -42,19 +41,6 @@ const LOGGED_BYTES: usize = 30;
 const HELD_BYTES: usize = 12;
 /// A packet a partner lacks: pair, id.
 const CANDIDATE_BYTES: usize = 12;
-
-static MOST_HELD: AtomicUsize = AtomicUsize::new(0);
-static LARGEST_GROUP: AtomicUsize = AtomicUsize::new(0);
-
-/// The most packets of one checksum this process has held in memory at
-/// once while comparing sources, and the most it has seen in one group.
-/// For tests of the bound.
-pub fn group_sizes() -> (usize, usize) {
-    (
-        MOST_HELD.load(Ordering::Relaxed),
-        LARGEST_GROUP.load(Ordering::Relaxed),
-    )
-}
 
 fn encode(l: &Logged) -> [u8; LOGGED_BYTES] {
     let mut b = [0u8; LOGGED_BYTES];
@@ -236,6 +222,9 @@ struct Group {
     over: Option<TempFile>,
     over_len: u64,
     size: usize,
+    /// The most packets held in memory at once, and the most in one group.
+    most_held: usize,
+    largest: usize,
 }
 
 impl Group {
@@ -260,13 +249,13 @@ impl Group {
         }
         self.held.push((lane, id));
         self.size += 1;
-        MOST_HELD.fetch_max(self.held.len(), Ordering::Relaxed);
+        self.most_held = self.most_held.max(self.held.len());
         Ok(())
     }
 
     /// Empties the group.
     fn clear(&mut self) {
-        LARGEST_GROUP.fetch_max(self.size, Ordering::Relaxed);
+        self.largest = self.largest.max(self.size);
         self.held.clear();
         self.over_len = 0;
         self.size = 0;
@@ -295,9 +284,16 @@ impl Group {
 /// partner lacks.
 pub struct Replay {
     candidates: Option<(TempFile, u64)>,
+    group_sizes: (usize, usize),
 }
 
 impl Replay {
+    /// The most packets of one checksum held in memory at once while
+    /// comparing, and the most seen in one group: what bounds the memory.
+    pub fn group_sizes(&self) -> (usize, usize) {
+        self.group_sizes
+    }
+
     /// Gives every kept (pair, id) back to the comparison.
     pub fn run(self, cmp: &mut Comparison) -> Result<()> {
         let Some((temp, len)) = self.candidates else {
@@ -361,6 +357,8 @@ pub fn compare(
         over: None,
         over_len: 0,
         size: 0,
+        most_held: 0,
+        largest: 0,
     };
     let mut kept = Kept { file: None, len: 0 };
     merge(inputs, &wants, |l| {
@@ -379,7 +377,10 @@ pub fn compare(
         }
         None => None,
     };
-    Ok(Replay { candidates })
+    Ok(Replay {
+        candidates,
+        group_sizes: (group.most_held, group.largest),
+    })
 }
 
 /// The (pair, id) of every packet a partner lacks, in a temporary file.
@@ -533,5 +534,72 @@ mod tests {
         assert!(want.counts().iter().all(|c| c.shared > 0));
         assert!(want.counts().iter().any(|c| c.missing > 0));
         assert!(want.copies(1, 2) > 0);
+    }
+
+    /// One packet repeated far more often than a group holds in memory, on
+    /// two sources: the group goes to a temporary file past
+    /// [`GROUP_MEMORY`], and the counts are those of every packet at once.
+    #[test]
+    fn a_group_larger_than_memory_is_held_in_a_file() {
+        let dir = std::env::temp_dir().join(format!("packetlane-group-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let scratch = Scratch(dir);
+        let repeats = GROUP_MEMORY / 2 + 5_000;
+        let mut all = Vec::new();
+        for lane in [1u32, 2] {
+            for _ in 0..repeats {
+                all.push(Logged {
+                    sum: 42,
+                    seq: 7,
+                    length: 10,
+                    lane,
+                    id: all.len() as i64 + 1,
+                });
+            }
+        }
+        // A packet only one source has, after the group.
+        all.push(Logged {
+            sum: 43,
+            seq: 8,
+            length: 10,
+            lane: 1,
+            id: all.len() as i64 + 1,
+        });
+        let mut w = Writer::create(&scratch.0, 1, 1).unwrap();
+        for p in &all {
+            let header = PrimaryHeader {
+                version: 0,
+                packet_type: PacketType::Telemetry,
+                has_secondary_header: false,
+                apid: 5,
+                seq_flags: SeqFlags::Unsegmented,
+                seq_count: p.seq,
+                data_length: 3,
+            };
+            let row = PacketRow {
+                idx: p.id - 1,
+                offset: 0,
+                length: p.length,
+                receive_ns: None,
+                packet_ns: None,
+                header: Some(header),
+                length_ok: true,
+                sum: p.sum,
+            };
+            w.push(i64::from(p.lane), &row, None).unwrap();
+        }
+        let listed = vec![(w.finish().unwrap().unwrap().name, 1)];
+        let pairs = [(1, 2), (2, 1)];
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        let want = compare_all(&pairs, &[], sorted);
+        let mut cmp = Comparison::new(&pairs, &[]);
+        let replay = compare(&scratch.0, &listed, &mut cmp, FAN_IN).unwrap();
+        let (held, largest) = replay.group_sizes();
+        replay.run(&mut cmp).unwrap();
+        assert_eq!(cmp.counts(), want.counts());
+        assert!(largest >= 2 * repeats, "largest group {largest}");
+        assert!(held <= GROUP_MEMORY, "held {held}");
     }
 }

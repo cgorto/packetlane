@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use packetlane::pure::cross::{hop_finding, origin_finding};
 use packetlane::pure::sql;
 use packetlane::pure::synth::{Source, demo_run, packet};
-use packetlane::shell::cross::{GROUP_MEMORY, group_sizes};
 use packetlane::shell::ingest::ingest_targets;
 use packetlane::shell::store::Store;
 use rusqlite::{Connection, OpenFlags, params};
@@ -470,7 +469,8 @@ fn one_source_has_nothing_to_compare() {
 /// A stream that sends the same packet hundreds of thousands of times, on
 /// two sources, and a third that lacks those but shares what comes before
 /// and after: one group of checksums far larger than what is held in
-/// memory, and as many packets to give back as missing.
+/// memory, and as many packets to give back as missing. (That the group is
+/// held within its bound is tested in `shell::cross`.)
 #[test]
 fn one_packet_repeated_is_compared_in_bounded_memory() {
     let repeats = 200_000;
@@ -501,9 +501,6 @@ fn one_packet_repeated_is_compared_in_bounded_memory() {
         ],
     );
     let runs = check(&scratch.db());
-    let (held, largest) = group_sizes();
-    assert!(largest >= 2 * repeats, "largest group {largest}");
-    assert!(held <= GROUP_MEMORY, "held {held}");
     let missing: Vec<&Row> = runs[0]
         .iter()
         .filter(|r| r.2.starts_with(&format!("{repeats} packets")))
