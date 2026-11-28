@@ -38,6 +38,27 @@ Options:
 
 Exit status: 0 clean, 1 problems found, 2 error";
 
+/// Writes to standard output. If whatever reads it has gone, as `head` does
+/// once it has read enough, the program ends there quietly with status 0, as
+/// a tool in a pipe does; any other failure to write is an error, status 2.
+fn write_out(args: std::fmt::Arguments<'_>) {
+    match std::io::stdout().lock().write_fmt(args) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(e) => {
+            eprintln!("packetlane: writing the output: {e}");
+            std::process::exit(2)
+        }
+    }
+}
+
+/// `println!` through [`write_out`].
+macro_rules! out {
+    ($($arg:tt)*) => {
+        write_out(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
 fn plural<'a>(n: u64, one: &'a str, many: &'a str) -> &'a str {
     if n == 1 { one } else { many }
 }
@@ -89,7 +110,7 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         " (guessed)"
     };
     let wrapped = if file.is_gzip() { ", in gzip" } else { "" };
-    println!("{path}: format {}{certainty}{wrapped}", format.name());
+    out!("{path}: format {}{certainty}{wrapped}", format.name());
 
     // No configuration here: packets go unnamed, and there is no packet
     // time to compare and no limit to check.
@@ -109,40 +130,41 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let found = check.finish();
     let report = &found.continuity;
     if let Some(about) = records.describe() {
-        println!("{path}: {about}");
+        out!("{path}: {about}");
     }
 
     let (packets, streams) = (found.packets, report.streams.len() as u64);
-    println!(
+    out!(
         "{path}: {packets} {}, {streams} {}",
         plural(packets, "packet", "packets"),
         plural(streams, "stream", "streams"),
     );
     if found.non_packets() > 0 {
-        println!("  {}", non_packet_message(found.non_packets()));
+        out!("  {}", non_packet_message(found.non_packets()));
     }
     let wrong_length: u64 = found.wrong_length.iter().map(|(_, n)| n).sum();
     if wrong_length > 0 {
-        println!("  Note: {}", wrong_length_message(wrong_length));
+        out!("  Note: {}", wrong_length_message(wrong_length));
     }
     for (key, count) in &report.streams {
-        println!("  {key}: {count} {}", plural(*count, "packet", "packets"));
+        out!("  {key}: {count} {}", plural(*count, "packet", "packets"));
     }
     for finding in &report.findings {
         let what = match finding.kind {
             SeqKind::Constant { .. } => "Note",
             _ => "Problem",
         };
-        println!("  {what}: {finding}");
+        out!("  {what}: {finding}");
     }
     let order = &found.order;
     for finding in order {
         match finding.packet {
-            Some(i) => println!(
+            Some(i) => out!(
                 "  Problem: {}: {} at packet #{i}",
-                finding.lane, finding.message
+                finding.lane,
+                finding.message
             ),
-            None => println!("  Problem: {}: {}", finding.lane, finding.message),
+            None => out!("  Problem: {}: {}", finding.lane, finding.message),
         }
     }
     let notices = records.notices();
@@ -157,13 +179,13 @@ fn check_one(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         } else {
             "Note"
         };
-        println!("  {what}: {notice}");
+        out!("  {what}: {notice}");
     }
     if notices.more > 0 {
-        println!("  Problem: {} more losses are not listed", notices.more);
+        out!("  Problem: {} more losses are not listed", notices.more);
     }
     if let Some(e) = &read_problem {
-        println!("  Problem: {e}");
+        out!("  Problem: {e}");
     }
     let lost = notices.more > 0 || notices.list.iter().any(|n| n.is_problem());
     let counted = report
@@ -209,9 +231,9 @@ fn ingest(rest: &[String]) -> CliResult {
         user_config_path().as_deref(),
     )?;
 
-    println!("Run {} at {}", summary.run, summary.root);
+    out!("Run {} at {}", summary.run, summary.root);
     if summary.reread {
-        println!("  Config changed; existing files re-read");
+        out!("  Config changed; existing files re-read");
     }
     for file in &summary.files {
         let what = match file.status {
@@ -231,9 +253,9 @@ fn ingest(rest: &[String]) -> CliResult {
         } else {
             format!(" ({})", file.note)
         };
-        println!("  {}: {what}{note}", file.rel);
+        out!("  {}: {what}{note}", file.rel);
     }
-    println!(
+    out!(
         "{} {} in this run; store: {}",
         summary.problems,
         plural(summary.problems as u64, "problem", "problems"),
@@ -254,7 +276,7 @@ fn query(rest: &[String]) -> CliResult {
     check_user_sql(statement)?;
     let store = Store::open_read_only(&db_path(&args)?, Duration::from_secs(60))?;
     let table = store.query_user(statement, 100_000)?;
-    println!("{}", table.columns.join("\t"));
+    out!("{}", table.columns.join("\t"));
     for row in &table.rows {
         let cells: Vec<String> = row
             .iter()
@@ -265,7 +287,7 @@ fn query(rest: &[String]) -> CliResult {
                 Cell::Text(v) => v.replace(['\t', '\n'], " "),
             })
             .collect();
-        println!("{}", cells.join("\t"));
+        out!("{}", cells.join("\t"));
     }
     if table.truncated {
         eprintln!("packetlane: More rows than shown; add a LIMIT");
@@ -297,7 +319,7 @@ fn import_cosmos(files: &[String]) -> CliResult {
         import.warnings.len(),
         plural(import.warnings.len() as u64, "warning", "warnings"),
     );
-    print!("{}", cosmos_defs::to_toml(&import.packets));
+    write_out(format_args!("{}", cosmos_defs::to_toml(&import.packets)));
     Ok(if import.packets.is_empty() {
         ExitCode::from(1)
     } else {
@@ -329,13 +351,13 @@ fn demo(rest: &[String]) -> CliResult {
             .and_then(|mut f| f.write_all(&file.bytes))
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let bytes = file.bytes.len() as u64;
-        println!(
+        out!(
             "Wrote {} ({bytes} {})",
             path.display(),
             plural(bytes, "byte", "bytes")
         );
     }
-    println!("Next: packetlane serve --root {}", dir.display());
+    out!("Next: packetlane serve --root {}", dir.display());
     Ok(ExitCode::SUCCESS)
 }
 
@@ -402,7 +424,7 @@ fn serve(rest: &[String]) -> CliResult {
         user_config: user_config_path(),
         port,
     })?;
-    println!("{}", server.url());
+    out!("{}", server.url());
     server.run();
     Ok(ExitCode::SUCCESS)
 }

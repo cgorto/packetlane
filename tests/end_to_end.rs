@@ -201,6 +201,49 @@ fn the_read_only_store_cannot_be_made_to_write() {
     assert!(reader.query_user(endless, 10).is_err());
 }
 
+/// `query` and `check` piped into a reader that stops early (as `head`
+/// does) end quietly: no panic, nothing on standard error, status 0.
+#[test]
+fn output_into_a_closed_pipe_ends_quietly() {
+    use std::process::{Command, Stdio};
+    let scratch = Scratch::new();
+    let db = scratch.0.join("store.db");
+    drop(Store::open(&db).unwrap());
+    let packets = demo_run(60)
+        .into_iter()
+        .find(|f| f.rel.ends_with(".bin"))
+        .unwrap();
+    let file = scratch.0.join("one.bin");
+    fs::write(&file, &packets.bytes).unwrap();
+    let db_arg = db.to_string_lossy().into_owned();
+    let file_arg = file.to_string_lossy().into_owned();
+    let many = "with recursive c(x) as (select 1 union all select x + 1 from c limit 90000)
+                select x, 'a line long enough to fill a pipe quickly' from c";
+    let mut check = vec!["check"];
+    check.extend(std::iter::repeat_n(file_arg.as_str(), 3_000));
+    for args in [vec!["query", "--db", &db_arg, many], check] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_packetlane"))
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut first = [0u8; 100];
+        stdout.read_exact(&mut first).unwrap();
+        drop(stdout);
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{}: {:?} {stderr}",
+            args[0],
+            out.status
+        );
+        assert!(stderr.is_empty(), "{}: {stderr}", args[0]);
+    }
+}
+
 /// A store made by a build with another schema is refused for reading as
 /// for writing, by `query` and `serve` alike, with the same words, and
 /// `serve` does not word it as a port it could not listen on.
