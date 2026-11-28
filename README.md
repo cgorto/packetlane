@@ -184,9 +184,9 @@ Limits of working from counters alone are listed at the top of
   listed when it started; if one of them was replaced by an ingest
   meanwhile, it is run once more.
 - A store made by an earlier build with a different layout is refused, and
-  says so (this build's is layout 6): delete it, and its `.seg` folder,
+  says so (this build's is layout 7): delete it, and its `.seg` folder,
   and ingest again. A segment written by a build with another segment
-  format (this build's is 4) cannot be read either: ingest the store
+  format (this build's is 5) cannot be read either: ingest the store
   again. Nothing in it is not in the logs.
 - Writing uses about 16 to 21 MB of memory whatever the size of the run
   (measured: 16 MB for three million packets in 900 lanes, 21 MB for ten

@@ -43,9 +43,19 @@
 //! `field_values` is read in packet order from the segments' values
 //! sections: a range of packets found by binary search, segments without
 //! a series of the packet and field asked for skipped, the others read
-//! whole and their values tested by series and number. Its rowid is the
-//! segment's place in the list and the value's place in the segment, unique
-//! within a statement; the rowids the SQLite table had are kept nowhere.
+//! whole and their values tested by series and number. With a field and a
+//! range of numbers asked for, the values between those numbers are first
+//! counted in the series' value order (two binary searches a series); if
+//! there are at most 64 K of them they are gathered from there, put in
+//! packet order and handed out, so that a narrow range costs what it holds.
+//! Or, with a field asked for and an order by number (either way, then
+//! packet id either way), it is read from the value order of every series
+//! the field (and packet) names in every segment, between the bounds on the
+//! number, merged: values without a number first when ascending and last
+//! when descending, as SQLite orders nulls; runs of one number turned round
+//! where packet ids go the other way. Its rowid is the segment's place in
+//! the list and the value's place in the segment, unique within a
+//! statement; the rowids the SQLite table had are kept nowhere.
 //!
 //! Each read checks the time limit of the connection now and then, since
 //! SQLite's progress handler does not run while a table reads without
@@ -80,8 +90,9 @@ use rusqlite::vtab::{
 use rusqlite::{Connection, Error as SqlError};
 
 use crate::pure::segment::{
-    KIND_PACKETS, KIND_TIME, KIND_VALUES, PACKET_BYTES, PacketRecord, TIME_BYTES, TimeRecord,
-    VALUE_BYTES, ValueRecord,
+    KIND_PACKETS, KIND_TIME, KIND_VALUE_ORDER, KIND_VALUES, PACKET_BYTES, PacketRecord, TIME_BYTES,
+    TimeRecord, VALUE_BYTES, VALUE_ORDER_BYTES, ValueGroup, ValueOrderRecord, ValueRecord,
+    number_key,
 };
 use crate::pure::sql::{self, Clock};
 use crate::shell::segment::Segment;
@@ -331,6 +342,7 @@ struct Opened {
     seg: Segment,
     labels: OnceLock<Vec<String>>,
     names: OnceLock<Vec<(String, String)>>,
+    groups: OnceLock<Vec<ValueGroup>>,
 }
 
 impl Opened {
@@ -348,6 +360,24 @@ impl Opened {
         }
         let read = self.seg.series_names().map_err(|e| fail(e.to_string()))?;
         Ok(self.names.get_or_init(|| read))
+    }
+
+    fn groups(&self) -> VResult<&[ValueGroup]> {
+        if let Some(g) = self.groups.get() {
+            return Ok(g);
+        }
+        let read = self.seg.value_groups().map_err(|e| fail(e.to_string()))?;
+        Ok(self.groups.get_or_init(|| read))
+    }
+
+    /// Which series match a packet name and a field name asked for, by
+    /// number; all if neither is asked for.
+    fn matching(&self, packet: Option<&str>, field: Option<&str>) -> VResult<Vec<bool>> {
+        Ok(self
+            .names()?
+            .iter()
+            .map(|(p, f)| packet.is_none_or(|w| w == p) && field.is_none_or(|w| w == f))
+            .collect())
     }
 }
 
@@ -416,6 +446,7 @@ impl Reading {
             seg: segment,
             labels: OnceLock::new(),
             names: OnceLock::new(),
+            groups: OnceLock::new(),
         });
         Ok(Arc::clone(seg.opened.get_or_init(|| opened)))
     }
@@ -457,6 +488,18 @@ impl<const N: usize> Records<N> {
             cap,
             buf: Vec::new(),
             at: 0,
+        }
+    }
+
+    /// Where the reader stands, in bytes: the start of the next record
+    /// when reading first to last, the end of it when reading last to
+    /// first.
+    fn boundary(&self) -> u64 {
+        if self.back {
+            self.end.saturating_add(self.at as u64)
+        } else {
+            self.start
+                .saturating_sub(self.buf.len().saturating_sub(self.at) as u64)
         }
     }
 
@@ -508,6 +551,94 @@ impl<const N: usize> Records<N> {
         record.copy_from_slice(src);
         self.at += N;
         Ok(Some(record))
+    }
+}
+
+/// Records of a sorted section read through [`Records`], with each run of
+/// records of equal key handed out in the other order than the reader
+/// reads them, if asked: last to first within the run when reading first
+/// to last, and the other way. A run of up to `cap` records is held; a
+/// longer one is read again, the other way, by a second reader over just
+/// its range, so memory stays the same however long a run is.
+struct TieReader<const N: usize> {
+    reader: Records<N>,
+    reverse: bool,
+    key: fn(&[u8; N]) -> u64,
+    cap: usize,
+    /// The run being handed out, last record first.
+    run: Vec<[u8; N]>,
+    /// The first record of the next run, and where the reader stood before
+    /// it.
+    peeked: Option<([u8; N], u64)>,
+    /// A run too long to hold, read the other way.
+    long: Option<Records<N>>,
+}
+
+impl<const N: usize> TieReader<N> {
+    fn new(reader: Records<N>, reverse: bool, key: fn(&[u8; N]) -> u64, cap: usize) -> Self {
+        TieReader {
+            reader,
+            reverse,
+            key,
+            cap: cap.max(1),
+            run: Vec::new(),
+            peeked: None,
+            long: None,
+        }
+    }
+
+    fn read(&mut self) -> VResult<Option<[u8; N]>> {
+        if !self.reverse {
+            return self.reader.read();
+        }
+        if let Some(long) = &mut self.long {
+            match long.read()? {
+                Some(r) => return Ok(Some(r)),
+                None => self.long = None,
+            }
+        }
+        if let Some(r) = self.run.pop() {
+            return Ok(Some(r));
+        }
+        let (first, from) = match self.peeked.take() {
+            Some(p) => p,
+            None => {
+                let at = self.reader.boundary();
+                match self.reader.read()? {
+                    Some(r) => (r, at),
+                    None => return Ok(None),
+                }
+            }
+        };
+        let key = (self.key)(&first);
+        self.run.push(first);
+        let mut held = true;
+        let to = loop {
+            let at = self.reader.boundary();
+            match self.reader.read()? {
+                None => break at,
+                Some(r) if (self.key)(&r) != key => {
+                    self.peeked = Some((r, at));
+                    break at;
+                }
+                Some(r) if self.run.len() < self.cap => self.run.push(r),
+                Some(_) => held = false,
+            }
+        };
+        if held {
+            return Ok(self.run.pop());
+        }
+        self.run.clear();
+        let opened = Arc::clone(&self.reader.opened);
+        let buffer = self.reader.cap;
+        let mut long = if self.reader.back {
+            Records::new(opened, to, from, buffer)
+        } else {
+            Records::back(opened, from, to, buffer)
+        };
+        let first = long.read()?;
+        self.long = Some(long);
+        Ok(first)
     }
 }
 
@@ -1754,15 +1885,39 @@ unsafe impl<'vtab> VTab<'vtab> for ValuesTab {
                 * if num_eq { 0.01 } else { quarter(num_sides) })
             .max(1.0);
             take(info, &taken)?;
-            info.set_idx_num(0);
-            info.set_estimated_cost(scan + 1.0);
             info.set_estimated_rows(out as i64);
-            // In packet order, and within a packet in the order kept; only
-            // the packet id can be claimed.
             let asked: Vec<(c_int, bool)> = info
                 .order_bys()
                 .map(|o| (o.column(), o.is_order_by_desc()))
                 .collect();
+            // In order of number, either way, then of packet id, either way:
+            // from the value order of the series a field (and packet) names,
+            // merged across them, reading what they hold between the bounds
+            // on the number. With no order of packet id asked for, values
+            // of equal number come by packet id the way the number goes.
+            let by_value = match asked.as_slice() {
+                [(V_NUM, num_desc)] => Some((*num_desc, *num_desc)),
+                [(V_NUM, num_desc), (V_PACKET_ID, id_desc)] => Some((*num_desc, *id_desc)),
+                _ => None,
+            }
+            .filter(|_| sides(&taken, 'd').0);
+            if let Some((num_desc, id_desc)) = by_value {
+                let mut plan = PLAN_BY_VALUE;
+                if num_desc {
+                    plan |= PLAN_NUM_DESC;
+                }
+                if id_desc {
+                    plan |= PLAN_ID_DESC;
+                }
+                info.set_idx_num(plan);
+                info.set_estimated_cost(out + segments.log2().max(1.0) + 1.0);
+                info.set_order_by_consumed(true);
+                return Ok(true);
+            }
+            // In packet order, and within a packet in the order kept; only
+            // the packet id can be claimed.
+            info.set_idx_num(0);
+            info.set_estimated_cost(scan + 1.0);
             info.set_order_by_consumed(asked == [(V_PACKET_ID, false)]);
             Ok(true)
         })
@@ -1921,6 +2076,317 @@ struct ValueRow {
     packet_id: i64,
     position: u64,
     value: ValueRecord,
+    /// The value has a text, but where it starts must be read from its
+    /// record in the values section.
+    text_unread: bool,
+}
+
+/// A `field_values` plan in order of number; with the order each way.
+const PLAN_BY_VALUE: c_int = 1;
+const PLAN_NUM_DESC: c_int = 2;
+const PLAN_ID_DESC: c_int = 4;
+
+/// Most values [`Picked`] gathers to hand out in packet order: 64 K, of 32
+/// bytes each, 2 MB.
+const PICK_MOST: u64 = 1 << 16;
+
+/// Values of a field between two numbers, few enough to gather from the
+/// value order and hand out in packet order, as the scan in packet order
+/// would: by segment, then place in it.
+struct Picked {
+    rows: std::vec::IntoIter<PickedRow>,
+}
+
+struct PickedRow {
+    seg: usize,
+    position: u64,
+    packet_id: i64,
+    index: u32,
+    series: u32,
+    num: f64,
+    text: bool,
+}
+
+impl Picked {
+    /// The values a field (and packet) and bounds on the number allow, if
+    /// there are at most [`PICK_MOST`]; `None` if more, or if the bounds
+    /// do not name a field and a range of numbers.
+    fn gather(r: &mut Reading, segs: &[usize], b: &ValueBounds) -> VResult<Option<Picked>> {
+        if b.field.is_none() || !b.num.bounded || b.empty() {
+            return Ok(None);
+        }
+        let mut ranges = Vec::new();
+        let mut total = 0u64;
+        for &at in segs {
+            let opened = r.open(at)?;
+            let ok = opened.matching(b.packet.as_deref(), b.field.as_deref())?;
+            if !ok.contains(&true) {
+                continue;
+            }
+            for g in opened.groups()? {
+                if !ok.get(g.series as usize).copied().unwrap_or(false) {
+                    continue;
+                }
+                let (from, to) = opened
+                    .seg
+                    .value_order_range(g, b.num.lo, b.num.hi)
+                    .map_err(|e| fail(e.to_string()))?;
+                total = total.saturating_add(to - from);
+                if total > PICK_MOST {
+                    return Ok(None);
+                }
+                if from < to {
+                    ranges.push((at, g.series, from, to));
+                }
+            }
+        }
+        let mut rows = Vec::with_capacity(total as usize);
+        for (at, series, from, to) in ranges {
+            let Some(seg) = r.manifest.segs.get(at) else {
+                continue;
+            };
+            let (first, packets) = (seg.first, seg.packets());
+            let opened = r.open(at)?;
+            let (offset, _) = opened
+                .seg
+                .section_bytes(KIND_VALUE_ORDER, Clock::Receive)
+                .map_err(|e| fail(e.to_string()))?;
+            let bytes = |n: u64| {
+                n.saturating_mul(VALUE_ORDER_BYTES as u64)
+                    .saturating_add(offset)
+            };
+            let mut reader =
+                Records::<VALUE_ORDER_BYTES>::new(opened, bytes(from), bytes(to), SCAN_BUFFER);
+            while let Some(raw) = reader.read()? {
+                r.tick()?;
+                let v = ValueOrderRecord::decode(&raw);
+                if u64::from(v.index) >= packets {
+                    return Err(fail("a kept value names no packet"));
+                }
+                let packet_id = first.saturating_add(i64::from(v.index));
+                if b.packet_id.holds(packet_id) && b.num.holds(Some(v.num)) {
+                    rows.push(PickedRow {
+                        seg: at,
+                        position: v.position,
+                        packet_id,
+                        index: v.index,
+                        series,
+                        num: v.num,
+                        text: v.text,
+                    });
+                }
+            }
+        }
+        rows.sort_unstable_by_key(|p| (p.seg, p.position));
+        Ok(Some(Picked {
+            rows: rows.into_iter(),
+        }))
+    }
+
+    fn next(&mut self) -> Option<ValueRow> {
+        self.rows.next().map(|p| ValueRow {
+            seg: p.seg,
+            packet_id: p.packet_id,
+            position: p.position,
+            value: ValueRecord {
+                index: p.index,
+                series: p.series,
+                num: Some(p.num),
+                text_at: None,
+            },
+            text_unread: p.text,
+        })
+    }
+}
+
+/// One series of one segment in value order: its values with a number,
+/// between the bounds, or those without one.
+struct ByValueSlot {
+    seg: usize,
+    first: i64,
+    packets: u64,
+    series: u32,
+    numbers: bool,
+    reader: TieReader<VALUE_ORDER_BYTES>,
+    head: Option<ValueOrderRecord>,
+}
+
+/// Values in order of number and then packet id, merged across the series
+/// and segments a field names. Values without a number come first when
+/// the number ascends and last when it descends, as SQLite orders nulls,
+/// by packet id.
+struct ByValue {
+    num_desc: bool,
+    id_desc: bool,
+    bounds: ValueBounds,
+    slots: Vec<ByValueSlot>,
+    /// Each slot's next value: whether it is in the later of the two parts
+    /// (numbers, values without one), its number and packet id as keys of
+    /// the order, and the slot.
+    heap: BinaryHeap<Reverse<(bool, u64, i64, usize)>>,
+}
+
+fn value_order_key(b: &[u8; VALUE_ORDER_BYTES]) -> u64 {
+    ValueOrderRecord::key_of(b)
+}
+
+impl ByValue {
+    fn new(
+        r: &mut Reading,
+        segs: &[usize],
+        b: ValueBounds,
+        num_desc: bool,
+        id_desc: bool,
+    ) -> VResult<ByValue> {
+        // (segment, series, first record, end, numbers)
+        let mut parts = Vec::new();
+        if !b.empty() {
+            for &at in segs {
+                let opened = r.open(at)?;
+                let ok = opened.matching(b.packet.as_deref(), b.field.as_deref())?;
+                if !ok.contains(&true) {
+                    continue;
+                }
+                for g in opened.groups()? {
+                    if !ok.get(g.series as usize).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    let (from, to) = if b.num.bounded {
+                        opened
+                            .seg
+                            .value_order_range(g, b.num.lo, b.num.hi)
+                            .map_err(|e| fail(e.to_string()))?
+                    } else {
+                        (g.first + g.nulls, g.first + g.count)
+                    };
+                    if from < to {
+                        parts.push((at, g.series, from, to, true));
+                    }
+                    if !b.num.bounded && g.nulls > 0 {
+                        parts.push((at, g.series, g.first, g.first + g.nulls, false));
+                    }
+                }
+            }
+        }
+        // The readers share the merge's buffers; each holds a run of equal
+        // numbers as large as its buffer.
+        let buffer = (MERGE_BUFFERS / parts.len().max(1)).clamp(VALUE_ORDER_BYTES, SCAN_BUFFER);
+        let mut slots = Vec::with_capacity(parts.len());
+        for (at, series, from, to, numbers) in parts {
+            let Some(seg) = r.manifest.segs.get(at) else {
+                continue;
+            };
+            let opened = r.open(at)?;
+            let (offset, _) = opened
+                .seg
+                .section_bytes(KIND_VALUE_ORDER, Clock::Receive)
+                .map_err(|e| fail(e.to_string()))?;
+            let bytes = |n: u64| {
+                n.saturating_mul(VALUE_ORDER_BYTES as u64)
+                    .saturating_add(offset)
+            };
+            // Values with a number are read the way the number goes, runs
+            // of one number turned round if packet ids go the other way;
+            // those without one the way packet ids go.
+            let back = if numbers { num_desc } else { id_desc };
+            let reader = if back {
+                Records::back(opened, bytes(from), bytes(to), buffer)
+            } else {
+                Records::new(opened, bytes(from), bytes(to), buffer)
+            };
+            let reverse = numbers && num_desc != id_desc;
+            slots.push(ByValueSlot {
+                seg: at,
+                first: seg.first,
+                packets: seg.packets(),
+                series,
+                numbers,
+                reader: TieReader::new(
+                    reader,
+                    reverse,
+                    value_order_key,
+                    buffer / VALUE_ORDER_BYTES,
+                ),
+                head: None,
+            });
+        }
+        let mut scan = ByValue {
+            num_desc,
+            id_desc,
+            bounds: b,
+            slots,
+            heap: BinaryHeap::new(),
+        };
+        for slot in 0..scan.slots.len() {
+            scan.advance(r, slot)?;
+        }
+        Ok(scan)
+    }
+
+    /// Reads a slot's next value within the bounds on packet id onto the
+    /// heap.
+    fn advance(&mut self, r: &mut Reading, slot: usize) -> VResult<()> {
+        let Some(s) = self.slots.get_mut(slot) else {
+            return Ok(());
+        };
+        s.head = None;
+        while let Some(raw) = s.reader.read()? {
+            r.tick()?;
+            let v = ValueOrderRecord::decode(&raw);
+            if u64::from(v.index) >= s.packets {
+                return Err(fail("a kept value names no packet"));
+            }
+            let id = s.first.saturating_add(i64::from(v.index));
+            if !self.bounds.packet_id.holds(id) {
+                continue;
+            }
+            let later = s.numbers == self.num_desc;
+            let num = if s.numbers {
+                let k = number_key(v.num);
+                if self.num_desc { !k } else { k }
+            } else {
+                0
+            };
+            let id = if self.id_desc { !id } else { id };
+            s.head = Some(v);
+            self.heap.push(Reverse((!later, num, id, slot)));
+            break;
+        }
+        Ok(())
+    }
+
+    fn next(&mut self, r: &mut Reading) -> VResult<Option<ValueRow>> {
+        let Some(Reverse((_, _, _, slot))) = self.heap.pop() else {
+            return Ok(None);
+        };
+        let Some(s) = self.slots.get(slot) else {
+            return Ok(None);
+        };
+        let Some(v) = s.head else {
+            return Err(fail("a value-order slot lost its value"));
+        };
+        let row = ValueRow {
+            seg: s.seg,
+            packet_id: s.first.saturating_add(i64::from(v.index)),
+            position: v.position,
+            value: ValueRecord {
+                index: v.index,
+                series: s.series,
+                num: s.numbers.then_some(v.num),
+                text_at: None,
+            },
+            text_unread: v.text,
+        };
+        self.advance(r, slot)?;
+        Ok(Some(row))
+    }
+}
+
+/// How a `field_values` cursor reads.
+enum ValueSource {
+    Packets(ValueScan),
+    Picked(Picked),
+    ByValue(ByValue),
 }
 
 impl ValueScan {
@@ -1969,6 +2435,7 @@ impl ValueScan {
                 packet_id: slot.first.saturating_add(i64::from(v.index)),
                 position,
                 value: v,
+                text_unread: false,
             }));
         }
     }
@@ -2037,14 +2504,16 @@ struct ValuesCursor {
     /// SQLite's part; must come first.
     base: sqlite3_vtab_cursor,
     reading: Reading,
-    scan: Option<ValueScan>,
+    scan: Option<ValueSource>,
     row: Option<ValueRow>,
 }
 
 impl ValuesCursor {
     fn step(&mut self) -> VResult<()> {
         self.row = match &mut self.scan {
-            Some(scan) => scan.next(&mut self.reading)?,
+            Some(ValueSource::Packets(scan)) => scan.next(&mut self.reading)?,
+            Some(ValueSource::Picked(picked)) => picked.next(),
+            Some(ValueSource::ByValue(scan)) => scan.next(&mut self.reading)?,
             None => None,
         };
         if self.row.is_none() {
@@ -2059,7 +2528,7 @@ impl ValuesCursor {
 // and hands SQLite a pointer to it as a `sqlite3_vtab_cursor`, and casts it
 // back.
 unsafe impl VTabCursor for ValuesCursor {
-    fn filter(&mut self, _plan: c_int, idx_str: Option<&str>, args: &Filters<'_>) -> VResult<()> {
+    fn filter(&mut self, plan: c_int, idx_str: Option<&str>, args: &Filters<'_>) -> VResult<()> {
         guard(|| {
             let b = ValueBounds::read(&decode_plan(idx_str), args);
             let m = Arc::clone(&self.reading.manifest);
@@ -2076,11 +2545,19 @@ unsafe impl VTabCursor for ValuesCursor {
                     })
                     .collect()
             };
-            self.scan = Some(ValueScan {
-                segs,
-                next: 0,
-                open: None,
-                bounds: b,
+            let r = &mut self.reading;
+            self.scan = Some(if plan & PLAN_BY_VALUE != 0 {
+                let (num_desc, id_desc) = (plan & PLAN_NUM_DESC != 0, plan & PLAN_ID_DESC != 0);
+                ValueSource::ByValue(ByValue::new(r, &segs, b, num_desc, id_desc)?)
+            } else if let Some(picked) = Picked::gather(r, &segs, &b)? {
+                ValueSource::Picked(picked)
+            } else {
+                ValueSource::Packets(ValueScan {
+                    segs,
+                    next: 0,
+                    open: None,
+                    bounds: b,
+                })
             });
             self.step()
         })
@@ -2120,13 +2597,28 @@ unsafe impl VTabCursor for ValuesCursor {
                 V_PACKET => ctx.set_result(name(0)?),
                 V_FIELD => ctx.set_result(name(1)?),
                 V_NUM => ctx.set_result(row.value.num),
-                V_TEXT => match row.value.text_at {
-                    None => ctx.set_result(None::<&str>),
-                    Some(at) => {
+                V_TEXT => {
+                    let at = if row.text_unread {
                         let opened = self.reading.open(row.seg)?;
-                        ctx.set_result(opened.seg.text(at).map_err(|e| fail(e.to_string()))?)
+                        let v = opened
+                            .seg
+                            .value_at(row.position)
+                            .map_err(|e| fail(e.to_string()))?;
+                        if v.series != row.value.series {
+                            return Err(fail("a value in value order names another value"));
+                        }
+                        v.text_at
+                    } else {
+                        row.value.text_at
+                    };
+                    match at {
+                        None => ctx.set_result(None::<&str>),
+                        Some(at) => {
+                            let opened = self.reading.open(row.seg)?;
+                            ctx.set_result(opened.seg.text(at).map_err(|e| fail(e.to_string()))?)
+                        }
                     }
-                },
+                }
                 _ => Err(fail("no such column")),
             }
         })

@@ -564,6 +564,93 @@ fn statements_over_the_tables_give_what_the_tables_gave() {
     }
 }
 
+/// Kept values in order of number, either way and then packet id either
+/// way, from the value order of the series a field names, merged across
+/// series and segments: ties, values without a number (first ascending,
+/// last descending), values with a text, values of packets with no time,
+/// bounds on the number and the packet id, limits. And values of a field
+/// between two numbers, gathered from the value order and handed out in
+/// packet order.
+#[test]
+fn kept_values_in_order_of_number_are_what_the_tables_gave() {
+    let s = stored();
+    let reader = s.reader();
+    let cols = "packet_id, file_id, packet, field, num, text";
+    let mut statements = Vec::new();
+    for (filter, limit) in [
+        // Two series named V (HK and RARE), no ties within a file, ties
+        // across files.
+        ("field = 'V'", ""),
+        ("field = 'V'", " LIMIT 7"),
+        ("field = 'V' AND packet = 'RARE'", ""),
+        // Two numbers only, each thousands of times, with a text.
+        ("field = 'MODE'", ""),
+        ("field = 'MODE'", " LIMIT 50"),
+        // Floats, some not a number: values without one.
+        ("field = 'F'", ""),
+        ("field = 'F'", " LIMIT 30"),
+        // Texts with no number at all.
+        ("field = 'NAME'", ""),
+        // Packets with no time.
+        ("field = 'B'", ""),
+        ("field = 'ARR[1]'", ""),
+        // Bounds on the number, the packet id and the file.
+        ("field = 'V' AND num BETWEEN 100 AND 20000", ""),
+        ("field = 'V' AND num > 30000", " LIMIT 10"),
+        ("field = 'F' AND num >= -60.25 AND num < 1.5", ""),
+        ("field = 'MODE' AND num = 1", " LIMIT 20"),
+        ("field = 'V' AND packet_id BETWEEN 100 AND 3000", ""),
+        ("field = 'V' AND file_id = 1", ""),
+        ("field = 'F' AND num > 1e300", ""),
+        ("field = 'NOPE'", ""),
+        ("field = 'V' AND packet = 'NOPE'", ""),
+    ] {
+        for order in [
+            "num, packet_id",
+            "num DESC, packet_id",
+            "num, packet_id DESC",
+            "num DESC, packet_id DESC",
+        ] {
+            statements.push(format!(
+                "SELECT {cols} FROM {{V}} WHERE {filter} ORDER BY {order}{limit}"
+            ));
+        }
+    }
+    // Ordered by number alone, where no two values of the field are equal
+    // (so the order of ties cannot differ), and through the view.
+    statements.push(format!(
+        "SELECT {cols} FROM {{V}} WHERE field = 'V' AND file_id = 1 ORDER BY num DESC"
+    ));
+    statements.push(format!(
+        "SELECT {cols} FROM {{V}} WHERE field = 'V' AND file_id = 1 ORDER BY num LIMIT 5"
+    ));
+    statements.push(
+        "SELECT * FROM {VV} WHERE field = 'MODE' ORDER BY value DESC, id LIMIT 40".to_string(),
+    );
+    statements.push("SELECT * FROM {VV} WHERE field = 'F' ORDER BY value, id LIMIT 40".to_string());
+    // Between two numbers, in packet order.
+    for filter in [
+        "field = 'V' AND num > 60000",
+        "field = 'V' AND num < 100",
+        "field = 'F' AND num BETWEEN -50 AND -40",
+        "field = 'MODE' AND num = 1",
+        "field = 'V' AND packet = 'RARE' AND num >= 0",
+        "field = 'V' AND num > 1000 AND packet_id > 3000",
+        "field = 'B' AND num >= 0",
+        "field = 'NAME' AND num >= 0",
+    ] {
+        statements.push(format!(
+            "SELECT {cols} FROM {{V}} WHERE {filter} ORDER BY packet_id"
+        ));
+        statements.push(format!("SELECT {cols} FROM {{V}} WHERE {filter}"));
+    }
+    let mut rows = 0;
+    for sql in &statements {
+        rows += compare(&reader, sql);
+    }
+    assert!(rows > 50_000, "{rows}");
+}
+
 /// The plan SQLite takes, one step a line.
 fn plan(reader: &Store, sql: &str) -> String {
     reader
@@ -628,6 +715,67 @@ fn the_query_builder_is_answered_without_sorting_or_scanning_per_row() {
             "{sql}\n{steps}"
         );
     }
+    // Sorted by value with a field (and a packet): read in order of number
+    // (plan 1, either way: 3 is descending), nothing sorted afterwards.
+    for (filters, desc, index) in [
+        (
+            vec![run.clone(), "field = 'V'".to_string()],
+            false,
+            "INDEX 1:",
+        ),
+        (
+            vec![run.clone(), "field = 'V'".to_string()],
+            true,
+            "INDEX 3:",
+        ),
+        (
+            vec![
+                run.clone(),
+                "field = 'V'".to_string(),
+                "packet = 'HK'".to_string(),
+            ],
+            true,
+            "INDEX 3:",
+        ),
+        (
+            vec!["field = 'MODE'".to_string(), "value > 0".to_string()],
+            false,
+            "INDEX 1:",
+        ),
+    ] {
+        let sql = builder("value_view", &VALUE_COLS, &filters, Some(("value", desc)));
+        let steps = plan(&reader, &sql);
+        assert!(!steps.contains("TEMP B-TREE"), "{sql}\n{steps}");
+        // The run is one row looked up first; the values are what is read.
+        let scans: Vec<&str> = steps
+            .lines()
+            .filter(|l| l.starts_with("SCAN v VIRTUAL TABLE"))
+            .collect();
+        assert!(
+            scans.len() == 1 && scans[0].contains(index),
+            "{sql}\n{steps}"
+        );
+    }
+    for (sql, index) in [
+        (
+            "SELECT * FROM field_values WHERE field = 'V' ORDER BY num DESC, packet_id DESC",
+            "INDEX 7:",
+        ),
+        (
+            "SELECT * FROM field_values WHERE field = 'V' ORDER BY num, packet_id DESC",
+            "INDEX 5:",
+        ),
+    ] {
+        let steps = plan(&reader, sql);
+        assert!(
+            !steps.contains("TEMP B-TREE") && steps.contains(index),
+            "{sql}\n{steps}"
+        );
+    }
+    // Without a field the order of number is not claimed.
+    let steps = plan(&reader, "SELECT * FROM field_values ORDER BY num");
+    assert!(steps.contains("TEMP B-TREE"), "{steps}");
+
     // A value search by field and by value reads only the values, and
     // finds each one's packet by id.
     for sql in [

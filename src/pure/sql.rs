@@ -5,7 +5,9 @@
 use serde::Serialize;
 use serde::ser::Serializer;
 
-pub const SCHEMA_VERSION: i64 = 6;
+/// Layout 7: the segments hold their kept values in order of number too
+/// (segment format version 5); a store of an earlier layout is refused.
+pub const SCHEMA_VERSION: i64 = 7;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (

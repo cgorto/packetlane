@@ -17,9 +17,10 @@ use crate::pure::segment::{
     self as layout, BUCKET_BYTES, BucketRecord, CHECKSUM_BYTES, CHECKSUM_KEY_BYTES, ChecksumRecord,
     DELAY, ENTRY_BYTES, Entry, FormatError, GROUP_BYTES, GroupRecord, KIND_BUCKETS, KIND_CHECKSUMS,
     KIND_GROUPS, KIND_LABELS, KIND_PACKETS, KIND_SERIES, KIND_SERIES_BUCKETS, KIND_SERIES_NAMES,
-    KIND_TEXTS, KIND_TIME, KIND_VALUES, LaneStats, LaneTable, LevelCounter, MAGIC, PACKET_BYTES,
-    POINT_BYTES, POINT_KEY_BYTES, PacketRecord, PointRecord, SERIES_BUCKET_BYTES, SeriesBucket,
-    TAIL_BYTES, TIME_BYTES, Tail, TimeRecord, VALUE_BYTES, ValueRecord,
+    KIND_TEXTS, KIND_TIME, KIND_VALUE_GROUPS, KIND_VALUE_ORDER, KIND_VALUES, LaneStats, LaneTable,
+    LevelCounter, MAGIC, PACKET_BYTES, POINT_BYTES, POINT_KEY_BYTES, PacketRecord, PointRecord,
+    SERIES_BUCKET_BYTES, SeriesBucket, TAIL_BYTES, TIME_BYTES, Tail, TimeRecord, VALUE_BYTES,
+    VALUE_GROUP_BYTES, VALUE_KEY_BYTES, VALUE_ORDER_BYTES, ValueGroup, ValueRecord,
 };
 use crate::pure::sql::Clock;
 use crate::shell::store::Result;
@@ -32,6 +33,8 @@ const SORT_CHUNK: usize = (1 << 20) / TIME_BYTES;
 const POINT_CHUNK: usize = (1 << 20) / POINT_KEY_BYTES;
 /// The same for the sorter of checksums.
 const CHECKSUM_CHUNK: usize = (1 << 20) / CHECKSUM_KEY_BYTES;
+/// The same for the sorter of kept values in value order.
+const VALUE_CHUNK: usize = (1 << 20) / VALUE_KEY_BYTES;
 /// Buffer for each of the temporary files kept values and their texts are
 /// written to.
 const SPOOL_BUFFER: usize = 64 << 10;
@@ -614,6 +617,8 @@ pub struct Writer {
     /// Every space packet, to be sorted by checksum, sequence count,
     /// length, lane and index.
     sums: Option<Sorter<CHECKSUM_KEY_BYTES>>,
+    /// Every kept value, to be sorted by series, number, index and place.
+    by_value: Option<Sorter<VALUE_KEY_BYTES>>,
 }
 
 /// Bytes written one after another to a temporary file, to be copied into
@@ -773,6 +778,15 @@ impl Writer {
                 )
                 .ordered(ChunkOrder::Radix),
             ),
+            by_value: Some(Sorter::new(
+                folder.join(format!("{file_id}.by-value")),
+                if chunk == SORT_CHUNK {
+                    VALUE_CHUNK
+                } else {
+                    chunk
+                },
+                FAN_IN,
+            )),
         })
     }
 
@@ -824,7 +838,17 @@ impl Writer {
             num,
             text_at,
         };
+        let position = values.len / VALUE_BYTES as u64;
         values.write(&record.encode())?;
+        if let Some(by_value) = &mut self.by_value {
+            by_value.push(layout::value_key(
+                series,
+                num,
+                index,
+                position,
+                text_at.is_some(),
+            ))?;
+        }
         if let Some(num) = num {
             for (c, t) in times.into_iter().enumerate() {
                 if let Some(ns) = t {
@@ -1056,6 +1080,55 @@ impl Writer {
             record: CHECKSUM_BYTES as u32,
             offset: start,
             length,
+            param: 0,
+        });
+
+        // Every kept value by series and number, for `field_values` in
+        // order of value, and where each series lies.
+        let by_value = self.by_value.take().ok_or("segment finished twice")?;
+        let start = self.at;
+        let out = &mut self.out;
+        let mut groups: Vec<ValueGroup> = Vec::new();
+        let mut written = 0u64;
+        by_value.finish(|keys| {
+            for key in keys {
+                let (series, has, record) = layout::from_value_key(key);
+                match groups.last_mut() {
+                    Some(g) if g.series == series => g.count += 1,
+                    _ => groups.push(ValueGroup {
+                        series,
+                        first: written,
+                        nulls: 0,
+                        count: 1,
+                    }),
+                }
+                if !has && let Some(g) = groups.last_mut() {
+                    g.nulls += 1;
+                }
+                out.write_all(&record.encode())?;
+                written += 1;
+            }
+            Ok(())
+        })?;
+        self.at += written * VALUE_ORDER_BYTES as u64;
+        entries.push(Entry {
+            kind: KIND_VALUE_ORDER,
+            clock: 0,
+            record: VALUE_ORDER_BYTES as u32,
+            offset: start,
+            length: self.at - start,
+            param: 0,
+        });
+        let start = self.at;
+        for g in &groups {
+            self.append(&g.encode())?;
+        }
+        entries.push(Entry {
+            kind: KIND_VALUE_GROUPS,
+            clock: 0,
+            record: VALUE_GROUP_BYTES as u32,
+            offset: start,
+            length: self.at - start,
             param: 0,
         });
 
@@ -1789,6 +1862,78 @@ impl Segment {
             }
             f(v)
         })
+    }
+
+    /// The kept value at `position` in the values section.
+    pub fn value_at(&self, position: u64) -> Result<ValueRecord> {
+        let e = self.section(KIND_VALUES, 0)?;
+        if position >= e.records() {
+            return Err(FormatError("a kept value is out of range".into()).into());
+        }
+        let mut b = [0u8; VALUE_BYTES];
+        self.file
+            .read_exact_at(&mut b, e.offset + position * VALUE_BYTES as u64)?;
+        Ok(ValueRecord::decode(&b))
+    }
+
+    /// Every series' place in the value-order section, in series order,
+    /// checked to lie within it.
+    pub fn value_groups(&self) -> Result<Vec<ValueGroup>> {
+        let e = self.section(KIND_VALUE_GROUPS, 0)?;
+        let records = self.section(KIND_VALUE_ORDER, 0)?.records();
+        let series = self.series_names()?.len() as u64;
+        let mut out = Vec::with_capacity(e.records().min(series) as usize);
+        let mut bad = false;
+        self.each::<VALUE_GROUP_BYTES>(&e, 0, e.records(), |rec| {
+            let g = ValueGroup::decode(rec);
+            bad = g.first.checked_add(g.count).is_none_or(|end| end > records)
+                || g.nulls > g.count
+                || u64::from(g.series) >= series
+                || out
+                    .last()
+                    .is_some_and(|l: &ValueGroup| l.series >= g.series);
+            out.push(g);
+            Ok(!bad)
+        })?;
+        if bad {
+            return Err(
+                FormatError("a group of values in value order is out of range".into()).into(),
+            );
+        }
+        Ok(out)
+    }
+
+    /// The records of group `g` in the value-order section, as a range
+    /// `from..to`, whose number lies above `lo` and below `hi` (each a
+    /// number and whether it is excluded), by two binary searches.
+    pub fn value_order_range(
+        &self,
+        g: &ValueGroup,
+        lo: Option<(f64, bool)>,
+        hi: Option<(f64, bool)>,
+    ) -> Result<(u64, u64)> {
+        let e = self.section(KIND_VALUE_ORDER, 0)?;
+        let (start, end) = (g.first + g.nulls, g.first + g.count);
+        let key = layout::ValueOrderRecord::key_of;
+        let from = match lo {
+            None => start,
+            Some((x, strict)) => {
+                let k = layout::number_key(x);
+                self.search(&e, (start, end), 8, |b| {
+                    if strict { key(b) <= k } else { key(b) < k }
+                })?
+            }
+        };
+        let to = match hi {
+            None => end,
+            Some((x, strict)) => {
+                let k = layout::number_key(x);
+                self.search(&e, (from, end), 8, |b| {
+                    if strict { key(b) < k } else { key(b) <= k }
+                })?
+            }
+        };
+        Ok((from, to.max(from)))
     }
 
     /// The text of a value, from the texts section.

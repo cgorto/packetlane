@@ -60,7 +60,8 @@
 //!
 //! Clocks are numbered 0 receive, 1 packet, 2 order.
 //!
-//! Sections in version 4 (version 3 had all but kind 11):
+//! Sections in version 5 (version 4 had all but kinds 12 and 13; version 3
+//! not kind 11 either):
 //!
 //! - kind 1, packets: one 56-byte record per logged item, in id order;
 //!   packet id = first packet id + index. Record: receive time (i64), packet
@@ -144,6 +145,22 @@
 //!   match lie together whatever their lanes and tracing needs no more than
 //!   a count per lane (see `pure::cross`). A run's
 //!   sections are merged in that order, with ids in place of indexes.
+//!
+//! For `field_values` in order of value (version 5; earlier versions had
+//! none of these, and are not read):
+//!
+//! - kind 12, value order: a 20-byte record per kept value, number (f64; 0
+//!   for a value without one), index (u32) and the value's place in kind 6
+//!   (u64, its top bit set if the value has a text), in groups of one
+//!   series, sorted by series. Within a group the
+//!   values without a number come first, by index and place; then those
+//!   with one by number ([`number_key`]: SQLite's order, a negative zero
+//!   equal to zero), index and place. Every value of the series is there,
+//!   whatever its packet's times and whether it has a text.
+//! - kind 13, value groups: a 28-byte record per series, sorted by series:
+//!   series (u32), first record in kind 12, how many of its values have no
+//!   number, and how many values in all (u64 each). A series' values
+//!   between two numbers are two binary searches in its group.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -153,7 +170,7 @@ use crate::pure::sql::Clock;
 
 pub const MAGIC: [u8; 8] = *b"PLSEGMNT";
 pub const TAIL_MAGIC: [u8; 8] = *b"PLSEGEND";
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 pub const PACKET_BYTES: usize = 56;
 pub const TIME_BYTES: usize = 16;
@@ -178,6 +195,8 @@ pub const KIND_SERIES: u16 = 8;
 pub const KIND_GROUPS: u16 = 9;
 pub const KIND_SERIES_BUCKETS: u16 = 10;
 pub const KIND_CHECKSUMS: u16 = 11;
+pub const KIND_VALUE_ORDER: u16 = 12;
+pub const KIND_VALUE_GROUPS: u16 = 13;
 
 pub const VALUE_BYTES: usize = 24;
 pub const POINT_BYTES: usize = 20;
@@ -190,6 +209,12 @@ pub const CHECKSUM_BYTES: usize = 28;
 /// The sort key of a checksum record while a segment is written: checksum,
 /// sequence count, length, lane, index.
 pub const CHECKSUM_KEY_BYTES: usize = 26;
+pub const VALUE_ORDER_BYTES: usize = 20;
+pub const VALUE_GROUP_BYTES: usize = 28;
+/// The sort key of a value in value order while a segment is written:
+/// series, whether it has a number, the number, index, position, and
+/// whether the number is a negative zero.
+pub const VALUE_KEY_BYTES: usize = 26;
 
 /// The series number of arrival delay in the time-order sections.
 pub const DELAY: u32 = u32::MAX;
@@ -657,6 +682,142 @@ impl ChecksumRecord {
     }
 }
 
+/// The bytes of a number whose order is SQLite's order of numbers: as an
+/// unsigned integer, negative numbers below positive ones and each in
+/// numeric order. A negative zero is a zero, as SQLite compares them.
+pub fn number_key(n: f64) -> u64 {
+    let bits = if n == 0.0 { 0 } else { n.to_bits() };
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    }
+}
+
+/// The number of a [`number_key`]; a zero comes back positive.
+pub fn from_number_key(k: u64) -> f64 {
+    f64::from_bits(if k >> 63 == 1 { k & !(1 << 63) } else { !k })
+}
+
+/// One kept value in a series' value order: its number (if it has one; the
+/// series' group says which records have none), the packet's index, the
+/// value's place in the values section, and whether it has a text.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValueOrderRecord {
+    pub num: f64,
+    pub index: u32,
+    pub position: u64,
+    pub text: bool,
+}
+
+/// The bit of a value-order record's place that says the value has a text.
+const HAS_TEXT: u64 = 1 << 63;
+
+impl ValueOrderRecord {
+    pub fn encode(&self) -> [u8; VALUE_ORDER_BYTES] {
+        let mut b = [0u8; VALUE_ORDER_BYTES];
+        b[0..8].copy_from_slice(&self.num.to_bits().to_le_bytes());
+        b[8..12].copy_from_slice(&self.index.to_le_bytes());
+        let place = (self.position & !HAS_TEXT) | if self.text { HAS_TEXT } else { 0 };
+        b[12..20].copy_from_slice(&place.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> ValueOrderRecord {
+        let place = u64_at(b, 12);
+        ValueOrderRecord {
+            num: f64::from_bits(u64_at(b, 0)),
+            index: u32_at(b, 8),
+            position: place & !HAS_TEXT,
+            text: place & HAS_TEXT != 0,
+        }
+    }
+
+    /// The number of an encoded record, as its [`number_key`], without
+    /// decoding the rest.
+    pub fn key_of(b: &[u8]) -> u64 {
+        number_key(f64::from_bits(u64_at(b, 0)))
+    }
+}
+
+/// A kept value while a segment is written, as bytes whose order is the
+/// value-order section's: series, values without a number before those
+/// with one, the number by [`number_key`], index, position. The last byte
+/// says whether the number is a negative zero, which only its record keeps,
+/// and whether the value has a text.
+pub fn value_key(
+    series: u32,
+    num: Option<f64>,
+    index: u32,
+    position: u64,
+    text: bool,
+) -> [u8; VALUE_KEY_BYTES] {
+    let mut b = [0u8; VALUE_KEY_BYTES];
+    b[0..4].copy_from_slice(&series.to_be_bytes());
+    if let Some(n) = num {
+        b[4] = 1;
+        b[5..13].copy_from_slice(&number_key(n).to_be_bytes());
+        b[25] = u8::from(n == 0.0 && n.is_sign_negative());
+    }
+    b[25] |= u8::from(text) << 1;
+    b[13..17].copy_from_slice(&index.to_be_bytes());
+    b[17..25].copy_from_slice(&position.to_be_bytes());
+    b
+}
+
+/// The series, whether there is a number, and the record of a
+/// [`value_key`].
+pub fn from_value_key(b: &[u8; VALUE_KEY_BYTES]) -> (u32, bool, ValueOrderRecord) {
+    let mut k = [0u8; 8];
+    k.copy_from_slice(&b[5..13]);
+    let mut p = [0u8; 8];
+    p.copy_from_slice(&b[17..25]);
+    let has = b[4] == 1;
+    let num = match (has, b[25] & 1) {
+        (false, _) => 0.0,
+        (true, 1) => -0.0,
+        (true, _) => from_number_key(u64::from_be_bytes(k)),
+    };
+    let record = ValueOrderRecord {
+        num,
+        index: u32::from_be_bytes([b[13], b[14], b[15], b[16]]),
+        position: u64::from_be_bytes(p),
+        text: b[25] & 2 != 0,
+    };
+    (u32::from_be_bytes([b[0], b[1], b[2], b[3]]), has, record)
+}
+
+/// Where one series lies in the value-order section: its first record, how
+/// many of its values have no number (they come first) and how many it has
+/// in all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValueGroup {
+    pub series: u32,
+    pub first: u64,
+    pub nulls: u64,
+    pub count: u64,
+}
+
+impl ValueGroup {
+    pub fn encode(&self) -> [u8; VALUE_GROUP_BYTES] {
+        let mut b = [0u8; VALUE_GROUP_BYTES];
+        b[0..4].copy_from_slice(&self.series.to_le_bytes());
+        b[4..12].copy_from_slice(&self.first.to_le_bytes());
+        b[12..20].copy_from_slice(&self.nulls.to_le_bytes());
+        b[20..28].copy_from_slice(&self.count.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> ValueGroup {
+        ValueGroup {
+            series: u32_at(b, 0),
+            first: u64_at(b, 4),
+            nulls: u64_at(b, 12),
+            count: u64_at(b, 20),
+        }
+    }
+}
+
 /// What one segment holds of one lane: how many packets, the lowest and
 /// highest time and how many have one on each time clock, and the first
 /// and last packet id. Kept while the segment is written and stored in the
@@ -853,6 +1014,8 @@ pub fn check_directory(entries: &[Entry], tail: &Tail, dir_at: u64) -> Result<()
             KIND_GROUPS => (GROUP_BYTES as u32, &[0, 1]),
             KIND_SERIES_BUCKETS => (SERIES_BUCKET_BYTES as u32, &[0, 1]),
             KIND_CHECKSUMS => (CHECKSUM_BYTES as u32, &[0]),
+            KIND_VALUE_ORDER => (VALUE_ORDER_BYTES as u32, &[0]),
+            KIND_VALUE_GROUPS => (VALUE_GROUP_BYTES as u32, &[0]),
             // A section of a later version.
             _ => continue,
         };
@@ -1793,6 +1956,73 @@ mod tests {
         // Too narrow to hold one stored bucket whole.
         assert_eq!(plan(5, 7, 4, 2).whole, None);
         assert_eq!(plan(i64::MIN, i64::MAX, i64::MAX, 63).whole, None);
+    }
+
+    #[test]
+    fn number_keys_order_numbers_as_sqlite_does_and_value_keys_survive() {
+        let numbers = [
+            f64::NEG_INFINITY,
+            -1e300,
+            -2.5,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            5e-324,
+            1.0,
+            2.5,
+            f64::MAX,
+            f64::INFINITY,
+        ];
+        for pair in numbers.windows(2) {
+            let (a, b) = (number_key(pair[0]), number_key(pair[1]));
+            // Strictly in order, but for the two zeros, which are equal.
+            if pair[0] == pair[1] {
+                assert_eq!(a, b);
+            } else {
+                assert!(a < b, "{} {}", pair[0], pair[1]);
+            }
+            assert_eq!(
+                from_number_key(a),
+                if pair[0] == 0.0 { 0.0 } else { pair[0] }
+            );
+        }
+        for &n in &numbers {
+            for (num, text) in [(Some(n), false), (Some(n), true), (None, true)] {
+                let key = value_key(7, num, 3, 1 << 40, text);
+                let (series, has, r) = from_value_key(&key);
+                assert_eq!(
+                    (series, has, r.index, r.position, r.text),
+                    (7, num.is_some(), 3, 1 << 40, text)
+                );
+                // The number comes back as it was, a negative zero too.
+                assert_eq!(r.num.to_bits(), num.unwrap_or(0.0).to_bits());
+                assert_eq!(ValueOrderRecord::decode(&r.encode()), r);
+            }
+        }
+        // Values without a number first; then by number, index, place.
+        let mut keys = [
+            value_key(1, Some(-0.0), 9, 0, false),
+            value_key(1, Some(0.0), 2, 5, true),
+            value_key(1, None, 8, 1, false),
+            value_key(0, Some(9.0), 0, 0, false),
+            value_key(1, Some(-1.0), 99, 2, false),
+        ];
+        keys.sort_unstable();
+        let order: Vec<(u32, u32)> = keys
+            .iter()
+            .map(|k| {
+                let (s, _, r) = from_value_key(k);
+                (s, r.index)
+            })
+            .collect();
+        assert_eq!(order, [(0, 0), (1, 8), (1, 99), (1, 2), (1, 9)]);
+        let g = ValueGroup {
+            series: 3,
+            first: 1 << 33,
+            nulls: 4,
+            count: 9,
+        };
+        assert_eq!(ValueGroup::decode(&g.encode()), g);
     }
 
     #[test]

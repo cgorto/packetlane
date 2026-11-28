@@ -68,7 +68,7 @@ is checked inside those reads, where SQLite's own progress handler does
 not run.
 
 The format is described in `src/pure/segment.rs`. A store from a build
-before schema 6 is refused, and a segment of a format version other than
+before schema 7 is refused, and a segment of a format version other than
 this build's fails to read: ingest such a store again.
 
 Each file read commits on its own, and the end of an ingest (lane totals,
