@@ -150,9 +150,10 @@ Limits of working from counters alone are listed at the top of
   so is the comparison of sources at the end of an ingest, from each
   segment's packets in checksum order. Each lane's count and time range
   is added up from what each segment holds of it, kept per file in the
-  store (`segment_lanes`). Text logs, the lists of lanes, files and
-  findings, and the SQL box still read SQLite, which for now holds the
-  same packets and values, written but no longer read while ingesting. A
+  store (`segment_lanes`). SQLite holds no packets: text logs and the
+  lists of runs, lanes, files and findings are read from it, and the
+  tables `packets` and `field_values` that SQL sees are served from the
+  segment files (see below). A
   segment is written whole before the store lists it, replaced when its
   file is read again, and one the store does not list is removed the next
   time the store is opened for writing.
@@ -164,18 +165,39 @@ Limits of working from counters alone are listed at the top of
   file by name and times as text.
 - `packetlane query` and the SQL box in the UI accept one statement that
   reads. The connection they use cannot write.
+- `packets` and `field_values` are not tables in the SQLite file: they
+  are served from the segment files, on every connection this tool opens,
+  with the columns, types and meaning the tables of those names had, so
+  the same SQL works and gives the same rows. A stock `sqlite3` opening
+  the store sees every other table, but not these two, nor the views over
+  them. A range of ids or of receive or packet time, one file, one lane or
+  one packet's values reads only what it needs; a field skips the
+  segments that have none of it but reads the kept values of the others
+  whole; anything else reads the segments from end to end. Nothing is
+  kept in order of value: ordering a field's values by value (the query
+  builder's sort by value) reads and sorts them all, 0.9 s for the three
+  million values of a field where the old index of values by field and
+  number answered at once; counting every packet takes 80 to 250 ms where
+  SQLite counted its own table in 25 to 45. The rowids of
+  `field_values` are not the ones the old table gave (those were the order
+  rows were inserted in, kept nowhere now). A statement reads the segments
+  listed when it started; if one of them was replaced by an ingest
+  meanwhile, it is run once more.
 - A store made by an earlier build with a different layout is refused, and
-  says so (this build's is layout 5): delete it, and its `.seg` folder,
+  says so (this build's is layout 6): delete it, and its `.seg` folder,
   and ingest again. A segment written by a build with another segment
   format (this build's is 4) cannot be read either: ingest the store
   again. Nothing in it is not in the logs.
-- Writing uses about 25 MB of memory whatever the size of the run, most of
-  it the store's page cache (8 MB, which is enough for files of several
-  hundred streams each). Sorting a segment's time order, its kept values
-  and its checksums takes five 1 MB buffers more, and comparing sources
-  about 5 MB more whatever the number of files or of repeats. Set
-  `PACKETLANE_CACHE_MB` to change it: a file with more streams than that
-  ingests faster with more, and 2 is enough for files of a few dozen.
+- Writing uses about 16 to 21 MB of memory whatever the size of the run
+  (measured: 16 MB for three million packets in 900 lanes, 21 MB for ten
+  million in 12). Sorting a segment's time order, its kept values and its
+  checksums takes five 1 MB buffers, comparing sources about 5 MB more
+  whatever the number of files or of repeats, and SQLite's page cache up
+  to 8 MB, filled only as far as it writes (`PACKETLANE_CACHE_MB` sets
+  it); SQLite holds no packets, so it writes little.
+- The store file holds no packets either: 6.6 MB for that run of ten
+  million packets (1.95 GB before layout 6), 1.5 MB for the run of three
+  million (1.0 GB), beside segment folders of 1.7 GB and 0.93 GB.
 - An ingest writes temporary files in the segment folder, each removed
   when done with (or, after a crash, the next time the store is opened for
   writing): while a file is read, its segment under a temporary name and
@@ -362,7 +384,9 @@ Any web page open in the same browser can send requests to a loopback port, so
 - Packet bytes shown in Details are read back only from files still inside
   those folders.
 - The SQL box runs on a read-only connection that cannot attach other files,
-  and each statement has a time limit and a size limit.
+  and each statement has a time limit and a size limit. The time limit
+  holds inside reads of the segment files too, for SQL and for the
+  page's own requests.
 
 `tests/end_to_end.rs` checks each of these against a running server.
 
@@ -404,6 +428,9 @@ been built here.
   two places. One description per record, with the writer and the reader
   both made from it, would rule out a field written at one offset and read
   at another. For when the format has settled.
+- **An export of packets to a plain SQLite file**, with `packets` and
+  `field_values` as real tables, for tools that open the store without
+  this program.
 - **Problem report export** to attach to a ticket.
 - Other channel codes: convolutional, turbo and LDPC (a file must hold hard
   decisions that are already frame-aligned; Reed-Solomon and BCH are the only
@@ -449,7 +476,10 @@ web/          the page: structure, style, script (embedded at build time)
 tests/        end-to-end tests, decoders against damaged input, and the test
               that keeps I/O out of src/pure
               load.rs measures large runs and is run only when asked for;
-              store_sql.rs pins which index each view of the timeline uses
+              store_sql.rs pins which index the oracle statements use
+              vtab.rs runs the same SQL over the tables served from the segment
+              files and over the oracle tables a store opened for tests
+              writes, and pins the plans of the query builder's statements
 tools/        ui-load.js measures the page in a headless Chrome
 docs/         architecture.md, parsing.md
 container/    development container stub and editor settings

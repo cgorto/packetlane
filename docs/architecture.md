@@ -29,7 +29,7 @@ the facts and asks the core.
 | Text logs | `textlog`: lines in, timestamped entries out | reads lines |
 | Checks | `continuity`, `order`, `limits`, `cross`: packets or stored counts in, findings out, all as one type (`finding`) with a fixed list of kinds; `pipeline` runs the per-file ones; `cross` also says what a run's packets in checksum order come to, one checksum at a time | prints or stores them; `cross` merges the segments' checksum sections with bounded fan-in and keeps what must be given back later in temporary files |
 | Naming and decoding packets | `config`, `format`: definitions plus bytes give named values | reads the config file, reads packet bytes back from the log |
-| Store | `sql`: schema text, statements and their parameters; `ingest`: records to rows | `store`: owns the connection, runs statements |
+| Store | `sql`: schema text, statements and their parameters; `ingest`: records to rows; `oracle`: for tests only, the tables of packets the store used to keep and the statements it ran over them | `store`: owns the connection, runs statements; `vtab`: serves the tables `packets` and `field_values` from the segment files |
 | Segment files | `segment`: record and directory layouts, the bucket grids and which levels are kept, how a density view or a plot is put together from stored buckets and single values | `segment`: writes a file's packets and kept values beside the store as it is read (sorting in bounded chunks), reads them back with positioned reads, merges item lists across files; `store` lists them in the `segments` table, and what each holds of each lane in `segment_lanes` |
 | Web API | `http`: bytes to request, response to bytes; `api`: request to an authorised command, results to JSON | `server`: owns the socket, runs the command against the store |
 | File browser | `paths`: is this canonical path inside the allowed roots | canonicalises paths, lists directories |
@@ -38,24 +38,48 @@ the facts and asks the core.
 
 ## Where things are stored
 
-Everything is in one SQLite file, and each packet file's packets are also
-written to a segment file of their own in a folder beside it
-(`<store>.seg/`), listed in the store's `segments` table. For now both
-hold the same packets and kept values, and the tests check the segments
-against SQLite's rows. Read from the segments: the timeline's density,
-its item list, plots of kept fields and arrival delay, a packet's
-details (with its file and source from SQLite), the packet times of a
-run's findings, and at the end of an ingest the comparison of sources
-(each segment's packets in checksum order, merged). Read from SQLite:
-runs, files, lanes, findings, text logs, the list of what can be plotted
-(`file_series`), and the SQL box and its views. A lane's count and time
-ranges are added up from `segment_lanes`, written with each file; the
-next packet id is one more than the highest any segment holds. Ingest
-writes the `packets` and `field_values` rows but no longer reads them;
-only the SQL box and the tests do. The format is described in
-`src/pure/segment.rs`. A store from a build before schema 5 is refused,
-and a segment of a format version other than this build's fails to
-read: ingest such a store again.
+Each packet file's packets and kept values are written to a segment file of
+their own, in a folder beside the SQLite file (`<store>.seg/`), listed in
+the store's `segments` table; SQLite holds no packet rows. Read from the
+segments: the timeline's density, its item list, plots of kept fields and
+arrival delay, a packet's details (with its file and source from SQLite),
+the packet times of a run's findings, at the end of an ingest the
+comparison of sources (each segment's packets in checksum order, merged),
+and the tables `packets` and `field_values` that SQL sees. Read from
+SQLite: runs, files, lanes, findings, text logs and the list of what can
+be plotted (`file_series`). A lane's count and time ranges are added up
+from `segment_lanes`, written with each file; the next packet id is one
+more than the highest any segment holds.
+
+`packets` and `field_values` are eponymous-only virtual tables
+(`shell::vtab`), registered on every connection the store opens, with the
+columns the SQLite tables of those names had. Nothing about them is in
+the database file, so a stock `sqlite3` opens it and sees every other
+table, but not these two. The store reads the `segments` rows inside the
+read transaction a statement runs in and hands them to the tables, so a
+statement reads the segments listed when it started; if one of them was
+replaced meanwhile, the statement is run once more on a fresh list. A
+page's reads of the segment files do the same, with all their SQL in one
+read transaction. Constraints only ever skip what cannot match, and
+SQLite checks every row it gets; `packets` is read in id order or in
+order of a time clock (from the time-order sections), either way up,
+`field_values` in packet order. The time limit of a read-only connection
+is checked inside those reads, where SQLite's own progress handler does
+not run.
+
+The format is described in `src/pure/segment.rs`. A store from a build
+before schema 6 is refused, and a segment of a format version other than
+this build's fails to read: ingest such a store again.
+
+Each file read commits on its own, and the end of an ingest (lane totals,
+the comparison of sources) commits after them. A run whose end did not
+commit is listed in `unfinished`, and its next ingest does that end
+again even if no file has changed.
+
+The tests open stores with `Store::open_with_oracle`, which also writes
+the rows the old `packets` and `field_values` tables held to
+`oracle_packets` and `oracle_field_values`, and check the segment files,
+and the same SQL over the virtual tables, against them.
 
 ## Decoders
 
