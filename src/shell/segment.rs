@@ -2408,7 +2408,7 @@ mod tests {
             state
         };
         for i in 0..6_000i64 {
-            let lane = (i % 7) as i64 + 1;
+            let lane = i % 7 + 1;
             // In order, then late packets, then a jump back, then ties.
             let base = match i {
                 0..1_500 => i * 1_000,
