@@ -171,14 +171,17 @@ Limits of working from counters alone are listed at the top of
   the same SQL works and gives the same rows. A stock `sqlite3` opening
   the store sees every other table, but not these two, nor the views over
   them. A range of ids or of receive or packet time, one file, one lane or
-  one packet's values reads only what it needs; a field skips the
-  segments that have none of it but reads the kept values of the others
-  whole; anything else reads the segments from end to end. Nothing is
-  kept in order of value: ordering a field's values by value (the query
-  builder's sort by value) reads and sorts them all, 0.9 s for the three
-  million values of a field where the old index of values by field and
-  number answered at once; counting every packet takes 80 to 250 ms where
-  SQLite counted its own table in 25 to 45. The rowids of
+  one packet's values reads only what it needs. A field with an order by
+  its number (the query builder's sort by value), or with a range of
+  numbers, reads that field's values in order of number from each
+  segment; a field alone skips the segments that have none of it but
+  reads the kept values of the others whole (400 ms for the three million
+  values of one field); anything else reads the segments from end to end.
+  Counting every packet or every value reads no record, but SQLite still
+  steps through each row: 180 ms for ten million packets, 40 ms for 2.2
+  million values (SQLite counted its own tables in 25 to 45 ms). What the
+  builder's statements cost, and what they cost at the commit before this
+  measurement (ebc1b5f), is in the table below. The rowids of
   `field_values` are not the ones the old table gave (those were the order
   rows were inserted in, kept nowhere now). A statement reads the segments
   listed when it started; if one of them was replaced by an ingest
@@ -201,14 +204,34 @@ Limits of working from counters alone are listed at the top of
   (18.3 MB whatever the cache on the three million).
 - The store file holds no packets either: 6.6 MB for that run of ten
   million packets (1.95 GB before layout 6), 1.5 MB for the run of three
-  million (1.0 GB), beside segment folders of 1.7 GB and 0.93 GB.
+  million (1.0 GB), beside segment folders of 1.76 GB and 1.05 GB (1.71
+  and 0.93 GB at layout 6: the values in order of number take 20 bytes
+  each, 44 MB and 120 MB here).
+- Ingest takes 8.6 s for the ten million packets in 12 lanes and 5.9 s for
+  the three million in 900 lanes with six million values kept (19.5 s and
+  10.1 s at layout 6), measured with a game running on the same machine
+  (16 cores, NVMe; with the machine quiet, an earlier build of this
+  milestone took 8.1 and 5.3 s where this one is about 0.7 s quicker).
+  Reading the files with nothing written takes 3.6 and 2.2 s; of the
+  rest, the checksums (sorting them, and comparing sources from them)
+  take about 2.4 s and 0.8 s,
+  the kept numbers and delays 1.3 and 1.5 s, the time orders 0.65 and
+  0.35 s, the values in order of number 0.3 and 0.9 s. Sorting costs what
+  the input's disorder costs: input in time order is written once and
+  read back once, kept numbers (interleaved by lane and series, each in
+  time order) cost a step a group, and only the checksums, which are in
+  no order, pay a full merge. A file read again costs only itself: 2.9 s
+  for 96 MB of one file of that run with 1% added, the other segments
+  untouched; a small run added to a store that holds the ten million
+  costs 0.03 to 0.05 s.
 - An ingest writes temporary files in the segment folder, each removed
   when done with (or, after a crash, the next time the store is opened for
   writing): while a file is read, its segment under a temporary name and
   the sorted runs of its sections, together up to about twice the size
   of that segment (the most measured at once: 1.1 GB for a run of ten
   million packets in four files, 420 MB for one of three million in
-  three); and when a run
+  three; the segment folder peaked at 1.9 and 1.1 GB while they were
+  ingested); and when a run
   that more than one source logged is compared, 12 bytes for each packet
   that a source holds and another source logging the same stream lacks,
   12 for each copy of a packet repeated more than 65,536 times, and for a
@@ -217,6 +240,34 @@ Limits of working from counters alone are listed at the top of
   table. SQLite itself needs little temporary space now: for counting text
   log entries into buckets. It puts it in the folder named by
   `SQLITE_TMPDIR` or `TMPDIR`, else the system's.
+
+What the query builder's statements and a few others take, from start to
+end of `packetlane query` (the process alone takes about 4 ms), at
+ebc1b5f and now, on the long run (ten million packets, 1.1 million values
+of the field asked for) and the wide one (three million packets, three
+million values of the field `TEMP` in 300 packets), each alone in its
+store. Medians of five, the two numbers being two rounds, with a game
+running on the same machine. The same rows come back from both.
+
+| statement | long before ms | long now | wide before | wide now |
+|---|---|---|---|---|
+| values, a field, sorted by value | 452–471 | 5–6 | 1115–1302 | 10–16 |
+| the same, descending | 575–632 | 5–6 | 1113–1272 | 13–17 |
+| values, a field and a packet, sorted by value | 684–697 | 5–8 | 75–82 | 8–10 |
+| values, a field above a number, sorted by value | 31–35 | 5–6 | 63–70 | 12–15 |
+| values, a field above a number | 6–7 | 6–7 | 64–73 | 12–14 |
+| values, a field above any number | 26 | 5 | 64–73 | 11–12 |
+| values, a field | 5 | 5–6 | 5–7 | 6–8 |
+| values, after a receive time | 70–73 | 72–78 | 652–823 | 646–711 |
+| `count(*)` of `packets` | 269–274 | 179–190 | 83–98 | 65–72 |
+| `count(*)` of `field_values` | 55–56 | 38–41 | 137–160 | 105–110 |
+| packets, the run's first | 5 | 6–8 | 5–8 | 5–6 |
+| packets, after a receive time | 141–143 | 144–158 | 243–273 | 240–261 |
+| packets per APID, whole store | 2846–2881 | 2814–2966 | 698–817 | 841–846 |
+
+Values after a receive time look each value's packet up to test its
+time, one lookup a value; SQLite's own tables did that in 414 ms on the
+wide run, the segment files take about 150 ms more.
 
 ### Timeline
 
@@ -513,6 +564,28 @@ change, and run again with `LOAD_DIR=after LOAD_BASELINE=before`: each
 time is printed with its change, and marked where that is more than the
 times move on their own. `LOAD_PACKETS=300000` does both runs in under a
 minute.
+
+Measured at `LOAD_PACKETS=1000000` with a game running on the same machine
+(16 cores, NVMe), ebc1b5f against this build (medians; everything the page
+asks for moved by less than the noise except where shown):
+
+| | long before | long now | wide before | wide now |
+|---|---|---|---|---|
+| ingest | 1.6 s | 1.0 s | 2.9 s | 2.3 s |
+| peak memory of ingest | 14 MB | 16 MB | 15 MB | 17 MB |
+| store with segments | 180 MB | 185 MB | 311 MB | 351 MB |
+| opening the page | 1.4 ms | 1.2 ms | 47 ms | 44 ms |
+| one view with 6 plots, a tenth | 6.5 ms | 6.7 ms | 43 ms | 43 ms |
+| query: count packets | 29 ms | 19 ms | 32 ms | 20 ms |
+| query: largest values of a field | 47 ms | 0.9 ms | 660 ms | 3.7 ms |
+| query: packets per stream | 334 ms | 341 ms | 291 ms | 297 ms |
+| query: newest packets | 1452 ms | 1427 ms | 1421 ms | 1434 ms |
+
+At `LOAD_PACKETS=10000000` (the long run only), in the same state:
+ingest 21.5 s and 21 MB at ebc1b5f, 9.9 s and 18 MB now; store 1.72 GB
+and 1.76 GB; count packets 302 and 192 ms; largest values of a field 475
+and 1.0 ms. At both, the "newest packets" query is stopped by the
+server's 10 s time limit.
 
 ```
 packetlane serve --db store.db --root <run folder>
