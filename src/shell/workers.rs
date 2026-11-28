@@ -17,7 +17,8 @@ use crate::pure::config::Config;
 use crate::pure::decode::{Format, decoder_for};
 use crate::pure::finding::FileFinding;
 use crate::pure::ingest::LaneKey;
-use crate::pure::pipeline::{FileCheck, Seen};
+use crate::pure::ingest::PacketRow;
+use crate::pure::pipeline::{FileCheck, KeptValue, Seen};
 use crate::pure::segment as layout;
 use crate::shell::files::{Hashing, ReadError, Records, open_sniffed};
 use crate::shell::segment::{self, Ids, Writer, Written};
@@ -143,36 +144,82 @@ pub fn read_file<'a>(
         return Ok((nothing, None));
     };
     let source = config.source_for(&job.rel);
-    let mut writer = Writer::start(folder, stem, chunk_bytes)?;
+    let writer = Writer::start(folder, stem, chunk_bytes)?;
     let mut check = FileCheck::new(config, &source);
     let mut lanes = OwnLanes::default();
     let mut series: layout::Map<(u32, &'a str, &'a str), i64> = layout::Map::default();
     let mut end = None;
     let mut records = Records::new(BufReader::new(&mut file), decoder);
-    let mut seen = 0u64;
-    for item in &mut records {
-        seen += 1;
-        if seen.is_multiple_of(STOP_EVERY) && stop.load(Ordering::Relaxed) {
-            return Err("the ingest stopped".into());
-        }
-        let record = match item {
-            Ok(record) => record,
-            Err(ReadError::Io(e)) => return Err(e.into()),
-            Err(ReadError::Decode(e)) => {
-                end = Some(e);
-                break;
+    // Records are decoded and checked on this thread, and written to the
+    // segment on another, a batch at a time.
+    let (batches, to_write) = mpsc::sync_channel::<Vec<Item<'a>>>(BATCHES_AHEAD);
+    let (writer, read) = std::thread::scope(|scope| {
+        let writing = scope.spawn(move || write_batches(writer, to_write));
+        let read = (|| -> Result<()> {
+            let mut batch = Vec::with_capacity(BATCH);
+            let mut seen = 0u64;
+            // Labels numbered as they first come, as the segment numbers
+            // them, so that each is copied once.
+            let mut labels: layout::Map<String, u32> = layout::Map::default();
+            for item in &mut records {
+                seen += 1;
+                if seen.is_multiple_of(STOP_EVERY) && stop.load(Ordering::Relaxed) {
+                    return Err("the ingest stopped".into());
+                }
+                let record = match item {
+                    Ok(record) => record,
+                    Err(ReadError::Io(e)) => return Err(e.into()),
+                    Err(ReadError::Decode(e)) => {
+                        end = Some(e);
+                        break;
+                    }
+                };
+                let Seen { row, values } = check.observe(&record);
+                let lane = lanes.number(row.lane())?;
+                for v in &values {
+                    if v.num.is_some() {
+                        *series.entry((lane, v.packet, v.field)).or_default() += 1;
+                    }
+                }
+                let (label, new_label) = match record.label {
+                    None => (None, None),
+                    Some(text) => match labels.get(text.as_str()) {
+                        Some(&n) => (Some(n), None),
+                        None => {
+                            let n = u32::try_from(labels.len())
+                                .map_err(|_| "too many labels for a segment")?;
+                            labels.insert(text.clone(), n);
+                            (Some(n), Some(text))
+                        }
+                    },
+                };
+                batch.push(Item {
+                    lane,
+                    row,
+                    label,
+                    new_label,
+                    values,
+                });
+                if batch.len() >= BATCH {
+                    let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH));
+                    // The writing thread stopped: it says why below.
+                    if batches.send(full).is_err() {
+                        return Ok(());
+                    }
+                }
             }
-        };
-        let Seen { row, values } = check.observe(&record);
-        let lane = lanes.number(row.lane())?;
-        writer.push(i64::from(lane), &row, record.label.as_deref())?;
-        for v in values {
-            writer.push_value(v.packet, v.field, v.num, v.text.as_deref())?;
-            if v.num.is_some() {
-                *series.entry((lane, v.packet, v.field)).or_default() += 1;
-            }
-        }
-    }
+            let _ = batches.send(batch);
+            Ok(())
+        })();
+        drop(batches);
+        let writer = writing
+            .join()
+            .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+        (writer, read)
+    });
+    // What went wrong writing comes first: it may be why reading stopped.
+    let writer = writer?;
+    read?;
     let report = check.finish();
     let findings = report.findings(&records.notices(), end.as_ref());
     for finding in &findings {
@@ -200,6 +247,38 @@ pub fn read_file<'a>(
         fault: file.fault().map(str::to_string),
     };
     Ok((Read::Packets(Box::new(packets)), Some(writer)))
+}
+
+/// Records decoded and checked, handed to the thread writing them to the
+/// segment this many at a time, at most [`BATCHES_AHEAD`] batches ahead.
+const BATCH: usize = 1024;
+const BATCHES_AHEAD: usize = 4;
+
+/// A record as the thread writing the segment gets it: its label by
+/// number, with the label itself the first time.
+struct Item<'a> {
+    lane: u32,
+    row: PacketRow,
+    label: Option<u32>,
+    new_label: Option<String>,
+    values: Vec<KeptValue<'a>>,
+}
+
+/// Writes batches of records to a segment until there are no more, and
+/// hands the writer back.
+fn write_batches(mut writer: Writer, batches: mpsc::Receiver<Vec<Item<'_>>>) -> Result<Writer> {
+    for batch in batches {
+        for item in batch {
+            if let Some(text) = item.new_label {
+                writer.add_label(text)?;
+            }
+            writer.push_numbered(i64::from(item.lane), &item.row, item.label)?;
+            for v in item.values {
+                writer.push_value(v.packet, v.field, v.num, v.text.as_deref())?;
+            }
+        }
+    }
+    Ok(writer)
 }
 
 /// A name for the temporary files of the writer of job `job`, unique to

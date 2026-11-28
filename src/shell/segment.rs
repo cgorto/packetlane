@@ -1137,26 +1137,44 @@ impl Writer {
     /// see [`Ids`]). Its id is the first packet's plus the number added
     /// before it.
     pub fn push(&mut self, lane: i64, row: &PacketRow, label: Option<&str>) -> Result<()> {
+        let label = match label {
+            None => None,
+            Some(text) => Some(match self.labels.get(text) {
+                Some(&n) => n,
+                None => {
+                    let n = self.add_label(text.to_string())?;
+                    self.labels.insert(text.to_string(), n);
+                    n
+                }
+            }),
+        };
+        self.push_numbered(lane, row, label)
+    }
+
+    /// Adds a label to the segment's list, numbered on from the one added
+    /// before it, for packets added with [`Writer::push_numbered`].
+    pub fn add_label(&mut self, text: String) -> Result<u32> {
+        let n =
+            u32::try_from(self.label_list.len()).map_err(|_| "too many labels for a segment")?;
+        self.label_list.push(text);
+        Ok(n)
+    }
+
+    /// As [`Writer::push`], with the label given by its number: labels
+    /// numbered by whoever adds the packets, in the order they first come,
+    /// and each added ([`Writer::add_label`]) before the first packet with
+    /// it. Either way the segment numbers them so.
+    pub fn push_numbered(&mut self, lane: i64, row: &PacketRow, label: Option<u32>) -> Result<()> {
         let index = u32::try_from(self.count)
             .map_err(|_| "more packets in one file than a segment holds")?;
         let lane = u32::try_from(lane)
             .ok()
             .filter(|&l| l < u32::MAX)
             .ok_or("lane id out of range for a segment")?;
+        if label.is_some_and(|n| n as usize >= self.label_list.len()) {
+            return Err("a packet's label was not added".into());
+        }
         self.lane_bound = self.lane_bound.max(lane + 1);
-        let label = match label {
-            None => None,
-            Some(text) => Some(match self.labels.get(text) {
-                Some(&n) => n,
-                None => {
-                    let n = u32::try_from(self.label_list.len())
-                        .map_err(|_| "too many labels for a segment")?;
-                    self.labels.insert(text.to_string(), n);
-                    self.label_list.push(text.to_string());
-                    n
-                }
-            }),
-        };
         let record = PacketRecord {
             receive_ns: row.receive_ns,
             packet_ns: row.packet_ns,
