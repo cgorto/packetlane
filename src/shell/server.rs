@@ -108,7 +108,12 @@ impl Server {
         }
         // Create the store if it is not there, so readers can open it.
         drop(Store::open(&options.db)?);
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, options.port))?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, options.port)).map_err(|e| {
+            format!(
+                "Could not listen on port {}: {e}; try --port 0",
+                options.port
+            )
+        })?;
         let port = listener.local_addr()?.port();
         Ok(Server {
             listener,

@@ -201,6 +201,43 @@ fn the_read_only_store_cannot_be_made_to_write() {
     assert!(reader.query_user(endless, 10).is_err());
 }
 
+/// A store made by a build with another schema is refused for reading as
+/// for writing, by `query` and `serve` alike, with the same words, and
+/// `serve` does not word it as a port it could not listen on.
+#[test]
+fn a_store_of_another_schema_is_refused_for_reading_too() {
+    let scratch = Scratch::new();
+    let db = scratch.0.join("store.db");
+    drop(Store::open(&db).unwrap());
+    let old = packetlane::pure::sql::SCHEMA_VERSION - 1;
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .pragma_update(None, "user_version", old)
+        .unwrap();
+    let message = match Store::open(&db) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a store of schema {old} was opened for writing"),
+    };
+    assert!(message.contains(&format!("schema {old}")), "{message}");
+    match Store::open_read_only(&db, Duration::from_secs(5)) {
+        Err(e) => assert_eq!(e.to_string(), message),
+        Ok(_) => panic!("a store of schema {old} was opened for reading"),
+    }
+    let bin = env!("CARGO_BIN_EXE_packetlane");
+    let db_arg = db.to_string_lossy().into_owned();
+    let root = scratch.0.to_string_lossy().into_owned();
+    for args in [
+        vec!["query", "--db", &db_arg, "select count(*) from runs"],
+        vec!["serve", "--db", &db_arg, "--root", &root, "--port", "0"],
+    ] {
+        let out = std::process::Command::new(bin).args(&args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(stderr.contains(&message), "{args:?}: {stderr}");
+        assert!(!stderr.contains("listen"), "{args:?}: {stderr}");
+    }
+}
+
 fn http(port: u16, request: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.write_all(request.as_bytes()).unwrap();

@@ -401,8 +401,7 @@ fn serve(rest: &[String]) -> CliResult {
         config,
         user_config: user_config_path(),
         port,
-    })
-    .map_err(|e| format!("Could not listen on port {port}: {e}; try --port 0"))?;
+    })?;
     println!("{}", server.url());
     server.run();
     Ok(ExitCode::SUCCESS)

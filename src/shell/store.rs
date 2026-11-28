@@ -182,6 +182,22 @@ fn run_query(conn: &Connection, q: &Query, limit: usize) -> Result<Table> {
     collect(&mut stmt, &q.params, limit)
 }
 
+/// Refuses a store made by a build with another schema: its tables, or its
+/// segments, are not the ones this build reads. A file with no schema yet
+/// (version 0) is a new store.
+fn check_schema(conn: &Connection, path: &Path) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != 0 && version != sql::SCHEMA_VERSION {
+        return Err(format!(
+            "{} uses schema {version}, expected {}; delete it or pass a different --db",
+            path.display(),
+            sql::SCHEMA_VERSION
+        )
+        .into());
+    }
+    Ok(())
+}
+
 impl Store {
     /// Opens the store for reading and writing, creating it if needed.
     pub fn open(path: &Path) -> Result<Store> {
@@ -192,15 +208,7 @@ impl Store {
         conn.pragma_update(None, "temp_store", "FILE")?;
         // Negative means a size in KiB, not a count of pages.
         conn.pragma_update(None, "cache_size", -write_cache_kib())?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version != 0 && version != sql::SCHEMA_VERSION {
-            return Err(format!(
-                "{} uses schema {version}, expected {}; delete it or pass a different --db",
-                path.display(),
-                sql::SCHEMA_VERSION
-            )
-            .into());
-        }
+        check_schema(&conn, path)?;
         let segments = segment::folder_for(path);
         let shared = vtab::Shared::new(segments.clone());
         vtab::register(&conn, &shared)?;
@@ -244,6 +252,7 @@ impl Store {
         conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
         // No single value larger than this can be made or read here.
         conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)?;
+        check_schema(&conn, path)?;
         let deadline = Instant::now() + budget;
         conn.progress_handler(10_000, Some(move || Instant::now() > deadline))?;
         let segments = segment::folder_for(path);
