@@ -959,7 +959,8 @@ impl Store {
             }
             phases.mark("text log buckets");
             tx.execute(sql::DELETE_CROSS_FINDINGS, params![run_id])?;
-            for finding in cross_findings(&tx, &self.segments, run_id, &mut phases)? {
+            let threads = self.readers.workers.max(1);
+            for finding in cross_findings(&tx, &self.segments, run_id, threads, &mut phases)? {
                 tx.execute(
                     sql::INSERT_FINDING,
                     params![
@@ -2040,6 +2041,7 @@ fn cross_findings(
     conn: &Connection,
     folder: &Path,
     run_id: i64,
+    threads: usize,
     phases: &mut Phases,
 ) -> Result<Vec<CrossFinding>> {
     let mut out = Vec::new();
@@ -2082,7 +2084,7 @@ fn cross_findings(
             .collect();
 
     let mut cmp = Comparison::new(&lane_pairs, &traced);
-    let replay = cross::compare(folder, &segments, &mut cmp, cross::FAN_IN)?;
+    let replay = cross::compare(folder, &segments, &mut cmp, cross::FAN_IN, threads)?;
     phases.mark("merging the checksum sections");
     replay.run(&mut cmp)?;
     phases.mark("counting packets a partner lacks");

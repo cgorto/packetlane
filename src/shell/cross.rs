@@ -115,7 +115,7 @@ fn buffer_for(n: usize) -> usize {
 /// input is not in order.
 fn merge(
     mut inputs: Vec<Input>,
-    wants: &dyn Fn(u32) -> bool,
+    wants: &(dyn Fn(u32) -> bool + Sync),
     mut out: impl FnMut(Logged) -> Result<()>,
 ) -> Result<()> {
     let mut heap = BinaryHeap::with_capacity(inputs.len());
@@ -166,20 +166,24 @@ fn open_segments(folder: &Path, list: &[(String, i64)], buffer: usize) -> Result
     Ok(out)
 }
 
-/// Merged runs: ranges of one temporary file.
+/// Merged runs: ranges of temporary files, as (file, start, end), in the
+/// order of the groups they were merged from.
 struct Runs {
-    temp: TempFile,
-    ranges: Vec<(u64, u64)>,
+    temps: Vec<TempFile>,
+    ranges: Vec<(usize, u64, u64)>,
 }
 
 impl Runs {
-    fn inputs(&self, ranges: &[(u64, u64)]) -> Result<Vec<Input>> {
-        let buffer = buffer_for(ranges.len());
+    fn inputs(&self, ranges: &[(usize, u64, u64)], buffer: usize) -> Result<Vec<Input>> {
         ranges
             .iter()
-            .map(|&(start, end)| {
+            .map(|&(temp, start, end)| {
+                let file = self
+                    .temps
+                    .get(temp)
+                    .ok_or("a merged run without its file")?;
                 Ok(Input::Run(RecordFile::new(
-                    self.temp.file.try_clone()?,
+                    file.file.try_clone()?,
                     start,
                     end,
                     buffer,
@@ -189,30 +193,60 @@ impl Runs {
     }
 }
 
-/// Merges groups of `fan_in` inputs, each group into one run of a new
-/// temporary file.
+/// Merges groups of inputs, each group into one run, on up to `threads`
+/// threads, each writing the runs of its groups to a temporary file of its
+/// own. `open` opens a group's inputs, each read through a buffer of the
+/// size it is given: [`MERGE_BUDGET`] shared by every input of every
+/// thread.
 fn merge_level(
     temps: &mut Temps,
     groups: usize,
-    mut open: impl FnMut(usize) -> Result<Vec<Input>>,
-    wants: &dyn Fn(u32) -> bool,
+    widest: usize,
+    open: &(dyn Fn(usize, usize) -> Result<Vec<Input>> + Sync),
+    wants: &(dyn Fn(u32) -> bool + Sync),
+    threads: usize,
 ) -> Result<Runs> {
-    let temp = temps.create()?;
-    let mut ranges = Vec::with_capacity(groups);
-    let mut writer = BufWriter::with_capacity(IO_BUFFER, temp.file.try_clone()?);
-    let mut at = 0u64;
-    for g in 0..groups {
-        let start = at;
-        merge(open(g)?, wants, |l| {
-            writer.write_all(&encode(&l))?;
-            at += LOGGED_BYTES as u64;
-            Ok(())
-        })?;
-        ranges.push((start, at));
-    }
-    writer.flush()?;
-    drop(writer);
-    Ok(Runs { temp, ranges })
+    let threads = threads.clamp(1, groups.max(1));
+    let buffer = buffer_for(widest * threads);
+    let files: Vec<TempFile> = (0..threads)
+        .map(|_| temps.create())
+        .collect::<Result<_>>()?;
+    let mut ranges: Vec<(usize, usize, u64, u64)> = std::thread::scope(|scope| {
+        let mut parts = Vec::with_capacity(threads);
+        for (t, temp) in files.iter().enumerate() {
+            parts.push(
+                scope.spawn(move || -> Result<Vec<(usize, usize, u64, u64)>> {
+                    let mut writer = BufWriter::with_capacity(IO_BUFFER, temp.file.try_clone()?);
+                    let mut at = 0u64;
+                    let mut ranges = Vec::new();
+                    for g in (t..groups).step_by(threads) {
+                        let start = at;
+                        merge(open(g, buffer)?, wants, |l| {
+                            writer.write_all(&encode(&l))?;
+                            at += LOGGED_BYTES as u64;
+                            Ok(())
+                        })?;
+                        ranges.push((g, t, start, at));
+                    }
+                    writer.flush()?;
+                    Ok(ranges)
+                }),
+            );
+        }
+        let mut all = Vec::with_capacity(groups);
+        for part in parts {
+            let part = part
+                .join()
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
+            all.extend(part?);
+        }
+        Ok::<_, crate::shell::store::Error>(all)
+    })?;
+    ranges.sort_unstable();
+    Ok(Runs {
+        temps: files,
+        ranges: ranges.into_iter().map(|(_, t, s, e)| (t, s, e)).collect(),
+    })
 }
 
 /// The packets of the current group, in memory up to [`GROUP_MEMORY`] and
@@ -309,13 +343,15 @@ impl Replay {
 
 /// Feeds every space packet of the listed segments (name, first packet id)
 /// to the comparison, in checksum order, reading at most `fan_in` sections
-/// at once. What it returns gives the comparison what it could not decide
+/// at once on each of up to `threads` threads (the passes before the last
+/// merge groups of them at once; the last is on this thread). What it returns gives the comparison what it could not decide
 /// until every packet had been seen.
 pub fn compare(
     folder: &Path,
     segments: &[(String, i64)],
     cmp: &mut Comparison,
     fan_in: usize,
+    threads: usize,
 ) -> Result<Replay> {
     let fan_in = fan_in.max(2);
     let mut temps = Temps {
@@ -329,26 +365,29 @@ pub fn compare(
     let mut runs: Option<Runs> = None;
     if segments.len() > fan_in {
         let chunks: Vec<&[(String, i64)]> = segments.chunks(fan_in).collect();
-        let buffer = buffer_for(fan_in);
         runs = Some(merge_level(
             &mut temps,
             chunks.len(),
-            |g| open_segments(folder, chunks[g], buffer),
+            fan_in,
+            &|g, buffer| open_segments(folder, chunks[g], buffer),
             &wants,
+            threads,
         )?);
         while let Some(level) = runs.as_ref().filter(|r| r.ranges.len() > fan_in) {
-            let chunks: Vec<&[(u64, u64)]> = level.ranges.chunks(fan_in).collect();
+            let chunks: Vec<&[(usize, u64, u64)]> = level.ranges.chunks(fan_in).collect();
             let next = merge_level(
                 &mut temps,
                 chunks.len(),
-                |g| level.inputs(chunks[g]),
+                fan_in,
+                &|g, buffer| level.inputs(chunks[g], buffer),
                 &wants,
+                threads,
             )?;
             runs = Some(next);
         }
     }
     let inputs = match &runs {
-        Some(r) => r.inputs(&r.ranges)?,
+        Some(r) => r.inputs(&r.ranges, buffer_for(r.ranges.len()))?,
         None => open_segments(folder, segments, buffer_for(segments.len()))?,
     };
 
@@ -514,9 +553,9 @@ mod tests {
         let mut sorted = all.clone();
         sorted.sort_unstable();
         let want = compare_all(&PAIRS, &[1, 4], sorted);
-        for fan_in in [2, 3, 64] {
+        for (fan_in, threads) in [(2, 1), (3, 1), (64, 1), (2, 3), (3, 2), (2, 8)] {
             let mut cmp = Comparison::new(&PAIRS, &[1, 4]);
-            compare(&scratch.0, &listed, &mut cmp, fan_in)
+            compare(&scratch.0, &listed, &mut cmp, fan_in, threads)
                 .unwrap()
                 .run(&mut cmp)
                 .unwrap();
@@ -595,7 +634,7 @@ mod tests {
         sorted.sort_unstable();
         let want = compare_all(&pairs, &[], sorted);
         let mut cmp = Comparison::new(&pairs, &[]);
-        let replay = compare(&scratch.0, &listed, &mut cmp, FAN_IN).unwrap();
+        let replay = compare(&scratch.0, &listed, &mut cmp, FAN_IN, 2).unwrap();
         let (held, largest) = replay.group_sizes();
         replay.run(&mut cmp).unwrap();
         assert_eq!(cmp.counts(), want.counts());
