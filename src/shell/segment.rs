@@ -446,6 +446,16 @@ impl<const N: usize> Sorter<N> {
         self
     }
 
+    /// Takes its chunk's memory now, on this thread, rather than on the
+    /// thread that first pushes: memory a thread takes stays with that
+    /// thread's allocator, so a writer filled on one thread and finished
+    /// on another would otherwise hold both threads' share at once. The
+    /// pages are not touched until records fill them.
+    pub fn reserved(mut self) -> Self {
+        self.buf.reserve_exact(self.chunk);
+        self
+    }
+
     fn temp(&mut self) -> Result<TempFile> {
         self.names += 1;
         let mut name = self.stem.clone().into_os_string();
@@ -636,7 +646,10 @@ impl<const N: usize> Spread<N> {
             stem,
             chunk: chunk.max(1),
             block: (chunk / PARTS).max(16),
-            held: (0..PARTS).map(|_| Vec::new()).collect(),
+            // Taken now, on this thread: see [`Sorter::reserved`].
+            held: (0..PARTS)
+                .map(|_| Vec::with_capacity((chunk / PARTS).max(16)))
+                .collect(),
             last: vec![None; PARTS],
             counts: vec![0; PARTS],
             file: None,
@@ -1027,9 +1040,11 @@ impl Writer {
         let mut out = BufWriter::with_capacity(IO_BUFFER, temp.file.try_clone()?);
         out.write_all(&MAGIC)?;
         let path = |what: &str| folder.join(format!("{stem}.{what}"));
-        let sorter = |clock: &str| Sorter::new(path(clock), chunk(TIME_BYTES), FAN_IN);
+        let sorter = |clock: &str| Sorter::new(path(clock), chunk(TIME_BYTES), FAN_IN).reserved();
         let points = |clock: &str| {
-            Sorter::new(path(clock), chunk(POINT_KEY_BYTES), FAN_IN).ordered(ChunkOrder::Grouped)
+            Sorter::new(path(clock), chunk(POINT_KEY_BYTES), FAN_IN)
+                .ordered(ChunkOrder::Grouped)
+                .reserved()
         };
         let spool = |what: &str| Spool::create(folder.join(format!("{stem}.{what}.tmp")));
         Ok(Writer {
@@ -1055,11 +1070,9 @@ impl Writer {
             lane_bound: 0,
             levels: Default::default(),
             sums: Some(Spread::new(path("sums"), chunk(CHECKSUM_KEY_BYTES))),
-            by_value: Some(Sorter::new(
-                path("by-value"),
-                chunk(VALUE_KEY_BYTES),
-                FAN_IN,
-            )),
+            by_value: Some(
+                Sorter::new(path("by-value"), chunk(VALUE_KEY_BYTES), FAN_IN).reserved(),
+            ),
         })
     }
 

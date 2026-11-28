@@ -203,7 +203,8 @@ Limits of working from counters alone are listed at the top of
   files before it and checked by that transaction, and a file not given
   the ids foreseen (another writer stored meanwhile, or a file before it
   failed) is read again. The six sorting buffers of every thread share
-  24 MB (1 MB each up to four threads, less beyond, never under 256 KB).
+  12 MB (1 MB each up to two threads, 512 KB at four, never under
+  256 KB).
 - Writing uses about 18 MB of memory whatever the size of the run
   (measured: 18 MB for three million packets in 900 lanes and for ten
   million in 12). Sorting a segment's time order, its kept numbers, its

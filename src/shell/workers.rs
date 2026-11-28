@@ -251,8 +251,8 @@ pub fn read_file<'a>(
 
 /// Records decoded and checked, handed to the thread writing them to the
 /// segment this many at a time, at most [`BATCHES_AHEAD`] batches ahead.
-const BATCH: usize = 1024;
-const BATCHES_AHEAD: usize = 4;
+const BATCH: usize = 512;
+const BATCHES_AHEAD: usize = 2;
 
 /// A record as the thread writing the segment gets it: its label by
 /// number, with the label itself the first time.
@@ -300,7 +300,7 @@ pub const DEFAULT_WORKERS: usize = 4;
 /// What the sorters of all the threads hold together, at most: each
 /// thread's six sorters share an equal part, at most
 /// [`segment::CHUNK_BYTES`] each and at least [`MIN_CHUNK_BYTES`].
-pub const SORT_BUDGET: usize = 24 << 20;
+pub const SORT_BUDGET: usize = 12 << 20;
 pub const MIN_CHUNK_BYTES: usize = 256 << 10;
 
 /// How many threads read files, and what each sorter holds.
