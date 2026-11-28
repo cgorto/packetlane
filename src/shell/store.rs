@@ -158,13 +158,12 @@ impl Phases {
     }
 }
 
-/// The page cache to write with, in KiB. A file's packets are written to
-/// the end of each lane's part of the two lane-first indexes, so what must
-/// stay in memory is a couple of pages for every lane the file holds: 4 MB
-/// was enough for a file of 300 lanes, measured, and this leaves room for
-/// about twice that. With less, each packet pushes out a page another lane
-/// is about to need. With more, nothing is gained. Peak memory while
-/// writing was 16, 22, 35, 61 and 81 MB at 2, 4, 8, 16 and 32 MB of cache.
+/// The page cache to write with, in KiB: the most SQLite may hold, not what
+/// it takes, since it fills the cache only as it touches pages. It was sized
+/// for the indexes of packets the store kept before layout 6, which needed
+/// a couple of pages for every lane a file held. SQLite now holds no packet
+/// rows: while ingesting it writes a file's lanes, findings and counts, and
+/// the lines of text logs with their time index.
 const WRITE_CACHE_KIB: i64 = 8 * 1024;
 
 /// The page cache to write with: [`WRITE_CACHE_KIB`], or as many megabytes

@@ -1,6 +1,7 @@
-//! Segment files against the store's own rows: every answer read from the
-//! segments is checked against the `packets` table of the same store, which
-//! holds the same packets.
+//! Segment files against the oracle: every answer read from the segments is
+//! checked against the `oracle_packets` and `oracle_field_values` tables of
+//! the same store (see `pure::oracle`), which a store opened for tests
+//! writes with the same packets.
 
 use std::fs;
 use std::path::{Path, PathBuf};

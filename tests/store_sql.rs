@@ -1,6 +1,10 @@
 //! Two things about the store's SQL that no answer on a small run shows:
 //! which index SQLite uses for it, and that what it keeps per file adds up
-//! to what counting the packets gives.
+//! to what counting the packets gives. The packets are counted, and the
+//! plans pinned, on the oracle tables a store opened for tests writes (see
+//! `pure::oracle`): the statements the store ran over its own packet tables
+//! before those were served from the segment files. The plans of SQL over
+//! the tables that are served from them are pinned in `tests/vtab.rs`.
 //!
 //! A new index can make an existing query slow without changing a single
 //! answer, because SQLite may prefer it. The load tests show that as

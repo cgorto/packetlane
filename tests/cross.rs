@@ -1,9 +1,9 @@
 //! The comparison of sources is read from the checksum sections of the
 //! segment files. These tests check its findings against the comparison it
-//! replaced, which asked SQL over the `packets` rows of the same store: the
-//! statements are kept here as the oracle while those rows are still
-//! written. Findings must be the same rows in the same order, with the same
-//! lane and packet ids.
+//! replaced, which asked SQL over the packets of the same store: the
+//! statements are kept here as the oracle, over the `oracle_packets` rows a
+//! store opened for tests writes (see `pure::oracle`). Findings must be the
+//! same rows in the same order, with the same lane and packet ids.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

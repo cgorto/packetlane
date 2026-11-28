@@ -25,20 +25,39 @@
 //! constraint whose value has a type the plan does not expect (`id = '7'`,
 //! `field = 5`, a text compared under another collation) is not used.
 //!
-//! `packets` is read in id order, segment after segment, skipping segments
-//! by their listed id range, file, lanes and time ranges; or, for a range of
-//! receive or packet time (or an order by it, when every packet has that
-//! time), from the segments' time-order sections, merged by time and id.
+//! `packets` is read in id order, either way, segment after segment,
+//! skipping segments by their listed id range, file, lanes and time ranges;
+//! a single id is a binary search on the listed ranges and one read, and
+//! the block of records it read is kept for the next lookup, so a join that
+//! looks packets up in id order reads each block once. Or it is read from
+//! the segments' time-order sections, merged by time and then id, either
+//! way up: for a range of receive or packet time, or for an order by one.
+//! Packets without that time are not in those sections; with no range to
+//! rule them out they are read from the packet records, first when the
+//! order is ascending and last when it is descending, as SQLite orders
+//! nulls. Rows read in time order fetch their packet record only for a
+//! column that needs it. An order is claimed only when it is the one
+//! produced across all segments: id ascending or descending, or a time
+//! clock either way followed by id either way.
+//!
 //! `field_values` is read in packet order from the segments' values
-//! sections, a range of packets found by binary search, and segments
-//! without a series of the field asked for skipped.
+//! sections: a range of packets found by binary search, segments without
+//! a series of the packet and field asked for skipped, the others read
+//! whole and their values tested by series and number. Its rowid is the
+//! segment's place in the list and the value's place in the segment, unique
+//! within a statement; the rowids the SQLite table had are kept nowhere.
+//!
+//! Each read checks the time limit of the connection now and then, since
+//! SQLite's progress handler does not run while a table reads without
+//! returning a row.
 //!
 //! # Safety
 //!
 //! rusqlite's traits for a virtual table and its cursor are `unsafe` to
 //! implement: SQLite hands back pointers to the structs, which it treats as
 //! its own `sqlite3_vtab` and `sqlite3_vtab_cursor`. That is the only
-//! `unsafe` here, one `unsafe impl` per trait, each saying why it holds.
+//! `unsafe` here: four `unsafe impl`s, one for each table and each cursor,
+//! each saying why it holds.
 //! Nothing in a callback may panic, since a panic cannot cross into C: each
 //! body is run under `catch_unwind` and a panic becomes an error.
 
@@ -1178,8 +1197,8 @@ struct TimeSlot {
     peeked: Option<TimeRecord>,
 }
 
-/// Most packets of one segment with one time that a descending order
-/// holds at once to hand them out by id ascending.
+/// Most packets of one segment with one time that a time order holds at
+/// once, to hand them out by id the other way than their section has them.
 const MAX_RUN: usize = 1 << 20;
 
 impl TimeSlot {
