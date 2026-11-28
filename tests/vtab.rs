@@ -649,11 +649,43 @@ fn kept_values_in_order_of_number_are_what_the_tables_gave() {
         ));
         statements.push(format!("SELECT {cols} FROM {{V}} WHERE {filter}"));
     }
+    // A join that looks each packet's values up: a range of packets is
+    // read in packet order, not gathered from the value order.
+    statements.push(
+        "SELECT p.id, v.num FROM {P} p CROSS JOIN {V} v ON v.packet_id = p.id
+         WHERE v.field = 'V' AND v.num > 100 ORDER BY p.id"
+            .to_string(),
+    );
     let mut rows = 0;
     for sql in &statements {
         rows += compare(&reader, sql);
     }
     assert!(rows > 50_000, "{rows}");
+}
+
+/// Thousands of packets of one segment at one receive time, more than a
+/// reader holds, ordered by that time and then id the other way.
+#[test]
+fn many_packets_at_one_time_order_either_way() {
+    let s = Scratch::new();
+    s.write("t/packetlane.toml", KEPT_CONFIG.as_bytes());
+    let mut log = cosmos4_header(true, "kept", "bench");
+    for i in 0..9_000u32 {
+        let r = if i < 8_500 { T0 } else { T0 + i64::from(i) };
+        log.extend(kept_entry(16, i, r, r - i64::from(i % 3)));
+    }
+    s.write("t/bench/same.bin", &log);
+    s.ingest("t");
+    let reader = s.reader();
+    for order in [
+        "receive_ns DESC, id",
+        "receive_ns, id DESC",
+        "receive_ns DESC, id DESC",
+        "packet_ns DESC, id",
+    ] {
+        let sql = format!("SELECT id, receive_ns, packet_ns FROM {{P}} ORDER BY {order}");
+        assert_eq!(compare(&reader, &sql), 9_000, "{sql}");
+    }
 }
 
 /// The plan SQLite takes, one step a line.
@@ -782,6 +814,13 @@ fn the_query_builder_is_answered_without_sorting_or_scanning_per_row() {
     assert!(steps.contains("INDEX 8:"), "{steps}");
     let steps = plan(&reader, "SELECT COUNT(num) FROM field_values");
     assert!(!steps.contains("INDEX 8:"), "{steps}");
+    // Nor for one file at a time, which as the inner loop of a join over
+    // files would only be sorted again.
+    let steps = plan(
+        &reader,
+        "SELECT * FROM field_values WHERE field = 'V' AND file_id = 1 ORDER BY num",
+    );
+    assert!(!steps.contains("INDEX 1:"), "{steps}");
     // Without a field the order of number is not claimed.
     let steps = plan(&reader, "SELECT * FROM field_values ORDER BY num");
     assert!(steps.contains("TEMP B-TREE"), "{steps}");

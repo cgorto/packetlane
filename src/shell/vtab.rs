@@ -1919,7 +1919,9 @@ unsafe impl<'vtab> VTab<'vtab> for ValuesTab {
                 [(V_NUM, num_desc), (V_PACKET_ID, id_desc)] => Some((*num_desc, *id_desc)),
                 _ => None,
             }
-            .filter(|_| sides(&taken, 'd').0);
+            // Not for one file at a time: as the inner loop of a join over
+            // files it would only be sorted again, by file.
+            .filter(|_| sides(&taken, 'd').0 && !sides(&taken, 'f').0);
             if let Some((num_desc, id_desc)) = by_value {
                 let mut plan = PLAN_BY_VALUE;
                 if num_desc {
@@ -2195,7 +2197,9 @@ impl Picked {
     /// there are at most [`PICK_MOST`]; `None` if more, or if the bounds
     /// do not name a field and a range of numbers.
     fn gather(r: &mut Reading, segs: &[usize], b: &ValueBounds) -> VResult<Option<Picked>> {
-        if b.field.is_none() || !b.num.bounded || b.empty() {
+        // A range of packets (a join looking packets' values up, one
+        // packet at a time) is quicker found in packet order.
+        if b.field.is_none() || !b.num.bounded || b.empty() || b.packet_id.bounded {
             return Ok(None);
         }
         let mut ranges = Vec::new();
