@@ -2389,6 +2389,76 @@ mod tests {
         assert!(seg.group(Clock::Packet, 1, 0).unwrap().is_none());
     }
 
+    /// The bytes of a segment of 6,000 packets on seven lanes whose times
+    /// are in order in some stretches and not in others: late packets, a
+    /// clock that jumps back, ties, lanes running apart, and kept values
+    /// with ties, negative numbers and two values of one field in one
+    /// packet, written with sorters of `chunk` records (`None`: the
+    /// default).
+    fn disordered_segment(scratch: &Scratch, chunk: Option<usize>) -> Vec<u8> {
+        let mut writer = match chunk {
+            Some(chunk) => Writer::with_chunk(&scratch.0, 9, 50, chunk).unwrap(),
+            None => Writer::create(&scratch.0, 9, 50).unwrap(),
+        };
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for i in 0..6_000i64 {
+            let lane = (i % 7) as i64 + 1;
+            // In order, then late packets, then a jump back, then ties.
+            let base = match i {
+                0..1_500 => i * 1_000,
+                1_500..3_000 if i % 50 == 0 => i * 1_000 - 400_000,
+                1_500..3_000 => i * 1_000,
+                3_000..4_500 => i * 1_000 - 2_000_000,
+                _ => (i / 100) * 1_000,
+            };
+            let receive = (i % 11 != 0).then_some(base);
+            // Each lane's packet time runs behind by its own amount.
+            let packet = (i % 13 != 0).then_some(base - lane * 300_000);
+            let mut r = row(i, receive, packet);
+            r.sum = (random() % 400) as i64 - 200;
+            r.header = (i % 17 != 0).then_some(crate::pure::ccsds::PrimaryHeader {
+                version: 0,
+                packet_type: crate::pure::ccsds::PacketType::Telemetry,
+                has_secondary_header: false,
+                apid: lane as u16,
+                seq_flags: crate::pure::ccsds::SeqFlags::Unsegmented,
+                seq_count: (random() % 3) as u16,
+                data_length: 3,
+            });
+            writer.push(lane, &r, None).unwrap();
+            let n = (random() % 5) as f64 - 2.5;
+            writer.push_value("HK", "A", Some(n), None).unwrap();
+            if i % 3 == 0 {
+                writer.push_value("HK", "A", Some(-n), None).unwrap();
+                writer.push_value("HK", "B", Some(0.0), Some("x")).unwrap();
+            }
+        }
+        let written = writer.finish().unwrap().unwrap();
+        let path = scratch.0.join(&written.name);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_segment_is_the_same_whatever_its_sorters_hold() {
+        let scratch = Scratch::new();
+        let whole = disordered_segment(&scratch, None);
+        for chunk in [3, 97, 1_000] {
+            assert!(
+                disordered_segment(&scratch, Some(chunk)) == whole,
+                "chunk {chunk}"
+            );
+        }
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
     #[test]
     fn a_writer_dropped_unfinished_leaves_nothing() {
         let scratch = Scratch::new();
