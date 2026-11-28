@@ -49,6 +49,8 @@ pub struct Store {
     shared: Arc<vtab::Shared>,
     /// See [`Store::after_listing`].
     after_listing: Option<Box<dyn Fn() + Send>>,
+    /// When a read-only store's requests must stop.
+    deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -212,6 +214,7 @@ impl Store {
             oracle: false,
             shared,
             after_listing: None,
+            deadline: None,
         })
     }
 
@@ -255,6 +258,7 @@ impl Store {
             oracle: false,
             shared,
             after_listing: None,
+            deadline: Some(deadline),
         })
     }
 
@@ -310,10 +314,10 @@ impl Store {
     /// been replaced meanwhile ([`segment::Stale`]): the list is read again,
     /// and finds the new one.
     fn again_if_stale<T>(&self, read: impl Fn() -> Result<T>) -> Result<T> {
-        match self.in_read_transaction(&read) {
+        segment::with_deadline(self.deadline, || match self.in_read_transaction(&read) {
             Err(e) if e.is::<segment::Stale>() => self.in_read_transaction(read),
             other => other,
-        }
+        })
     }
 
     /// Runs `f` in a read transaction of its own, unless one is open, so

@@ -11,6 +11,7 @@ use std::hash::BuildHasherDefault;
 use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::pure::ingest::{PacketRow, ptype_code};
 use crate::pure::segment::{
@@ -100,6 +101,36 @@ impl Drop for TempFile {
     }
 }
 
+thread_local! {
+    /// When reads of segment files on this thread must stop; see
+    /// [`with_deadline`].
+    static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `read` with every buffered read of a segment file on this thread
+/// failing once `deadline` has passed, so that a request's reads of the
+/// segment files keep to its time as its SQL does.
+pub fn with_deadline<T>(deadline: Option<Instant>, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DEADLINE.with(|d| d.set(self.0));
+        }
+    }
+    let _restore = Restore(DEADLINE.with(|d| d.replace(deadline)));
+    read()
+}
+
+/// Fails if this thread's reads are past their deadline.
+fn in_time() -> Result<()> {
+    match DEADLINE.with(std::cell::Cell::get) {
+        Some(deadline) if Instant::now() > deadline => {
+            Err("Request took longer than the time limit while reading the segment files".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Reads fixed-width records from one range of a file, through a buffer.
 struct RangeReader<'a, const N: usize> {
     file: &'a File,
@@ -122,6 +153,7 @@ impl<'a, const N: usize> RangeReader<'a, N> {
 
     fn read(&mut self) -> Result<Option<[u8; N]>> {
         if self.at >= self.buf.len() {
+            in_time()?;
             let left = self.end.saturating_sub(self.next);
             if left < N as u64 {
                 return Ok(None);
@@ -1583,6 +1615,7 @@ impl<const N: usize> RecordFile<N> {
 
     pub(crate) fn read(&mut self) -> Result<Option<[u8; N]>> {
         if self.at >= self.buf.len() {
+            in_time()?;
             let left = self.end.saturating_sub(self.next);
             if left < N as u64 {
                 return Ok(None);

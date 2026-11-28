@@ -857,3 +857,32 @@ fn a_segment_replaced_after_it_was_listed_is_read_from_a_new_list() {
         assert_eq!(got, read(&fresh()), "{name}");
     }
 }
+
+/// The page's reads of the segment files keep to a request's time as its
+/// SQL does.
+#[test]
+fn the_pages_reads_of_the_segment_files_stop_at_the_time_limit() {
+    use packetlane::pure::sql::Clock;
+    let s = stored();
+    let (from, to) = (T0 - 1_000_000_000, T0 + 4_000_000_000);
+    let late = Store::open_read_only(&s.db(), Duration::from_millis(1)).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let in_time = s.reader();
+    type Read = fn(&Store, i64, i64) -> packetlane::shell::store::Result<Table>;
+    let reads: [(&str, Read); 3] = [
+        ("density", |r, from, to| {
+            r.packet_density(1, Clock::Receive, from, to, 7)
+        }),
+        ("items", |r, from, to| {
+            r.packet_items(1, Clock::Packet, from, to, 100_000)
+        }),
+        ("series", |r, from, to| {
+            r.series(1, Clock::Receive, 1, Some(("HK", "V")), from, to, 3)
+        }),
+    ];
+    for (name, read) in reads {
+        let err = read(&late, from, to).unwrap_err().to_string();
+        assert!(err.contains("time limit"), "{name}: {err}");
+        assert!(!read(&in_time, from, to).unwrap().rows.is_empty(), "{name}");
+    }
+}
