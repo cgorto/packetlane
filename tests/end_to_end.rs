@@ -230,7 +230,10 @@ fn a_store_of_another_schema_is_refused_for_reading_too() {
         vec!["query", "--db", &db_arg, "select count(*) from runs"],
         vec!["serve", "--db", &db_arg, "--root", &root, "--port", "0"],
     ] {
-        let out = std::process::Command::new(bin).args(&args).output().unwrap();
+        let out = std::process::Command::new(bin)
+            .args(&args)
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!out.status.success(), "{args:?}");
         assert!(stderr.contains(&message), "{args:?}: {stderr}");
