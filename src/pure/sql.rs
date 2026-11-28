@@ -588,6 +588,24 @@ pub const INSERT_SEGMENT: &str = "INSERT INTO segments
 /// `last_insert_rowid`, then [`DROP_SEGMENT_SERIAL`].
 pub const NEXT_SEGMENT_SERIAL: &str = "INSERT INTO segment_serial DEFAULT VALUES";
 pub const DROP_SEGMENT_SERIAL: &str = "DELETE FROM segment_serial";
+
+// What files read in parallel are foreseen to get: the ids SQLite hands
+// out are one more than the highest in use (the serial one more than the
+// highest ever), so these are read once, and what each file stored does
+// to them is followed (see `shell::store`). Each file's own statements
+// then check the ids it was given.
+
+/// The files of a run by path within it. Columns: rel, id, size, checksum.
+pub const RUN_FILE_IDENTITIES: &str = "SELECT rel, id, size, checksum FROM files WHERE run_id = ?";
+/// Every file's id. Columns: id.
+pub const ALL_FILE_IDS: &str = "SELECT id FROM files";
+/// Every lane. Columns: id, run id, source, kind, apid, ptype, file id.
+pub const ALL_LANES: &str = "SELECT id, run_id, source, kind, apid, ptype, file_id FROM lanes";
+/// Every segment's file and last packet id. Columns: file id, last packet.
+pub const ALL_SEGMENT_ENDS: &str = "SELECT file_id, last_packet FROM segments";
+/// The last serial handed out, if any. Columns: serial.
+pub const LAST_SEGMENT_SERIAL: &str =
+    "SELECT seq FROM sqlite_sequence WHERE name = 'segment_serial'";
 /// The segment of one file, if it has one. Columns: name.
 pub const FILE_SEGMENT: &str = "SELECT name FROM segments WHERE file_id = ?";
 /// The segments of a run's files. Columns: name.

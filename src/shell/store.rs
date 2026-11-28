@@ -2,7 +2,7 @@
 //! what the statements are, and what their results mean, is decided in
 //! `pure::sql`, `pure::ingest` and `pure::cross`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -12,14 +12,16 @@ use std::time::{Duration, Instant};
 
 use rusqlite::limits::Limit;
 use rusqlite::types::{Value as SqlValue, ValueRef};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, TransactionBehavior, params, params_from_iter,
+};
 use serde::Serialize;
 
 use crate::pure::config::{Config, SourceInfo};
 use crate::pure::cross::{Comparison, CrossFinding, hop_finding, origin_finding};
 use crate::pure::decode::{Format, decoder_for};
 use crate::pure::finding::{Kind, Severity};
-use crate::pure::ingest::{LaneKey, ptype_code};
+use crate::pure::ingest::{LANE_LOG, LANE_OTHER, LANE_PACKET, LaneKey, ptype_code};
 use crate::pure::oracle;
 use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::segment as segment_layout;
@@ -27,7 +29,7 @@ use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::cross;
 use crate::shell::files::{ReadError, Records, Source, open_sniffed};
-use crate::shell::segment::{self, CHUNK_BYTES, Ids, Writer};
+use crate::shell::segment::{self, CHUNK_BYTES, Ids, Writer, Written};
 use crate::shell::vtab;
 use crate::shell::workers;
 
@@ -54,6 +56,11 @@ pub struct Store {
     after_listing: Option<Box<dyn Fn() + Send>>,
     /// When a read-only store's requests must stop.
     deadline: Option<Instant>,
+    /// How many threads read the files of an ingest; see
+    /// [`workers::Settings`].
+    readers: workers::Settings,
+    /// See [`Store::on_reading`].
+    reading_hook: Option<workers::Hook>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -85,6 +92,12 @@ pub struct IngestSummary {
     pub reread: bool,
     pub files: Vec<FileOutcome>,
     pub problems: i64,
+    /// How many times the files read ahead of one being stored were read
+    /// again, because what was foreseen for them no longer held: none
+    /// unless a file failed when its turn came, or another writer changed
+    /// the store meanwhile.
+    #[serde(skip)]
+    pub read_again: usize,
 }
 
 fn bind(p: &Param) -> SqlValue {
@@ -226,6 +239,8 @@ impl Store {
             shared,
             after_listing: None,
             deadline: None,
+            readers: workers::Settings::from_env(),
+            reading_hook: None,
         })
     }
 
@@ -271,7 +286,25 @@ impl Store {
             shared,
             after_listing: None,
             deadline: Some(deadline),
+            readers: workers::Settings::with_workers(1),
+            reading_hook: None,
         })
+    }
+
+    /// Reads the files of an ingest on `threads` threads (1 to
+    /// [`workers::MAX_WORKERS`]) instead of as `PACKETLANE_INGEST_THREADS`
+    /// says; 0 reads each file on the calling thread and stores it before
+    /// the next is read, the store giving ids as it goes. What is stored is
+    /// the same however many.
+    pub fn read_with_threads(&mut self, threads: usize) {
+        self.readers = workers::Settings::with_workers(threads);
+    }
+
+    /// Calls `hook` as a thread reading a file passes each stage. For
+    /// tests only: they delay a file or make it fail there.
+    #[doc(hidden)]
+    pub fn on_reading(&mut self, hook: workers::Hook) {
+        self.reading_hook = Some(hook);
     }
 
     /// Runs one of the tool's own statements.
@@ -888,24 +921,10 @@ impl Store {
             .query_row(sql::RUN_ID, params![root_text], |r| r.get(0))?;
 
         let mut phases = Phases::start();
-        let mut outcomes = Vec::with_capacity(files.len());
-        let mut changed = false;
-        for (path, rel) in files {
-            let outcome = match self.ingest_here(run_id, path, rel, &config) {
-                Ok(outcome) => outcome,
-                Err(e) => FileOutcome {
-                    rel: rel.clone(),
-                    status: Status::NotReadable,
-                    format: "",
-                    packets: 0,
-                    entries: 0,
-                    note: e.to_string(),
-                    removed: false,
-                },
-            };
-            changed |= outcome.status == Status::Ingested || outcome.removed;
-            outcomes.push(outcome);
-        }
+        let (outcomes, read_again) = self.ingest_files(run_id, files, &config)?;
+        let changed = outcomes
+            .iter()
+            .any(|o| o.status == Status::Ingested || o.removed);
 
         phases.mark("reading files");
         // Also when no file changed now but the step did not finish after
@@ -970,7 +989,72 @@ impl Store {
             reread,
             files: outcomes,
             problems,
+            read_again,
         })
+    }
+
+    /// Reads and stores the files of an ingest, in order, on the threads
+    /// [`Store::read_with_threads`] says, and what each came to.
+    fn ingest_files(
+        &mut self,
+        run_id: i64,
+        files: &[(PathBuf, String)],
+        config: &Config,
+    ) -> Result<(Vec<FileOutcome>, usize)> {
+        let mut known: HashMap<String, (i64, i64, i64)> = HashMap::new();
+        {
+            let mut stmt = self.conn.prepare(sql::RUN_FILE_IDENTITIES)?;
+            let mut rows = stmt.query(params![run_id])?;
+            while let Some(row) = rows.next()? {
+                known.insert(row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?));
+            }
+        }
+        let jobs: Vec<workers::Job> = files
+            .iter()
+            .map(|(path, rel)| workers::Job {
+                path: path.clone(),
+                rel: rel.clone(),
+                known: known.get(rel).copied(),
+            })
+            .collect();
+        // Segments are written outside the store's transactions now: a
+        // sweep by another writer waits until they are listed.
+        let _held = segment::hold_folder(&self.segments)?;
+        let settings = self.readers;
+        let hook = self.reading_hook.clone();
+        if settings.workers == 0 {
+            let mut outcomes = Vec::with_capacity(jobs.len());
+            for job in &jobs {
+                outcomes.push(self.ingest_here(run_id, &job.path, &job.rel, config, hook.as_ref()));
+            }
+            return Ok((outcomes, 0));
+        }
+        let folder = self.segments.clone();
+        let forecast = Forecast::load(&self.conn, run_id)?;
+        let mut committer = Committer {
+            store: self,
+            run_id,
+            jobs: &jobs,
+            config,
+            forecast,
+            outcomes: Vec::with_capacity(jobs.len()),
+            again: 0,
+            hook: hook.clone(),
+        };
+        let mut from = 0;
+        while let Some(again) = workers::run(
+            &jobs,
+            from,
+            settings,
+            config,
+            &folder,
+            hook.as_ref(),
+            &mut committer,
+        )? {
+            committer.forecast = Forecast::load(&committer.store.conn, run_id)?;
+            from = again;
+        }
+        Ok((committer.outcomes, committer.again))
     }
 
     /// The file of a run at `rel`, as the store holds it now: id, size,
@@ -987,12 +1071,34 @@ impl Store {
     /// Reads and stores one file on this thread, the store giving ids as
     /// it goes: what every file got before files were read in parallel,
     /// and what a file whose ids were not the ones foreseen gets again.
+    /// An error or a panic is the file's failure, as on a reading thread.
     fn ingest_here(
         &mut self,
         run_id: i64,
         path: &Path,
         rel: &str,
         config: &Config,
+        hook: Option<&workers::Hook>,
+    ) -> FileOutcome {
+        workers::caught(|| self.ingest_here_or_fail(run_id, path, rel, config, hook))
+            .unwrap_or_else(|why| FileOutcome {
+                rel: rel.to_string(),
+                status: Status::NotReadable,
+                format: "",
+                packets: 0,
+                entries: 0,
+                note: why,
+                removed: false,
+            })
+    }
+
+    fn ingest_here_or_fail(
+        &mut self,
+        run_id: i64,
+        path: &Path,
+        rel: &str,
+        config: &Config,
+        hook: Option<&workers::Hook>,
     ) -> Result<FileOutcome> {
         let job = workers::Job {
             path: path.to_path_buf(),
@@ -1003,6 +1109,12 @@ impl Store {
         let stop = AtomicBool::new(false);
         let (read, writer) =
             workers::read_file(&job, config, &self.segments, &stem, CHUNK_BYTES, &stop)?;
+        if let Some(hook) = hook {
+            hook(rel, workers::Stage::Read);
+            if writer.is_some() {
+                hook(rel, workers::Stage::Finish);
+            }
+        }
         let finish = match writer {
             Some(writer) => Finish::Here(Box::new(writer)),
             None => Finish::Nothing,
@@ -1056,7 +1168,11 @@ impl Store {
         // A file is known by its place in the run. The same content there is
         // already ingested; different content (a log that has grown, say)
         // replaces what was read before.
-        let tx = self.conn.transaction()?;
+        // The write lock is taken first, so that another writer committing
+        // meanwhile makes this wait rather than fail.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let known: Option<(i64, i64, i64)> = tx
             .query_row(sql::FILE_BY_REL, params![run_id, job.rel], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -1185,7 +1301,10 @@ impl Store {
     ) -> Result<Committed> {
         let folder = self.segments.clone();
         // A finished segment not listed by the end is removed.
-        let mut unlisted: Option<String> = None;
+        let mut unlisted: Option<String> = match &finish {
+            Finish::Done(_, Some(w)) => Some(w.name.clone()),
+            _ => None,
+        };
         let result = self.store_packets_in(run_id, job, p, finish, config, &mut unlisted);
         if let Some(name) = unlisted {
             discard_segment(&folder, &name);
@@ -1204,7 +1323,9 @@ impl Store {
     ) -> Result<Committed> {
         let oracle_on = self.oracle;
         let folder = self.segments.clone();
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let known: Option<(i64, i64, i64)> = tx
             .query_row(sql::FILE_BY_REL, params![run_id, job.rel], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -1268,6 +1389,12 @@ impl Store {
                 .collect(),
         };
         let written = match finish {
+            Finish::Done(foreseen, written) => {
+                if foreseen != ids {
+                    return Ok(Committed::Mismatch);
+                }
+                written
+            }
             Finish::Here(writer) => {
                 let written = writer.finish_with(&ids)?;
                 *unlisted = written.as_ref().map(|w| w.name.clone());
@@ -1422,6 +1549,8 @@ enum Finish {
     Nothing,
     /// Here, with the ids the store gives.
     Here(Box<Writer>),
+    /// Already, elsewhere, with these ids foreseen.
+    Done(Ids, Option<Written>),
 }
 
 /// What storing a file came to.
@@ -1430,6 +1559,261 @@ enum Committed {
     /// Not stored: the store does not give the ids foreseen, or no longer
     /// holds what the reading was told it held.
     Mismatch,
+}
+
+/// The ids SQLite hands out, as they will be once every file read so far
+/// is stored: followed file by file in the order they are stored, so that
+/// a file read on another thread can have its segment finished before its
+/// turn. Only a forecast: each file's own statements give its ids, and a
+/// file given others is read again (see [`Committer::store`]).
+struct Forecast {
+    files: BTreeSet<i64>,
+    lanes: BTreeSet<i64>,
+    /// The run's lanes by source and key.
+    keys: HashMap<(String, LaneKey), i64>,
+    /// Each segment's last packet id by file, and how many segments end
+    /// at each.
+    ends: HashMap<i64, i64>,
+    last_packets: BTreeMap<i64, usize>,
+    serial: i64,
+}
+
+impl Forecast {
+    fn load(conn: &Connection, run_id: i64) -> Result<Forecast> {
+        let files = conn
+            .prepare(sql::ALL_FILE_IDS)?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut lanes = BTreeSet::new();
+        let mut keys = HashMap::new();
+        let mut stmt = conn.prepare(sql::ALL_LANES)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            lanes.insert(id);
+            let kind: String = row.get(3)?;
+            let kind = [LANE_PACKET, LANE_OTHER, LANE_LOG]
+                .into_iter()
+                .find(|k| *k == kind);
+            if let Some(kind) = kind
+                && row.get::<_, i64>(1)? == run_id
+            {
+                let key = LaneKey {
+                    kind,
+                    apid: row.get(4)?,
+                    ptype: row.get(5)?,
+                    file_id: row.get(6)?,
+                };
+                keys.insert((row.get::<_, String>(2)?, key), id);
+            }
+        }
+        let mut forecast = Forecast {
+            files,
+            lanes,
+            keys,
+            ends: HashMap::new(),
+            last_packets: BTreeMap::new(),
+            serial: conn
+                .query_row(sql::LAST_SEGMENT_SERIAL, [], |r| r.get(0))
+                .optional()?
+                .unwrap_or(0),
+        };
+        let ends: Vec<(i64, i64)> = conn
+            .prepare(sql::ALL_SEGMENT_ENDS)?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (file_id, last) in ends {
+            forecast.add_segment(file_id, last);
+        }
+        Ok(forecast)
+    }
+
+    fn add_segment(&mut self, file_id: i64, last: i64) {
+        self.ends.insert(file_id, last);
+        *self.last_packets.entry(last).or_default() += 1;
+    }
+
+    /// One more than the highest id in use, as SQLite gives a new row.
+    fn next(ids: &BTreeSet<i64>) -> i64 {
+        ids.last().map_or(1, |id| id + 1)
+    }
+
+    /// A file's earlier version is removed (`sql::DELETE_FILE`).
+    fn remove_file(&mut self, known: Option<(i64, i64, i64)>) {
+        let Some((file_id, _, _)) = known else {
+            return;
+        };
+        self.files.remove(&file_id);
+        if let Some(last) = self.ends.remove(&file_id)
+            && let Some(n) = self.last_packets.get_mut(&last)
+        {
+            *n -= 1;
+            if *n == 0 {
+                self.last_packets.remove(&last);
+            }
+        }
+        let logs: Vec<(String, LaneKey)> = self
+            .keys
+            .keys()
+            .filter(|(_, k)| k.kind == LANE_LOG && k.file_id == file_id)
+            .cloned()
+            .collect();
+        for key in logs {
+            if let Some(id) = self.keys.remove(&key) {
+                self.lanes.remove(&id);
+            }
+        }
+    }
+
+    fn new_file(&mut self) -> i64 {
+        let id = Forecast::next(&self.files);
+        self.files.insert(id);
+        id
+    }
+
+    fn lane(&mut self, source: &str, key: LaneKey) -> i64 {
+        let at = (source.to_string(), key);
+        if let Some(&id) = self.keys.get(&at) {
+            return id;
+        }
+        let id = Forecast::next(&self.lanes);
+        self.lanes.insert(id);
+        self.keys.insert(at, id);
+        id
+    }
+
+    /// `sql::NEXT_PACKET_ID`.
+    fn next_packet(&self) -> i64 {
+        self.last_packets
+            .last_key_value()
+            .map_or(1, |(last, _)| last + 1)
+    }
+}
+
+/// The step that stores the files of an ingest, in order, as the threads
+/// reading them hand them over.
+struct Committer<'s, 'a> {
+    store: &'s mut Store,
+    run_id: i64,
+    jobs: &'s [workers::Job],
+    config: &'a Config,
+    forecast: Forecast,
+    outcomes: Vec<FileOutcome>,
+    /// How many times what was foreseen no longer held.
+    again: usize,
+    hook: Option<workers::Hook>,
+}
+
+impl Committer<'_, '_> {
+    fn failed(&mut self, job: usize, why: String) {
+        self.outcomes.push(FileOutcome {
+            rel: self.jobs[job].rel.clone(),
+            status: Status::NotReadable,
+            format: "",
+            packets: 0,
+            entries: 0,
+            note: why,
+            removed: false,
+        });
+    }
+}
+
+impl<'a> workers::Commit<'a> for Committer<'_, 'a> {
+    fn foresee(&mut self, job: usize, read: &workers::Read<'a>) -> Option<Ids> {
+        let known = self.jobs[job].known;
+        let f = &mut self.forecast;
+        match read {
+            workers::Read::Unchanged | workers::Read::Failed(_) => None,
+            workers::Read::Nothing { .. } => {
+                f.remove_file(known);
+                None
+            }
+            workers::Read::Text { .. } => {
+                f.remove_file(known);
+                let file_id = f.new_file();
+                let source = self.config.source_for(&self.jobs[job].rel);
+                f.lane(&source.name, LaneKey::log(file_id));
+                None
+            }
+            workers::Read::Packets(p) => {
+                f.remove_file(known);
+                let file_id = f.new_file();
+                let first_packet = f.next_packet();
+                f.serial += 1;
+                let lanes = p
+                    .keys
+                    .iter()
+                    .map(|key| u32::try_from(f.lane(&p.source, *key)).unwrap_or(u32::MAX))
+                    .collect();
+                if p.packets > 0 {
+                    f.add_segment(file_id, first_packet + p.packets as i64 - 1);
+                }
+                Some(Ids {
+                    file_id,
+                    serial: Some(f.serial),
+                    first_packet,
+                    lanes,
+                })
+            }
+        }
+    }
+
+    fn store(
+        &mut self,
+        job: usize,
+        read: workers::Read<'a>,
+        finished: Option<workers::Finished>,
+    ) -> Result<workers::Flow> {
+        // Foreseen to leave the store as it was.
+        if let workers::Read::Failed(why) = read {
+            self.failed(job, why);
+            return Ok(workers::Flow::Next);
+        }
+        let finish = match (finished, &read) {
+            (Some((ids, Ok(written))), _) => Finish::Done(ids, written),
+            (Some((_, Err(why))), _) => {
+                self.failed(job, why);
+                self.again += 1;
+                return Ok(workers::Flow::Again);
+            }
+            (None, workers::Read::Packets(_)) => {
+                self.failed(job, "the file's segment was not finished".to_string());
+                self.again += 1;
+                return Ok(workers::Flow::Again);
+            }
+            (None, _) => Finish::Nothing,
+        };
+        let j = &self.jobs[job];
+        match self
+            .store
+            .store_read(self.run_id, j, read, finish, self.config)
+        {
+            Ok(Committed::Stored(outcome)) => {
+                self.outcomes.push(outcome);
+                Ok(workers::Flow::Next)
+            }
+            Ok(Committed::Mismatch) => {
+                // Read again here, the store giving the ids as it goes.
+                let outcome = self.store.ingest_here(
+                    self.run_id,
+                    &j.path,
+                    &j.rel,
+                    self.config,
+                    self.hook.as_ref(),
+                );
+                self.outcomes.push(outcome);
+                self.again += 1;
+                Ok(workers::Flow::Again)
+            }
+            Err(e) => {
+                // It was foreseen to be stored, and the files behind it
+                // to come after it.
+                self.failed(job, e.to_string());
+                self.again += 1;
+                Ok(workers::Flow::Again)
+            }
+        }
+    }
 }
 
 /// Fills the oracle's tables with a file's packets and kept values, read
@@ -1491,10 +1875,15 @@ fn discard_segment(folder: &Path, name: &str) {
 }
 
 /// Removes the segment and temporary files the store does not list: left by
-/// a crash, or by an ingest that did not commit. Every writer creates such
-/// files only while it holds the store's write lock, so this takes that lock
-/// first; if another writer holds it, the sweep waits for another time.
+/// a crash, or by an ingest that did not commit. An ingest creates such
+/// files while it holds the segment folder ([`segment::hold_folder`]), and
+/// lists them with the store's write lock, so this takes the folder to
+/// itself and then that lock; if another writer holds either, the sweep
+/// waits for another time.
 fn remove_orphans(conn: &Connection, folder: &Path) -> Result<()> {
+    let Some(_alone) = segment::sweep_folder(folder)? else {
+        return Ok(());
+    };
     conn.busy_timeout(Duration::ZERO)?;
     let locked = conn.execute_batch("BEGIN IMMEDIATE");
     conn.busy_timeout(Duration::from_secs(5))?;

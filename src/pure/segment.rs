@@ -28,7 +28,14 @@
 //! that adds its `files` and `segments` rows commits. When a file is read
 //! again or its run is emptied, its `segments` row goes in that transaction
 //! and the file after the commit. A segment with no row (left by a crash) is
-//! removed the next time the store is opened for writing.
+//! removed the next time the store is opened for writing, unless an ingest
+//! holds the folder: files are read, and their segments written, on
+//! several threads before their turn to be stored comes, so an ingest
+//! holds an advisory lock on the folder, shared, and the sweep waits for
+//! another time if it cannot have it alone. A segment is written before
+//! the store gives its file, packets and lanes their ids: it is finished
+//! with ids foreseen from the files before it, and the transaction that
+//! lists it checks them (see `shell::store`).
 //!
 //! A reader reads the `segments` rows and everything else it needs from
 //! SQLite in one read transaction. If a segment it listed was replaced after

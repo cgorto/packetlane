@@ -189,8 +189,21 @@ Limits of working from counters alone are listed at the top of
 - A store made by an earlier build with a different layout is refused, and
   says so (this build's is layout 8): delete it, and its `.seg` folder,
   and ingest again. A segment written by a build with another segment
-  format (this build's is 5) cannot be read either: ingest the store
+  format (this build's is 6) cannot be read either: ingest the store
   again. Nothing in it is not in the logs.
+- Files are read on several threads at once, four unless
+  `PACKETLANE_INGEST_THREADS` says otherwise (0 to 64; never more than
+  the machine has cores by default; 0 reads each file on the calling
+  thread and stores it before the next is read). One file is read on one
+  thread, so a run of one large file gains nothing. What is stored is the
+  same whatever the number: a file is read, checked and its segment
+  written with lanes numbered as the file meets them, then the files are
+  stored in their order, each in its own transaction as before; the ids
+  a segment holds (its first packet, its lanes) are foreseen from the
+  files before it and checked by that transaction, and a file not given
+  the ids foreseen (another writer stored meanwhile, or a file before it
+  failed) is read again. The six sorting buffers of every thread share
+  24 MB (1 MB each up to four threads, less beyond, never under 256 KB).
 - Writing uses about 18 MB of memory whatever the size of the run
   (measured: 18 MB for three million packets in 900 lanes and for ten
   million in 12). Sorting a segment's time order, its kept numbers, its

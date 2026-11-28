@@ -68,6 +68,29 @@ pub fn is_ours(name: &str) -> bool {
     name.ends_with(".seg") || name.ends_with(".tmp")
 }
 
+// Writers lock the segment folder itself (an advisory lock on the open
+// folder): shared while an ingest writes segments and temporary files
+// outside the store's transactions, alone while the folder is swept.
+
+/// Holds the folder against a sweep until the handle returned is dropped;
+/// other ingests may hold it at the same time.
+pub fn hold_folder(folder: &Path) -> Result<File> {
+    let file = File::open(folder)?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
+/// The folder to oneself for a sweep, until the handle returned is
+/// dropped; `None` if an ingest holds it now.
+pub fn sweep_folder(folder: &Path) -> Result<Option<File>> {
+    let file = File::open(folder)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.into()),
+    }
+}
+
 fn remove_quietly(path: &Path) {
     let _ = fs::remove_file(path);
 }

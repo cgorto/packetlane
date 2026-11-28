@@ -4,10 +4,13 @@
 //! for the step that commits the file (`shell::store`). Files are read so
 //! on several threads at once; see [`run`].
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufReader;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 
 use crate::pure::config::Config;
 use crate::pure::decode::{Format, decoder_for};
@@ -16,7 +19,7 @@ use crate::pure::ingest::LaneKey;
 use crate::pure::pipeline::{FileCheck, Seen};
 use crate::pure::segment as layout;
 use crate::shell::files::{Hashing, ReadError, Records, open_sniffed};
-use crate::shell::segment::Writer;
+use crate::shell::segment::{self, Ids, Writer, Written};
 use crate::shell::store::Result;
 
 /// How many records are read between looks at whether the ingest is
@@ -205,4 +208,408 @@ pub fn stem(job: usize) -> String {
     static INGESTS: AtomicU64 = AtomicU64::new(0);
     let n = INGESTS.fetch_add(1, Ordering::Relaxed);
     format!("ingest-{}-{n}-{job}", std::process::id())
+}
+
+// ---- reading files in parallel ---------------------------------------------------
+
+/// Most threads reading files at once, whatever the setting.
+pub const MAX_WORKERS: usize = 64;
+/// Threads reading files unless `PACKETLANE_INGEST_THREADS` says otherwise
+/// (and never more than the machine has cores).
+pub const DEFAULT_WORKERS: usize = 4;
+/// What the sorters of all the threads hold together, at most: each
+/// thread's six sorters share an equal part, at most
+/// [`segment::CHUNK_BYTES`] each and at least [`MIN_CHUNK_BYTES`].
+pub const SORT_BUDGET: usize = 24 << 20;
+pub const MIN_CHUNK_BYTES: usize = 256 << 10;
+
+/// How many threads read files, and what each sorter holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Settings {
+    pub workers: usize,
+    pub chunk_bytes: usize,
+}
+
+impl Settings {
+    /// `workers` threads (at most [`MAX_WORKERS`]), their sorters sharing
+    /// [`SORT_BUDGET`]; none reads every file on the calling thread.
+    pub fn with_workers(workers: usize) -> Settings {
+        let workers = workers.min(MAX_WORKERS);
+        let chunk_bytes =
+            (SORT_BUDGET / (6 * workers.max(1))).clamp(MIN_CHUNK_BYTES, segment::CHUNK_BYTES);
+        Settings {
+            workers,
+            chunk_bytes,
+        }
+    }
+
+    /// As the environment variable `PACKETLANE_INGEST_THREADS` says (0 to
+    /// [`MAX_WORKERS`]; 0 reads every file on the calling thread), else
+    /// [`DEFAULT_WORKERS`] or as many as the machine has cores, if fewer.
+    pub fn from_env() -> Settings {
+        let set = std::env::var("PACKETLANE_INGEST_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n <= MAX_WORKERS);
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        Settings::with_workers(set.unwrap_or(DEFAULT_WORKERS.min(cores)))
+    }
+
+    /// Files read ahead of the one being stored, at most: each holds its
+    /// findings and a finished segment until its turn.
+    pub fn window(&self) -> usize {
+        2 * self.workers + 2
+    }
+}
+
+/// Where a reading thread is with a file, as a [`Hook`] is told.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Read, its segment written as far as it can be without ids.
+    Read,
+    /// About to finish its segment, the ids given.
+    Finish,
+}
+
+/// Called by a reading thread with a file's path in its run as it passes
+/// each [`Stage`]: for tests, to delay a file or make it fail there.
+pub type Hook = Arc<dyn Fn(&str, Stage) + Send + Sync>;
+
+/// What the step that stores files does with what the threads read. Both
+/// are called in the order of the jobs, on the thread that called [`run`].
+pub trait Commit<'a> {
+    /// The ids a packet file is foreseen to get, if it is stored when its
+    /// turn comes; `None` for any other file. Takes into account what
+    /// every earlier job is foreseen to do to the store.
+    fn foresee(&mut self, job: usize, read: &Read<'a>) -> Option<Ids>;
+
+    /// Stores a job: what was read, and for a packet file the ids its
+    /// segment was finished with and how that went.
+    fn store(&mut self, job: usize, read: Read<'a>, finished: Option<Finished>) -> Result<Flow>;
+}
+
+/// How a packet file's segment was finished: with these ids, and either
+/// written (`None` if the file had no packets) or failed.
+pub type Finished = (Ids, std::result::Result<Option<Written>, String>);
+
+/// What comes after a stored job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    Next,
+    /// The job was stored with other ids than foreseen: what was foreseen
+    /// for later jobs no longer holds, and they are read again.
+    Again,
+}
+
+/// Hands jobs out in order, no further ahead of the one being stored than
+/// the window allows, until stopped.
+struct Gate {
+    state: Mutex<(usize, usize)>,
+    turn: Condvar,
+    stopping: AtomicBool,
+}
+
+impl Gate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (usize, usize)> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The next job, once the window reaches it; `None` once there are no
+    /// more or the gate is stopped.
+    fn claim(&self, end: usize) -> Option<usize> {
+        let mut state = self.lock();
+        loop {
+            let (next, limit) = *state;
+            if self.stopping.load(Ordering::Relaxed) || next >= end {
+                return None;
+            }
+            if next < limit {
+                state.0 += 1;
+                return Some(next);
+            }
+            state = self
+                .turn
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn open_to(&self, limit: usize) {
+        self.lock().1 = limit;
+        self.turn.notify_all();
+    }
+
+    fn stop(&self) {
+        self.stopping.store(true, Ordering::Relaxed);
+        let _held = self.lock();
+        self.turn.notify_all();
+    }
+}
+
+/// Stops the gate when dropped, however the step that stores files ends.
+struct StopOnDrop<'g>(&'g Gate);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
+enum Event<'a> {
+    /// A file read; a packet file's thread waits on `reply` for its ids.
+    Read {
+        job: usize,
+        read: Read<'a>,
+        reply: Option<mpsc::Sender<Ids>>,
+    },
+    Finished {
+        job: usize,
+        finished: Finished,
+    },
+}
+
+/// What the step that stores files holds of jobs not yet stored.
+#[derive(Default)]
+struct Board<'a> {
+    read: BTreeMap<usize, (Read<'a>, Option<mpsc::Sender<Ids>>)>,
+    /// Foreseen, with whether a finished segment is still to come.
+    ready: BTreeMap<usize, (Read<'a>, bool)>,
+    finished: BTreeMap<usize, Finished>,
+}
+
+impl Board<'_> {
+    /// Removes the segments finished for jobs that were not stored.
+    fn discard(&mut self, folder: &Path) {
+        for (_, (_, result)) in std::mem::take(&mut self.finished) {
+            if let Ok(Some(w)) = result {
+                let _ = segment::remove(folder, &w.name);
+            }
+        }
+    }
+}
+
+/// The text of a panic's payload.
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    let text = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_string());
+    format!("Reading the file failed unexpectedly: {text}")
+}
+
+/// Runs `f`, its error or panic as text.
+pub fn caught<T>(f: impl FnOnce() -> Result<T>) -> std::result::Result<T, String> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(payload) => Err(panic_text(payload)),
+    }
+}
+
+/// What a reading thread needs, shared by all of them.
+struct Shared<'s, 'a> {
+    jobs: &'s [Job],
+    config: &'a Config,
+    folder: &'s Path,
+    settings: Settings,
+    hook: Option<&'s Hook>,
+    gate: &'s Gate,
+}
+
+/// A reading thread: takes jobs in turn, reads each, and for a packet file
+/// waits for its ids and finishes its segment. An error or a panic is the
+/// job's failure; the thread goes on with the next.
+fn work<'a>(shared: &Shared<'_, 'a>, events: mpsc::Sender<Event<'a>>) {
+    let Shared {
+        jobs,
+        config,
+        folder,
+        settings,
+        hook,
+        gate,
+    } = shared;
+    while let Some(job) = gate.claim(jobs.len()) {
+        let j = &jobs[job];
+        let read = caught(|| {
+            let stem = stem(job);
+            let read = read_file(
+                j,
+                config,
+                folder,
+                &stem,
+                settings.chunk_bytes,
+                &gate.stopping,
+            )?;
+            if let Some(hook) = hook {
+                hook(&j.rel, Stage::Read);
+            }
+            Ok(read)
+        });
+        let (read, writer) = read.unwrap_or_else(|e| (Read::Failed(e), None));
+        let Some(writer) = writer else {
+            let event = Event::Read {
+                job,
+                read,
+                reply: None,
+            };
+            if events.send(event).is_err() {
+                return;
+            }
+            continue;
+        };
+        let (reply, ids) = mpsc::channel();
+        let event = Event::Read {
+            job,
+            read,
+            reply: Some(reply),
+        };
+        if events.send(event).is_err() {
+            return;
+        }
+        // No ids: the ingest is stopping, and the writer's files go with it.
+        let Ok(ids) = ids.recv() else {
+            continue;
+        };
+        let result = caught(|| {
+            if let Some(hook) = hook {
+                hook(&j.rel, Stage::Finish);
+            }
+            writer.finish_with(&ids)
+        });
+        let event = Event::Finished {
+            job,
+            finished: (ids, result),
+        };
+        if let Err(mpsc::SendError(Event::Finished { finished, .. })) = events.send(event) {
+            if let (_, Ok(Some(w))) = finished {
+                let _ = segment::remove(folder, &w.name);
+            }
+            return;
+        }
+    }
+}
+
+/// Reads `jobs[from..]` on `settings.workers` threads and stores them in
+/// order through `commit`. Returns where to start again if a job was
+/// stored with other ids than foreseen ([`Flow::Again`]): every job
+/// before that is stored; nothing of the jobs after it is.
+pub fn run<'a>(
+    jobs: &[Job],
+    from: usize,
+    settings: Settings,
+    config: &'a Config,
+    folder: &Path,
+    hook: Option<&Hook>,
+    commit: &mut dyn Commit<'a>,
+) -> Result<Option<usize>> {
+    let gate = Gate {
+        state: Mutex::new((from, from + settings.window())),
+        turn: Condvar::new(),
+        stopping: AtomicBool::new(false),
+    };
+    let shared = Shared {
+        jobs,
+        config,
+        folder,
+        settings,
+        hook,
+        gate: &gate,
+    };
+    std::thread::scope(|scope| {
+        let (sender, events) = mpsc::channel();
+        for _ in 0..settings.workers.min(jobs.len() - from.min(jobs.len())) {
+            let sender = sender.clone();
+            let shared = &shared;
+            scope.spawn(move || work(shared, sender));
+        }
+        drop(sender);
+        let mut board = Board::default();
+        let result = {
+            let _stop = StopOnDrop(&gate);
+            coordinate(
+                jobs.len(),
+                from,
+                settings,
+                &gate,
+                &events,
+                &mut board,
+                commit,
+            )
+        };
+        // Threads waiting for ids are let go, and what is still being
+        // read or finished is waited for and thrown away.
+        board.read.clear();
+        board.discard(folder);
+        for event in events.iter() {
+            if let Event::Finished {
+                finished: (_, Ok(Some(w))),
+                ..
+            } = event
+            {
+                let _ = segment::remove(folder, &w.name);
+            }
+        }
+        result
+    })
+}
+
+/// The step that stores files: foresees each file's ids as soon as it and
+/// every file before it have been read, and stores each once it and every
+/// file before it are done.
+fn coordinate<'a>(
+    end: usize,
+    from: usize,
+    settings: Settings,
+    gate: &Gate,
+    events: &mpsc::Receiver<Event<'a>>,
+    board: &mut Board<'a>,
+    commit: &mut dyn Commit<'a>,
+) -> Result<Option<usize>> {
+    let (mut foreseen, mut stored) = (from, from);
+    while stored < end {
+        loop {
+            let mut moved = false;
+            while let Some((read, reply)) = board.read.remove(&foreseen) {
+                // A thread let go without ids drops its writer; a thread
+                // that is gone has its job fail when stored.
+                let ids = commit.foresee(foreseen, &read);
+                let waits = match (reply, ids) {
+                    (Some(reply), Some(ids)) => reply.send(ids).is_ok(),
+                    _ => false,
+                };
+                board.ready.insert(foreseen, (read, waits));
+                foreseen += 1;
+                moved = true;
+            }
+            if let Some(&(_, waits)) = board.ready.get(&stored)
+                && (!waits || board.finished.contains_key(&stored))
+                && let Some((read, _)) = board.ready.remove(&stored)
+            {
+                let finished = board.finished.remove(&stored);
+                if commit.store(stored, read, finished)? == Flow::Again {
+                    return Ok(Some(stored + 1));
+                }
+                stored += 1;
+                gate.open_to(stored + settings.window());
+                moved = true;
+            }
+            if !moved || stored >= end {
+                break;
+            }
+        }
+        if stored >= end {
+            break;
+        }
+        match events.recv() {
+            Ok(Event::Read { job, read, reply }) => {
+                board.read.insert(job, (read, reply));
+            }
+            Ok(Event::Finished { job, finished }) => {
+                board.finished.insert(job, finished);
+            }
+            Err(_) => return Err("the threads reading files stopped".into()),
+        }
+    }
+    Ok(None)
 }
