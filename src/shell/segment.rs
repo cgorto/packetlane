@@ -608,6 +608,48 @@ impl<const N: usize> Sorter<N> {
     }
 }
 
+/// Puts the records of one part (all with one first byte) in order into
+/// `into`: by their second byte, then each set sharing it by their first
+/// eight bytes as a number, which decides nearly every comparison more
+/// cheaply than comparing bytes.
+fn order_part<const N: usize>(part: &mut [[u8; N]], into: &mut Vec<[u8; N]>) {
+    into.clear();
+    if N < 2 {
+        into.extend_from_slice(part);
+        into.sort_unstable();
+        return;
+    }
+    let mut starts = [0usize; 257];
+    for r in part.iter() {
+        starts[usize::from(r[1]) + 1] += 1;
+    }
+    for i in 0..256 {
+        starts[i + 1] += starts[i];
+    }
+    let bounds = starts;
+    into.resize(part.len(), [0u8; N]);
+    for r in part.iter() {
+        let slot = &mut starts[usize::from(r[1])];
+        into[*slot] = *r;
+        *slot += 1;
+    }
+    for b in 0..256 {
+        let set = &mut into[bounds[b]..bounds[b + 1]];
+        if set.len() > 1 {
+            set.sort_unstable_by(|a, b| lead(a).cmp(&lead(b)).then_with(|| a.cmp(b)));
+        }
+    }
+}
+
+/// A record's first eight bytes (fewer if it is shorter) as a number in
+/// the order of the bytes.
+fn lead<const N: usize>(r: &[u8; N]) -> u64 {
+    let mut b = [0u8; 8];
+    let n = N.min(8);
+    b[..n].copy_from_slice(&r[..n]);
+    u64::from_be_bytes(b)
+}
+
 /// Parts a [`Spread`] sorter divides its records into, by first byte.
 const PARTS: usize = 256;
 
@@ -733,6 +775,7 @@ impl<const N: usize> Spread<N> {
     pub fn finish(mut self, mut out: impl FnMut(&[[u8; N]]) -> Result<()>) -> Result<()> {
         let fits = (self.part_memory / N) as u64;
         let mut part_buf: Vec<[u8; N]> = Vec::new();
+        let mut scratch: Vec<[u8; N]> = Vec::new();
         for part in 0..PARTS {
             let count = self.counts[part];
             if count == 0 {
@@ -745,8 +788,8 @@ impl<const N: usize> Spread<N> {
                     part_buf.extend_from_slice(records);
                     Ok(())
                 })?;
-                part_buf.sort_unstable();
-                out(&part_buf)?;
+                order_part(&mut part_buf, &mut scratch);
+                out(&scratch)?;
             } else {
                 let mut stem = self.stem.clone().into_os_string();
                 stem.push(format!(".part{part}"));
