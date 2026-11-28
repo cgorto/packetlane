@@ -1344,25 +1344,25 @@ impl IdScan {
     }
 }
 
-/// One segment's time order, read from one end of a window.
+/// One segment's time order, read from one end of a window. Packets of
+/// equal time come by index ascending when it is read first to last and
+/// descending when read last to first; turned round if the order wants the
+/// other way.
 struct TimeSlot {
     seg: usize,
     first: i64,
     packets: u64,
-    reader: Records<TIME_BYTES>,
-    /// Read last to first, with packets of equal time handed out by
-    /// index ascending: the ones of the time being handed out, in reverse,
-    /// and the first one of the next time.
-    run: Vec<TimeRecord>,
-    peeked: Option<TimeRecord>,
+    reader: TieReader<TIME_BYTES>,
 }
 
-/// Most packets of one segment with one time that a time order holds at
-/// once, to hand them out by id the other way than their section has them.
-const MAX_RUN: usize = 1 << 20;
+/// The time of a time-order record, as the key its ties share.
+fn time_key(b: &[u8; TIME_BYTES]) -> u64 {
+    TimeRecord::decode(b).ns as u64
+}
 
 impl TimeSlot {
-    fn record(&mut self) -> VResult<Option<TimeRecord>> {
+    /// The next record in the slot's order.
+    fn take(&mut self) -> VResult<Option<TimeRecord>> {
         let Some(raw) = self.reader.read()? else {
             return Ok(None);
         };
@@ -1371,37 +1371,6 @@ impl TimeSlot {
             return Err(fail("a time record names no packet"));
         }
         Ok(Some(t))
-    }
-
-    /// The next record in the slot's order.
-    fn take(&mut self, reverse_ties: bool) -> VResult<Option<TimeRecord>> {
-        if !reverse_ties {
-            return self.record();
-        }
-        if let Some(t) = self.run.pop() {
-            return Ok(Some(t));
-        }
-        let first = match self.peeked.take() {
-            Some(t) => t,
-            None => match self.record()? {
-                Some(t) => t,
-                None => return Ok(None),
-            },
-        };
-        self.run.push(first);
-        while let Some(t) = self.record()? {
-            if t.ns != first.ns {
-                self.peeked = Some(t);
-                break;
-            }
-            if self.run.len() >= MAX_RUN {
-                return Err(fail(
-                    "too many packets of one time to order them by time descending and id",
-                ));
-            }
-            self.run.push(t);
-        }
-        Ok(self.run.pop())
     }
 }
 
@@ -1436,15 +1405,11 @@ impl TimeScan {
     }
 
     fn advance(&mut self, slot: usize, b: &PacketBounds) -> VResult<()> {
-        // A slot gives packets of equal time by index ascending when read
-        // first to last, descending when read last to first; reversed if
-        // the order wants the other.
-        let reverse_ties = self.desc != self.ties_desc;
         let range = b.times.get(self.clock).copied().unwrap_or_else(Range::all);
         let Some(s) = self.slots.get_mut(slot) else {
             return Ok(());
         };
-        let Some(t) = s.take(reverse_ties)? else {
+        let Some(t) = s.take()? else {
             return Ok(());
         };
         let past = if self.desc {
@@ -1714,13 +1679,14 @@ impl PacketsCursor {
                     buffer,
                 )
             };
+            // Runs of one time are held up to the reader's buffer, and read
+            // again the other way past it.
+            let reverse = access.desc != access.ties_desc;
             slots.push(TimeSlot {
                 seg: at,
                 first: seg.first,
                 packets: seg.packets(),
-                reader,
-                run: Vec::new(),
-                peeked: None,
+                reader: TieReader::new(reader, reverse, time_key, buffer / TIME_BYTES),
             });
         }
         let untimed = (!untimed.is_empty()).then(|| {
@@ -2788,5 +2754,91 @@ unsafe impl VTabCursor for ValuesCursor {
             }
             Ok((seg << 40) | position)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pure::ingest::PacketRow as Row;
+    use crate::shell::segment::Writer;
+
+    /// A segment whose receive times come in runs of one time, some far
+    /// longer than a reader holds, opened as a statement opens it.
+    fn tied_segment(dir: &std::path::Path) -> (Arc<Opened>, Vec<TimeRecord>) {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).unwrap();
+        let mut writer = Writer::create(dir, 1, 1).unwrap();
+        let runs = [(5i64, 50u32), (7, 3), (9, 1), (10, 20), (-4, 9), (12, 2)];
+        let mut want = Vec::new();
+        let mut index = 0u32;
+        for (t, n) in runs {
+            for _ in 0..n {
+                let row = Row {
+                    idx: i64::from(index),
+                    offset: 0,
+                    length: 1,
+                    receive_ns: Some(t),
+                    packet_ns: None,
+                    header: None,
+                    length_ok: true,
+                    sum: 0,
+                };
+                let lane = i64::from(index % 3) + 1;
+                writer.push(lane, &row, None).unwrap();
+                want.push(TimeRecord {
+                    ns: t,
+                    index,
+                    lane: index % 3 + 1,
+                });
+                index += 1;
+            }
+        }
+        let written = writer.finish().unwrap().unwrap();
+        let seg = Segment::open(&dir.join(&written.name)).unwrap();
+        let opened = Arc::new(Opened {
+            seg,
+            labels: OnceLock::new(),
+            names: OnceLock::new(),
+            groups: OnceLock::new(),
+        });
+        (opened, want)
+    }
+
+    #[test]
+    fn runs_of_one_time_turn_round_whatever_their_length() {
+        let dir = std::env::temp_dir().join(format!("packetlane-ties-{}", std::process::id()));
+        let (opened, records) = tied_segment(&dir);
+        let (offset, length) = opened.seg.section_bytes(KIND_TIME, Clock::Receive).unwrap();
+        // (read last to first, ties by index descending)
+        for (back, ties_desc) in [(false, true), (true, false), (false, false), (true, true)] {
+            let mut want = records.clone();
+            want.sort_by_key(|r| {
+                (
+                    if back { -r.ns } else { r.ns },
+                    if ties_desc {
+                        -i64::from(r.index)
+                    } else {
+                        i64::from(r.index)
+                    },
+                )
+            });
+            // A run longer than the reader holds is read again the other
+            // way; buffers of one record, of four, and of all of them.
+            for (buffer, cap) in [(TIME_BYTES, 1), (4 * TIME_BYTES, 4), (1 << 16, 1 << 12)] {
+                let reader = if back {
+                    Records::back(Arc::clone(&opened), offset, offset + length, buffer)
+                } else {
+                    Records::new(Arc::clone(&opened), offset, offset + length, buffer)
+                };
+                let mut ties = TieReader::new(reader, back != ties_desc, time_key, cap);
+                let mut got = Vec::new();
+                while let Some(raw) = ties.read().unwrap() {
+                    got.push(TimeRecord::decode(&raw));
+                }
+                assert_eq!(got, want, "back {back} ties_desc {ties_desc} cap {cap}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
