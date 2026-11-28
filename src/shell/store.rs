@@ -3,10 +3,11 @@
 //! `pure::sql`, `pure::ingest` and `pure::cross`.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use rusqlite::limits::Limit;
@@ -16,7 +17,7 @@ use serde::Serialize;
 
 use crate::pure::config::{Config, SourceInfo};
 use crate::pure::cross::{Comparison, CrossFinding, hop_finding, origin_finding};
-use crate::pure::decode::{Decoder, Format, decoder_for};
+use crate::pure::decode::{Format, decoder_for};
 use crate::pure::finding::{Kind, Severity};
 use crate::pure::ingest::{LaneKey, ptype_code};
 use crate::pure::oracle;
@@ -25,9 +26,10 @@ use crate::pure::segment as segment_layout;
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::cross;
-use crate::shell::files::{Hashing, ReadError, Records, Source, open_sniffed};
-use crate::shell::segment::{self, Writer, Written};
+use crate::shell::files::{ReadError, Records, Source, open_sniffed};
+use crate::shell::segment::{self, CHUNK_BYTES, Ids, Writer};
 use crate::shell::vtab;
+use crate::shell::workers;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -889,7 +891,7 @@ impl Store {
         let mut outcomes = Vec::with_capacity(files.len());
         let mut changed = false;
         for (path, rel) in files {
-            let outcome = match self.ingest_file(run_id, path, rel, &config) {
+            let outcome = match self.ingest_here(run_id, path, rel, &config) {
                 Ok(outcome) => outcome,
                 Err(e) => FileOutcome {
                     rel: rel.clone(),
@@ -971,18 +973,63 @@ impl Store {
         })
     }
 
-    fn ingest_file(
+    /// The file of a run at `rel`, as the store holds it now: id, size,
+    /// checksum.
+    fn known_file(&self, run_id: i64, rel: &str) -> Result<Option<(i64, i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row(sql::FILE_BY_REL, params![run_id, rel], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?)
+    }
+
+    /// Reads and stores one file on this thread, the store giving ids as
+    /// it goes: what every file got before files were read in parallel,
+    /// and what a file whose ids were not the ones foreseen gets again.
+    fn ingest_here(
         &mut self,
         run_id: i64,
         path: &Path,
         rel: &str,
         config: &Config,
     ) -> Result<FileOutcome> {
-        // Opened read-only, twice: once to identify the content, once to parse it.
-        let (checksum, size) = Hashing::new(File::open(path)?).finish()?;
-        let (checksum, size) = (checksum as i64, i64::try_from(size)?);
-        let outcome = |status, format, packets, entries, note: String| FileOutcome {
+        let job = workers::Job {
+            path: path.to_path_buf(),
             rel: rel.to_string(),
+            known: self.known_file(run_id, rel)?,
+        };
+        let stem = workers::stem(0);
+        let stop = AtomicBool::new(false);
+        let (read, writer) =
+            workers::read_file(&job, config, &self.segments, &stem, CHUNK_BYTES, &stop)?;
+        let finish = match writer {
+            Some(writer) => Finish::Here(Box::new(writer)),
+            None => Finish::Nothing,
+        };
+        match self.store_read(run_id, &job, read, finish, config)? {
+            Committed::Stored(outcome) => Ok(outcome),
+            Committed::Mismatch => Err("the store changed while the file was read".into()),
+        }
+    }
+
+    /// Stores what reading a file came to, in one transaction: the same
+    /// statements, in the same order, whichever thread read it. A file
+    /// read elsewhere comes with its segment finished with the ids
+    /// foreseen for it ([`Finish::Done`]); if the store gives other ids, or
+    /// no longer holds what the reading was told it held, nothing is
+    /// stored, the segment is removed and the answer is
+    /// [`Committed::Mismatch`].
+    fn store_read(
+        &mut self,
+        run_id: i64,
+        job: &workers::Job,
+        read: workers::Read<'_>,
+        finish: Finish,
+        config: &Config,
+    ) -> Result<Committed> {
+        let outcome = |status, format, packets, entries, note: String| FileOutcome {
+            rel: job.rel.clone(),
             status,
             format,
             packets,
@@ -990,13 +1037,28 @@ impl Store {
             note,
             removed: false,
         };
+        let (size, checksum) = match read {
+            workers::Read::Failed(e) => return Err(e.into()),
+            workers::Read::Unchanged => {
+                if self.known_file(run_id, &job.rel)? != job.known {
+                    return Ok(Committed::Mismatch);
+                }
+                let skipped = outcome(Status::AlreadyIngested, "", 0, 0, String::new());
+                return Ok(Committed::Stored(skipped));
+            }
+            workers::Read::Packets(p) => {
+                return self.store_packets(run_id, job, *p, finish, config);
+            }
+            workers::Read::Nothing { size, checksum, .. }
+            | workers::Read::Text { size, checksum } => (size, checksum),
+        };
 
         // A file is known by its place in the run. The same content there is
         // already ingested; different content (a log that has grown, say)
         // replaces what was read before.
         let tx = self.conn.transaction()?;
         let known: Option<(i64, i64, i64)> = tx
-            .query_row(sql::FILE_BY_REL, params![run_id, rel], |r| {
+            .query_row(sql::FILE_BY_REL, params![run_id, job.rel], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .optional()?;
@@ -1004,7 +1066,8 @@ impl Store {
         let mut old_segment: Option<String> = None;
         if let Some((file_id, old_size, old_checksum)) = known {
             if (old_size, old_checksum) == (size, checksum) {
-                return Ok(outcome(Status::AlreadyIngested, "", 0, 0, String::new()));
+                let skipped = outcome(Status::AlreadyIngested, "", 0, 0, String::new());
+                return Ok(Committed::Stored(skipped));
             }
             old_segment = tx
                 .query_row(sql::FILE_SEGMENT, params![file_id], |r| r.get(0))
@@ -1019,9 +1082,16 @@ impl Store {
             }
         }
 
-        let (format, mut file) = open_sniffed(path)?;
-        let decoder = decoder_for(format, config);
-        if format != Format::Text && decoder.is_none() {
+        let (format, mut file) = open_sniffed(&job.path)?;
+        if format != Format::Text {
+            let note = match format {
+                Format::Gzip => "Compressed file that cannot be read, or holds another one",
+                Format::Empty => "Empty file",
+                _ if decoder_for(format, config).is_some() => {
+                    return Err("the file changed while it was read".into());
+                }
+                _ => "Unrecognised format",
+            };
             // Nothing to store. Keep the removal of an earlier version, if any.
             if known.is_some() {
                 tx.execute(sql::MARK_UNFINISHED, params![run_id])?;
@@ -1030,23 +1100,18 @@ impl Store {
             if let Some(name) = &old_segment {
                 discard_segment(&self.segments, name);
             }
-            let note = match format {
-                Format::Gzip => "Compressed file that cannot be read, or holds another one",
-                Format::Empty => "Empty file",
-                _ => "Unrecognised format",
-            };
             let mut result = outcome(Status::NotReadable, format.name(), 0, 0, note.to_string());
             result.removed = known.is_some();
-            return Ok(result);
+            return Ok(Committed::Stored(result));
         }
 
-        let source = config.source_for(rel);
+        let source = config.source_for(&job.rel);
         tx.execute(
             sql::INSERT_FILE,
             params![
                 run_id,
-                path.to_string_lossy(),
-                rel,
+                job.path.to_string_lossy(),
+                job.rel,
                 source.name,
                 format.name(),
                 size,
@@ -1055,43 +1120,10 @@ impl Store {
         )?;
         let file_id = tx.last_insert_rowid();
         let mut lanes = Lanes::new(run_id, &source.name);
-        // The file's packets are numbered from here, with no gaps.
-        let first_packet: i64 = tx.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
-        let mut written: Option<Written> = None;
-
-        let (packets, entries, note) = match decoder {
-            Some(decoder) => {
-                // Created after the file's row, inside its transaction, so
-                // that no other writer can be sweeping the folder meanwhile.
-                tx.execute(sql::NEXT_SEGMENT_SERIAL, [])?;
-                let serial = tx.last_insert_rowid();
-                tx.execute(sql::DROP_SEGMENT_SERIAL, [])?;
-                let mut writer =
-                    Writer::create(&self.segments, file_id, first_packet)?.with_serial(serial);
-                let (packets, note) = ingest_packets(
-                    &tx,
-                    &mut file,
-                    decoder,
-                    config,
-                    file_id,
-                    run_id,
-                    &source,
-                    &mut lanes,
-                    first_packet,
-                    &mut writer,
-                    self.oracle,
-                )?;
-                written = writer.finish()?;
-                (packets, 0, note)
-            }
-            None => {
-                let assembler = Assembler::new(config.log_format_for(rel, source.utc_offset_s));
-                let entries = ingest_text(&tx, &mut file, file_id, &source, assembler, &mut lanes)?;
-                (0, entries, String::new())
-            }
-        };
-        // How the content was reached, what it says about itself and how
-        // reading ended, then why the compressed data gave out, if it did.
+        let assembler = Assembler::new(config.log_format_for(&job.rel, source.utc_offset_s));
+        let entries = ingest_text(&tx, &mut file, file_id, &source, assembler, &mut lanes)?;
+        // How the content was reached, then why the compressed data gave
+        // out, if it did.
         let fault = file
             .fault()
             .map(|why| format!("Compressed data unreadable past this point: {why}"));
@@ -1099,7 +1131,6 @@ impl Store {
             .is_gzip()
             .then(|| "gzip".to_string())
             .into_iter()
-            .chain((!note.is_empty()).then_some(note))
             .chain(fault.clone())
             .collect();
         let note = note.join("; ");
@@ -1117,12 +1148,208 @@ impl Store {
                 ],
             )?;
         }
+        tx.execute(
+            sql::FINISH_FILE,
+            params![
+                0i64,
+                entries as i64,
+                note,
+                None::<i64>,
+                None::<i64>,
+                file_id
+            ],
+        )?;
+        // The run's end-of-ingest step is owed until it commits.
+        tx.execute(sql::MARK_UNFINISHED, params![run_id])?;
+        tx.commit()?;
+        if let Some(name) = &old_segment {
+            discard_segment(&self.segments, name);
+        }
+        Ok(Committed::Stored(outcome(
+            Status::Ingested,
+            format.name(),
+            0,
+            entries,
+            note,
+        )))
+    }
 
+    /// [`Store::store_read`] for a packet file.
+    fn store_packets(
+        &mut self,
+        run_id: i64,
+        job: &workers::Job,
+        p: workers::Packets<'_>,
+        finish: Finish,
+        config: &Config,
+    ) -> Result<Committed> {
+        let folder = self.segments.clone();
+        // A finished segment not listed by the end is removed.
+        let mut unlisted: Option<String> = None;
+        let result = self.store_packets_in(run_id, job, p, finish, config, &mut unlisted);
+        if let Some(name) = unlisted {
+            discard_segment(&folder, &name);
+        }
+        result
+    }
+
+    fn store_packets_in(
+        &mut self,
+        run_id: i64,
+        job: &workers::Job,
+        p: workers::Packets<'_>,
+        finish: Finish,
+        config: &Config,
+        unlisted: &mut Option<String>,
+    ) -> Result<Committed> {
+        let oracle_on = self.oracle;
+        let folder = self.segments.clone();
+        let tx = self.conn.transaction()?;
+        let known: Option<(i64, i64, i64)> = tx
+            .query_row(sql::FILE_BY_REL, params![run_id, job.rel], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()?;
+        if known != job.known {
+            return Ok(Committed::Mismatch);
+        }
+        // The earlier version's segment, removed once its row is gone for good.
+        let mut old_segment: Option<String> = None;
+        if let Some((file_id, _, _)) = known {
+            old_segment = tx
+                .query_row(sql::FILE_SEGMENT, params![file_id], |r| r.get(0))
+                .optional()?;
+            if oracle_on {
+                for statement in oracle::delete_file_packets() {
+                    tx.execute(&statement, params![file_id])?;
+                }
+            }
+            for statement in sql::DELETE_FILE {
+                tx.execute(statement, params![file_id])?;
+            }
+        }
+        tx.execute(
+            sql::INSERT_FILE,
+            params![
+                run_id,
+                job.path.to_string_lossy(),
+                job.rel,
+                p.source,
+                p.format.name(),
+                p.size,
+                p.checksum
+            ],
+        )?;
+        let file_id = tx.last_insert_rowid();
+        // The file's packets are numbered from here, with no gaps.
+        let first_packet: i64 = tx.query_row(sql::NEXT_PACKET_ID, [], |r| r.get(0))?;
+        tx.execute(sql::NEXT_SEGMENT_SERIAL, [])?;
+        let serial = tx.last_insert_rowid();
+        tx.execute(sql::DROP_SEGMENT_SERIAL, [])?;
+        let mut lane_ids = Vec::with_capacity(p.keys.len());
+        {
+            let mut insert = tx.prepare_cached(sql::INSERT_LANE)?;
+            let mut select = tx.prepare_cached(sql::LANE_ID)?;
+            for key in &p.keys {
+                let row = params![run_id, p.source, key.kind, key.apid, key.ptype, key.file_id];
+                insert.execute(row)?;
+                lane_ids.push(select.query_row(row, |r| r.get::<_, i64>(0))?);
+            }
+        }
+        let ids = Ids {
+            file_id,
+            serial: Some(serial),
+            first_packet,
+            // A lane whose id a segment cannot hold is refused when the
+            // segment is finished.
+            lanes: lane_ids
+                .iter()
+                .map(|&id| u32::try_from(id).unwrap_or(u32::MAX))
+                .collect(),
+        };
+        let written = match finish {
+            Finish::Here(writer) => {
+                let written = writer.finish_with(&ids)?;
+                *unlisted = written.as_ref().map(|w| w.name.clone());
+                written
+            }
+            Finish::Nothing => return Err("a packet file without its segment".into()),
+        };
+        let lane_of = |key: &LaneKey| -> Result<i64> {
+            p.keys
+                .iter()
+                .position(|k| k == key)
+                .map(|i| lane_ids[i])
+                .ok_or_else(|| "a lane the file did not number".into())
+        };
+        if oracle_on {
+            let mut by_key = HashMap::new();
+            for (key, &id) in p.keys.iter().zip(&lane_ids) {
+                by_key.insert(*key, id);
+            }
+            fill_oracle(&tx, job, config, file_id, first_packet, &by_key)?;
+        }
+        {
+            let mut insert_series = tx.prepare_cached(sql::INSERT_FILE_SERIES)?;
+            for &((own, packet, field), count) in &p.series {
+                let lane_id = lane_ids[own as usize];
+                insert_series.execute(params![file_id, lane_id, packet, field, count])?;
+            }
+            let mut insert_finding = tx.prepare_cached(sql::INSERT_FINDING)?;
+            for finding in &p.findings {
+                let lane_id = match &finding.lane {
+                    Some(key) => Some(lane_of(key)?),
+                    None => None,
+                };
+                let packet_id = finding
+                    .packet
+                    .and_then(|i| i64::try_from(i).ok())
+                    .map(|i| first_packet + i);
+                insert_finding.execute(params![
+                    run_id,
+                    file_id,
+                    lane_id,
+                    packet_id,
+                    finding.severity.as_str(),
+                    finding.kind.name(),
+                    finding.message
+                ])?;
+            }
+        }
+        // How the content was reached, what it says about itself and how
+        // reading ended, then why the compressed data gave out, if it did.
+        let fault = p
+            .fault
+            .as_ref()
+            .map(|why| format!("Compressed data unreadable past this point: {why}"));
+        let note: Vec<String> = p
+            .gzip
+            .then(|| "gzip".to_string())
+            .into_iter()
+            .chain((!p.note.is_empty()).then(|| p.note.clone()))
+            .chain(fault.clone())
+            .collect();
+        let note = note.join("; ");
+        if let Some(message) = fault {
+            tx.execute(
+                sql::INSERT_FINDING,
+                params![
+                    run_id,
+                    file_id,
+                    None::<i64>,
+                    None::<i64>,
+                    Severity::Problem.as_str(),
+                    Kind::Truncated.name(),
+                    message
+                ],
+            )?;
+        }
+        let packets = p.packets;
         tx.execute(
             sql::FINISH_FILE,
             params![
                 packets as i64,
-                entries as i64,
+                0i64,
                 note,
                 (packets > 0).then_some(first_packet),
                 (packets > 0).then(|| first_packet + packets as i64 - 1),
@@ -1131,11 +1358,10 @@ impl Store {
         )?;
         if let Some(w) = &written {
             if w.last_packet - w.first_packet + 1 != packets as i64 {
-                discard_segment(&self.segments, &w.name);
                 return Err("the segment and the stored rows disagree".into());
             }
             let time = |c: usize| w.times[c].map(|(lo, hi, shift)| (lo, hi, i64::from(shift)));
-            let (r, p) = (time(0), time(1));
+            let (r, t) = (time(0), time(1));
             tx.execute(
                 sql::INSERT_SEGMENT,
                 params![
@@ -1146,15 +1372,15 @@ impl Store {
                     r.map(|t| t.0),
                     r.map(|t| t.1),
                     r.map(|t| t.2),
-                    p.map(|t| t.0),
-                    p.map(|t| t.1),
-                    p.map(|t| t.2),
+                    t.map(|t| t.0),
+                    t.map(|t| t.1),
+                    t.map(|t| t.2),
                     i64::from(w.order_shift)
                 ],
             )?;
             let mut insert_lane = tx.prepare_cached(sql::INSERT_SEGMENT_LANE)?;
             for (lane, s) in &w.lanes {
-                let [(r, r_n), (p, p_n)] = s.times;
+                let [(r, r_n), (t, t_n)] = s.times;
                 insert_lane.execute(params![
                     file_id,
                     lane,
@@ -1162,9 +1388,9 @@ impl Store {
                     r.map(|t| t.0),
                     r.map(|t| t.1),
                     r_n as i64,
-                    p.map(|t| t.0),
-                    p.map(|t| t.1),
-                    p_n as i64,
+                    t.map(|t| t.0),
+                    t.map(|t| t.1),
+                    t_n as i64,
                     s.first_id,
                     s.last_id
                 ])?;
@@ -1172,23 +1398,89 @@ impl Store {
         }
         // The run's end-of-ingest step is owed until it commits.
         tx.execute(sql::MARK_UNFINISHED, params![run_id])?;
-        if let Err(e) = tx.commit() {
-            if let Some(w) = &written {
-                discard_segment(&self.segments, &w.name);
-            }
-            return Err(e.into());
-        }
+        tx.commit()?;
+        // Listed now.
+        *unlisted = None;
         if let Some(name) = &old_segment {
-            discard_segment(&self.segments, name);
+            discard_segment(&folder, name);
         }
-        Ok(outcome(
-            Status::Ingested,
-            format.name(),
+        Ok(Committed::Stored(FileOutcome {
+            rel: job.rel.clone(),
+            status: Status::Ingested,
+            format: p.format.name(),
             packets,
-            entries,
+            entries: 0,
             note,
-        ))
+            removed: false,
+        }))
     }
+}
+
+/// How a packet file's segment is to be finished when the file is stored.
+enum Finish {
+    /// Not a packet file.
+    Nothing,
+    /// Here, with the ids the store gives.
+    Here(Box<Writer>),
+}
+
+/// What storing a file came to.
+enum Committed {
+    Stored(FileOutcome),
+    /// Not stored: the store does not give the ids foreseen, or no longer
+    /// holds what the reading was told it held.
+    Mismatch,
+}
+
+/// Fills the oracle's tables with a file's packets and kept values, read
+/// again from the file: the tables a test compares the segments with.
+fn fill_oracle(
+    conn: &Connection,
+    job: &workers::Job,
+    config: &Config,
+    file_id: i64,
+    base_id: i64,
+    lanes: &HashMap<LaneKey, i64>,
+) -> Result<()> {
+    let (format, mut file) = open_sniffed(&job.path)?;
+    let decoder = decoder_for(format, config).ok_or("the file changed while it was read")?;
+    let source = config.source_for(&job.rel);
+    let mut check = FileCheck::new(config, &source);
+    let mut insert = conn.prepare_cached(oracle::INSERT_PACKET)?;
+    let mut insert_value = conn.prepare_cached(oracle::INSERT_VALUE)?;
+    for item in Records::new(BufReader::new(&mut file), decoder) {
+        let record = match item {
+            Ok(record) => record,
+            Err(ReadError::Io(e)) => return Err(e.into()),
+            Err(ReadError::Decode(_)) => break,
+        };
+        let Seen { row, values } = check.observe(&record);
+        let packet_id = base_id + row.idx;
+        let lane_id = *lanes
+            .get(&row.lane())
+            .ok_or("the file changed while it was read")?;
+        insert.execute(params![
+            packet_id,
+            file_id,
+            lane_id,
+            row.idx,
+            row.offset,
+            row.length,
+            row.receive_ns,
+            row.packet_ns,
+            row.header.map(|h| i64::from(h.apid)),
+            row.header.map(|h| ptype_code(h.packet_type)),
+            row.header.map(|h| i64::from(h.seq_count)),
+            row.sum,
+            record.label,
+        ])?;
+        for v in values {
+            insert_value.execute(params![
+                packet_id, file_id, v.packet, v.field, v.num, v.text
+            ])?;
+        }
+    }
+    Ok(())
 }
 
 /// Removes a segment the store does not list. If that fails nothing is
@@ -1270,116 +1562,6 @@ impl<'a> Lanes<'a> {
         self.known.insert(key, id);
         Ok(id)
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ingest_packets(
-    conn: &Connection,
-    file: &mut Source,
-    decoder: Box<dyn Decoder>,
-    config: &Config,
-    file_id: i64,
-    run_id: i64,
-    source: &SourceInfo,
-    lanes: &mut Lanes<'_>,
-    // The id of the file's first packet; the rest follow with no gaps.
-    base_id: i64,
-    // Where each packet is also written.
-    segment: &mut Writer,
-    // Whether each packet and value also goes to the oracle tables.
-    oracle: bool,
-) -> Result<(u64, String)> {
-    let mut oracle_inserts = if oracle {
-        Some((
-            conn.prepare_cached(oracle::INSERT_PACKET)?,
-            conn.prepare_cached(oracle::INSERT_VALUE)?,
-        ))
-    } else {
-        None
-    };
-    let mut check = FileCheck::new(config, source);
-    let mut end = None;
-    // How many numbers were kept of each field of each lane, for the list
-    // of what the run has to plot.
-    let mut series: segment_layout::Map<(i64, &str, &str), i64> = segment_layout::Map::default();
-
-    let mut records = Records::new(BufReader::new(file), decoder);
-    for item in &mut records {
-        let record = match item {
-            Ok(record) => record,
-            Err(ReadError::Io(e)) => return Err(e.into()),
-            Err(ReadError::Decode(e)) => {
-                end = Some(e);
-                break;
-            }
-        };
-        let Seen { row, values } = check.observe(&record);
-        let packet_id = base_id + row.idx;
-        let lane_id = lanes.id(conn, row.lane())?;
-        if let Some((insert, _)) = &mut oracle_inserts {
-            insert.execute(params![
-                packet_id,
-                file_id,
-                lane_id,
-                row.idx,
-                row.offset,
-                row.length,
-                row.receive_ns,
-                row.packet_ns,
-                row.header.map(|h| i64::from(h.apid)),
-                row.header.map(|h| ptype_code(h.packet_type)),
-                row.header.map(|h| i64::from(h.seq_count)),
-                row.sum,
-                record.label,
-            ])?;
-        }
-        segment.push(lane_id, &row, record.label.as_deref())?;
-        for v in values {
-            if let Some((_, insert)) = &mut oracle_inserts {
-                insert.execute(params![
-                    packet_id, file_id, v.packet, v.field, v.num, v.text
-                ])?;
-            }
-            segment.push_value(v.packet, v.field, v.num, v.text.as_deref())?;
-            if v.num.is_some() {
-                *series.entry((lane_id, v.packet, v.field)).or_default() += 1;
-            }
-        }
-    }
-    let mut insert_series = conn.prepare_cached(sql::INSERT_FILE_SERIES)?;
-    for ((lane_id, packet, field), count) in series {
-        insert_series.execute(params![file_id, lane_id, packet, field, count])?;
-    }
-
-    let report = check.finish();
-    let findings = report.findings(&records.notices(), end.as_ref());
-    let mut insert_finding = conn.prepare_cached(sql::INSERT_FINDING)?;
-    for finding in &findings {
-        let lane_id = match finding.lane {
-            Some(key) => Some(lanes.id(conn, key)?),
-            None => None,
-        };
-        let packet_id = finding
-            .packet
-            .and_then(|i| i64::try_from(i).ok())
-            .map(|i| base_id + i);
-        insert_finding.execute(params![
-            run_id,
-            file_id,
-            lane_id,
-            packet_id,
-            finding.severity.as_str(),
-            finding.kind.name(),
-            finding.message
-        ])?;
-    }
-    // What the file says about itself, then why reading stopped early.
-    let note: Vec<String> = records
-        .describe()
-        .into_iter()
-        .chain(end.map(|e| e.to_string()))
-        .collect();
-    Ok((report.records, note.join("; ")))
 }
 
 /// Reads one line, newline included, keeping at most `max` bytes of it.

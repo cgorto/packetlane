@@ -987,6 +987,9 @@ impl Writer {
                 let lane = *lanes
                     .get(own as usize)
                     .ok_or("a lane of the segment has no id")?;
+                if lane == u32::MAX {
+                    return Err("lane id out of range for a segment".into());
+                }
                 self.levels[2].add(own, id);
                 PacketRecord::set_lane(record, lane);
                 id += 1;

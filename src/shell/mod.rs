@@ -11,3 +11,4 @@ pub mod segment;
 pub mod server;
 pub mod store;
 pub mod vtab;
+pub mod workers;
