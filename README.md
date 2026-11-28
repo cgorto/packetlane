@@ -188,13 +188,17 @@ Limits of working from counters alone are listed at the top of
   and ingest again. A segment written by a build with another segment
   format (this build's is 5) cannot be read either: ingest the store
   again. Nothing in it is not in the logs.
-- Writing uses about 16 to 21 MB of memory whatever the size of the run
-  (measured: 16 MB for three million packets in 900 lanes, 21 MB for ten
-  million in 12). Sorting a segment's time order, its kept values and its
-  checksums takes five 1 MB buffers, comparing sources about 5 MB more
+- Writing uses about 18 MB of memory whatever the size of the run
+  (measured: 18 MB for three million packets in 900 lanes and for ten
+  million in 12). Sorting a segment's time order, its kept numbers, its
+  checksums and its values in order of number takes six 1 MB buffers, and
+  merging what they spilled 2 MB more; comparing sources about 5 MB more
   whatever the number of files or of repeats, and SQLite's page cache up
-  to 8 MB, filled only as far as it writes (`PACKETLANE_CACHE_MB` sets
-  it); SQLite holds no packets, so it writes little.
+  to 2 MB, filled only as far as it writes (`PACKETLANE_CACHE_MB` sets
+  it). SQLite holds no packets, so it writes little: measured, a cache of
+  2, 4 or 8 MB ingests either run in the same time (8.8 s and 5.8 s,
+  within 0.2 s), and peaks at 18, 20.5 and 23.3 MB on the ten million
+  (18.3 MB whatever the cache on the three million).
 - The store file holds no packets either: 6.6 MB for that run of ten
   million packets (1.95 GB before layout 6), 1.5 MB for the run of three
   million (1.0 GB), beside segment folders of 1.7 GB and 0.93 GB.

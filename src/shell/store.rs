@@ -160,12 +160,13 @@ impl Phases {
 }
 
 /// The page cache to write with, in KiB: the most SQLite may hold, not what
-/// it takes, since it fills the cache only as it touches pages. It was sized
-/// for the indexes of packets the store kept before layout 6, which needed
-/// a couple of pages for every lane a file held. SQLite now holds no packet
-/// rows: while ingesting it writes a file's lanes, findings and counts, and
-/// the lines of text logs with their time index.
-const WRITE_CACHE_KIB: i64 = 8 * 1024;
+/// it takes, since it fills the cache only as it touches pages. SQLite holds
+/// no packet rows: while ingesting it writes a file's lanes, findings and
+/// counts, and the lines of text logs with their time index. Measured on
+/// ten million packets in 12 lanes and three million in 900, 2 MB ingests
+/// as fast as the 8 MB it was sized at for the packet indexes of earlier
+/// layouts, and peaks about 5 MB lower on the first.
+const WRITE_CACHE_KIB: i64 = 2 * 1024;
 
 /// The page cache to write with: [`WRITE_CACHE_KIB`], or as many megabytes
 /// as the environment variable `PACKETLANE_CACHE_MB` says (1 to 4096).
