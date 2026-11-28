@@ -210,8 +210,9 @@ Limits of working from counters alone are listed at the top of
 - Writing uses at most about 50 MB with four threads, whatever the size
   of the run or the number of files (measured: 25 MB for ten million
   packets in 12 lanes, 31 MB for three million in 900 lanes with six
-  million values kept, 49 MB for 200 files of 50,000 packets in 3,000
-  lanes from ten sources; 19, 21 and 33 MB on one thread). Each thread's
+  million values kept, 48 MB for 200 files of 50,000 packets in 3,000
+  lanes from ten sources, 28 MB for four files of five million packets
+  finishing at once; 19, 21 and 32 MB on one thread). Each thread's
   six sorters (time orders, kept numbers and delays, checksums, values in
   order of number) share 12 MB with the others' (1 MB each on one or two
   threads, 512 KB on four, never under 256 KB), taken when a file is
@@ -224,7 +225,7 @@ Limits of working from counters alone are listed at the top of
   comparison of sources (5 MB, 13 MB for the 27,000 pairs of lanes of
   the 200 files). The allocator keeps what each thread has held, so more
   threads cost more than the arithmetic says: eight threads peaked at
-  59 MB on the 200 files. More than four is a choice of memory for
+  58 MB on the 200 files. More than four is a choice of memory for
   speed.
 - The store file holds no packets either: 6.6 MB for that run of ten
   million packets (1.95 GB before layout 6), 1.5 MB for the run of three
@@ -232,33 +233,37 @@ Limits of working from counters alone are listed at the top of
   and 350 bytes a packet; 1.71 and 0.93 GB at layout 6: the values in
   order of number take 20 bytes each, 44 MB and 120 MB here); 11.4 MB
   and 1.82 GB for the 200 files.
-- Ingest takes 3.1 s for the ten million packets in 12 lanes (3.2
-  million a second), 1.85 s for the three million in 900 lanes (1.6
-  million a second) and 6.5 s for the 200 files (1.5 million a second)
-  on four threads; 5.4, 4.2 and 10.9 s on one; 7.3, 4.9 and 12.4 s at
-  c991d80. Medians of three, alternating builds, on an i7-11700K (8
-  cores, 16 threads), NVMe and btrfs, with a desktop session running
-  (load about 1). By threads:
+- Ingest takes 2.97 s for the ten million packets in 12 lanes (3.4
+  million a second), 1.80 s for the three million in 900 lanes (1.7
+  million a second) and 5.9 s for the 200 files (1.7 million a second)
+  on four threads; 5.05, 4.10 and 10.65 s on one; 7.34, 4.92 and 12.40 s
+  at c991d80. Four files of five million packets each (20 million) take
+  4.7 s. Medians of three, alternating builds, on an i7-11700K (8 cores,
+  16 threads), NVMe and btrfs, with a desktop session running (load
+  about 1 to 3); the three runs of each lay within 0.2 s. By threads:
 
   | threads | long | wide | 200 files | peak MB (long, wide, 200 files) |
   |---|---|---|---|---|
-  | 1 | 5.3–5.4 s | 4.2–4.3 s | 10.8–11.0 s | 19, 21, 33 |
-  | 2 | 4.3 s | 3.0 s | 7.9 s | 25, 33, 44 |
-  | 3 | 4.0–4.1 s | 1.8–2.4 s | 6.9–7.0 s | 26, 34, 47 |
-  | 4 | 3.1–3.3 s | 1.9 s | 6.4 s | 25, 31, 49 |
-  | 8 | 3.2 s | 1.9–2.4 s | 5.9–6.0 s | 24, 27, 59 |
+  | c991d80 | 7.34 s | 4.92 s | 12.40 s | 18, 19, 24 |
+  | 1 | 5.05 s | 4.10 s | 10.65 s | 19, 21, 32 |
+  | 2 | 4.08 s | 2.92 s | 7.54 s | 26, 32, 43 |
+  | 3 | 3.89 s | 1.78 s | 6.40 s | 25, 34, 46 |
+  | 4 (default) | 2.97 s | 1.80 s | 5.92 s | 25, 31, 48 |
+  | 8 | 3.08 s | 1.89 s | 5.40 s | 24, 26, 58 |
 
   The long run's largest file (five million packets) bounds it: read in
-  1.25 s on its two threads and finished in 1.1 s, then 0.45 s to
+  1.28 s on its two threads and finished in 1.13 s, then 0.45 s to
   compare sources. With three threads that file is taken last of the
   three large ones, which is why three are slower than four there. The
   200 files are bound by the comparison of ten sources logging the same
-  300 streams at the end: 2.9 s to merge the checksums and 0.9 s to count
-  what partners lack, mostly on one thread. With every sorter off the
-  largest files take 1.2 and 0.8 s (long, wide run); of the rest the kept
-  numbers and delays take about 0.5 and 0.4 s, the checksums 0.5 and
-  0.05 s, the time orders 0.3 and 0.1 s, the values in order of number
-  0.05 and 0.25 s. Sorting costs what the input's disorder costs: input
+  300 streams at the end (the files themselves are read in 2.0 s): 2.9 s
+  to merge the checksums and 0.9 s to count what partners lack, mostly on
+  one thread. With every sorter off the largest files take 1.17 and
+  0.67 s to read and finish (long, wide run); of the rest the kept
+  numbers and delays take about 0.48 and 0.41 s, the checksums 0.30 and
+  0.12 s (and the comparison of sources, 0.45 and 0.2 s, reads them),
+  the time orders 0.26 and 0.07 s, the values in order of number under
+  0.05 and 0.30 s. Sorting costs what the input's disorder costs: input
   in time order is written once and read back once, kept numbers
   (interleaved by lane and series, each in time order) cost a step a
   group, and the checksums, which are in no order, are spread over 256
@@ -542,7 +547,7 @@ been built here.
   finished on one, and the comparison of sources at the end of an ingest
   runs on one thread after its first passes; the first bounds a run of one
   large file, the second a run of many sources logging the same streams
-  (2.9 s of the 6.4 s of 200 files from ten sources). Files are also taken
+  (3.7 s of the 5.9 s of 200 files from ten sources). Files are also taken
   in their order, so with fewer threads than large files the largest may
   start last.
 - **An export of packets to a plain SQLite file**, with `packets` and
