@@ -26,8 +26,11 @@ use crate::pure::sql::Clock;
 use crate::shell::store::Result;
 
 /// Records a time-order sorter holds before it writes a sorted run: about
-/// 1 MB each. Two of them, and two of [`POINT_CHUNK`], run beside SQLite's
-/// page cache during ingest.
+/// 1 MB each. Six sorters of 1 MB run beside SQLite's page cache during
+/// ingest (two of these, two of [`POINT_CHUNK`], one of [`CHECKSUM_CHUNK`]
+/// and one of [`VALUE_CHUNK`]); putting a chunk in order by group or by
+/// radix takes a scratch copy of it for as long as that runs, one at a
+/// time, and merging what they spilled [`MERGE_MEMORY`].
 const SORT_CHUNK: usize = (1 << 20) / TIME_BYTES;
 /// The same for the sorters of kept numbers and arrival delays.
 const POINT_CHUNK: usize = (1 << 20) / POINT_KEY_BYTES;

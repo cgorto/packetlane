@@ -1100,12 +1100,13 @@ pub fn choose_levels(base: u32, records: &[u64], packets: u64) -> Vec<u32> {
 }
 
 /// Lane ids below this are looked up by index in a [`LaneTable`]; the
-/// others in a map.
-const DENSE_LANES: u32 = 1 << 16;
+/// others in a map. Lane ids are the store's, so they grow with the runs
+/// it holds; a table of 16 K slots stays under 2 MB.
+const DENSE_LANES: u32 = 1 << 14;
 
 /// Something per lane: by index for lanes below [`DENSE_LANES`], else in
 /// a map. Holds at most a slot per lane id up to the highest seen below
-/// that, 64 K of them.
+/// that, 16 K of them.
 #[derive(Debug)]
 pub struct LaneTable<T> {
     dense: Vec<Option<T>>,
