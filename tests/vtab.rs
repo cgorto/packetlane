@@ -489,6 +489,11 @@ fn statements_over_the_tables_give_what_the_tables_gave() {
             .into(),
         // Aggregates and full scans.
         "SELECT COUNT(*) FROM {P}".into(),
+        "SELECT COUNT(*) FROM {V}".into(),
+        "SELECT COUNT(*) FROM {P} p, {V} v WHERE v.packet_id = p.id".into(),
+        "SELECT id, file_id, idx FROM {P} ORDER BY id".into(),
+        "SELECT id, idx FROM {P} ORDER BY id DESC".into(),
+        "SELECT id FROM {P} WHERE file_id = 2 ORDER BY id DESC".into(),
         "SELECT apid, ptype, COUNT(*), SUM(length), MIN(offset), MAX(seq), SUM(sum % 1000)
          FROM {P} GROUP BY 1, 2 ORDER BY 1, 2"
             .into(),
@@ -772,6 +777,11 @@ fn the_query_builder_is_answered_without_sorting_or_scanning_per_row() {
             "{sql}\n{steps}"
         );
     }
+    // A count of every value reads only their places (plan 8).
+    let steps = plan(&reader, "SELECT COUNT(*) FROM field_values");
+    assert!(steps.contains("INDEX 8:"), "{steps}");
+    let steps = plan(&reader, "SELECT COUNT(num) FROM field_values");
+    assert!(!steps.contains("INDEX 8:"), "{steps}");
     // Without a field the order of number is not claimed.
     let steps = plan(&reader, "SELECT * FROM field_values ORDER BY num");
     assert!(steps.contains("TEMP B-TREE"), "{steps}");

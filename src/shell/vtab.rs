@@ -1258,6 +1258,35 @@ impl IdScan {
         }))
     }
 
+    /// Moves a row that is only an id to the next id of the segment it is
+    /// in, if this scan reads no records and that id is in range; false
+    /// if the row must be made anew.
+    fn step_in_place(&mut self, row: &mut PacketRow) -> bool {
+        let Some(open) = &mut self.open else {
+            return false;
+        };
+        if open.reader.is_some()
+            || row.seg != open.seg
+            || row.lane.is_some()
+            || row.time.is_some()
+            || row.record.get().is_some()
+        {
+            return false;
+        }
+        let id = open.id;
+        let inside = if self.desc {
+            id >= open.last && id > i64::MIN
+        } else {
+            id <= open.last && id < i64::MAX
+        };
+        if !inside {
+            return false;
+        }
+        open.id = if self.desc { id - 1 } else { id + 1 };
+        row.id = id;
+        true
+    }
+
     fn next(&mut self, r: &mut Reading, b: &PacketBounds) -> VResult<Option<PacketRow>> {
         loop {
             r.tick()?;
@@ -1512,6 +1541,13 @@ impl PacketsCursor {
             self.row = None;
             return Ok(());
         };
+        // Rows that are only ids move on in place: a count of every packet
+        // costs a step of SQLite's and an addition here.
+        if let (PacketSource::Ids(scan), Some(row)) = (&mut self.source, &mut self.row)
+            && scan.step_in_place(row)
+        {
+            return self.reading.tick();
+        }
         self.row = match &mut self.source {
             PacketSource::Done => None,
             PacketSource::Ids(scan) => scan.next(&mut self.reading, &b)?,
@@ -1890,6 +1926,14 @@ unsafe impl<'vtab> VTab<'vtab> for ValuesTab {
                 .order_bys()
                 .map(|o| (o.column(), o.is_order_by_desc()))
                 .collect();
+            // No column and nothing to test, as for a count of every value:
+            // places alone, nothing read.
+            if info.col_used() == 0 && info.constraints().count() == 0 && asked.is_empty() {
+                info.set_idx_num(PLAN_COUNT);
+                info.set_estimated_cost(values * 0.1 + 1.0);
+                info.set_order_by_consumed(false);
+                return Ok(true);
+            }
             // In order of number, either way, then of packet id, either way:
             // from the value order of the series a field (and packet) names,
             // merged across them, reading what they hold between the bounds
@@ -2079,6 +2123,70 @@ struct ValueRow {
     /// The value has a text, but where it starts must be read from its
     /// record in the values section.
     text_unread: bool,
+    /// Only the place is known: everything else must be read from the
+    /// record in the values section.
+    unread: bool,
+}
+
+/// A `field_values` plan for a count of every value: no column used and
+/// nothing to test, so each value's place is all a row needs.
+const PLAN_COUNT: c_int = 8;
+
+/// Every value's place, segment after segment, nothing read.
+struct Places {
+    segs: Vec<usize>,
+    next: usize,
+    /// The segment being counted, the next place and the end.
+    open: Option<(usize, u64, u64)>,
+}
+
+impl Places {
+    fn next(&mut self, r: &mut Reading) -> VResult<Option<ValueRow>> {
+        loop {
+            r.tick()?;
+            if let Some((seg, at, end)) = &mut self.open
+                && *at < *end
+            {
+                let position = *at;
+                *at += 1;
+                return Ok(Some(ValueRow {
+                    seg: *seg,
+                    packet_id: 0,
+                    position,
+                    value: ValueRecord {
+                        index: 0,
+                        series: 0,
+                        num: None,
+                        text_at: None,
+                    },
+                    text_unread: false,
+                    unread: true,
+                }));
+            }
+            let Some(&at) = self.segs.get(self.next) else {
+                return Ok(None);
+            };
+            self.next += 1;
+            let opened = r.open(at)?;
+            let (_, length) = opened
+                .seg
+                .section_bytes(KIND_VALUES, Clock::Receive)
+                .map_err(|e| fail(e.to_string()))?;
+            self.open = Some((at, 0, length / VALUE_BYTES as u64));
+        }
+    }
+
+    /// Moves a row to the next place of its segment, if there is one.
+    fn step_in_place(&mut self, row: &mut ValueRow) -> bool {
+        match &mut self.open {
+            Some((seg, at, end)) if *seg == row.seg && *at < *end => {
+                row.position = *at;
+                *at += 1;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A `field_values` plan in order of number; with the order each way.
@@ -2195,6 +2303,7 @@ impl Picked {
                 text_at: None,
             },
             text_unread: p.text,
+            unread: false,
         })
     }
 }
@@ -2376,6 +2485,7 @@ impl ByValue {
                 text_at: None,
             },
             text_unread: v.text,
+            unread: false,
         };
         self.advance(r, slot)?;
         Ok(Some(row))
@@ -2384,6 +2494,7 @@ impl ByValue {
 
 /// How a `field_values` cursor reads.
 enum ValueSource {
+    Places(Places),
     Packets(ValueScan),
     Picked(Picked),
     ByValue(ByValue),
@@ -2436,6 +2547,7 @@ impl ValueScan {
                 position,
                 value: v,
                 text_unread: false,
+                unread: false,
             }));
         }
     }
@@ -2510,7 +2622,13 @@ struct ValuesCursor {
 
 impl ValuesCursor {
     fn step(&mut self) -> VResult<()> {
+        if let (Some(ValueSource::Places(places)), Some(row)) = (&mut self.scan, &mut self.row)
+            && places.step_in_place(row)
+        {
+            return self.reading.tick();
+        }
         self.row = match &mut self.scan {
+            Some(ValueSource::Places(places)) => places.next(&mut self.reading)?,
             Some(ValueSource::Packets(scan)) => scan.next(&mut self.reading)?,
             Some(ValueSource::Picked(picked)) => picked.next(),
             Some(ValueSource::ByValue(scan)) => scan.next(&mut self.reading)?,
@@ -2546,7 +2664,13 @@ unsafe impl VTabCursor for ValuesCursor {
                     .collect()
             };
             let r = &mut self.reading;
-            self.scan = Some(if plan & PLAN_BY_VALUE != 0 {
+            self.scan = Some(if plan & PLAN_COUNT != 0 {
+                ValueSource::Places(Places {
+                    segs,
+                    next: 0,
+                    open: None,
+                })
+            } else if plan & PLAN_BY_VALUE != 0 {
                 let (num_desc, id_desc) = (plan & PLAN_NUM_DESC != 0, plan & PLAN_ID_DESC != 0);
                 ValueSource::ByValue(ByValue::new(r, &segs, b, num_desc, id_desc)?)
             } else if let Some(picked) = Picked::gather(r, &segs, &b)? {
@@ -2573,7 +2697,34 @@ unsafe impl VTabCursor for ValuesCursor {
 
     fn column(&self, ctx: &mut Context, i: c_int) -> VResult<()> {
         guard(|| {
-            let row = self.row.as_ref().ok_or_else(|| fail("no current row"))?;
+            let read;
+            let row = match self.row.as_ref().ok_or_else(|| fail("no current row"))? {
+                // A count's row is only a place: its value is read if a
+                // column is asked for after all.
+                row if row.unread => {
+                    let opened = self.reading.open(row.seg)?;
+                    let value = opened
+                        .seg
+                        .value_at(row.position)
+                        .map_err(|e| fail(e.to_string()))?;
+                    let first = self
+                        .reading
+                        .manifest
+                        .segs
+                        .get(row.seg)
+                        .map_or(0, |s| s.first);
+                    read = ValueRow {
+                        seg: row.seg,
+                        packet_id: first.saturating_add(i64::from(value.index)),
+                        position: row.position,
+                        value,
+                        text_unread: false,
+                        unread: false,
+                    };
+                    &read
+                }
+                row => row,
+            };
             let name = |which: usize| -> VResult<String> {
                 let opened = self.reading.open(row.seg)?;
                 let names = opened.names()?;
