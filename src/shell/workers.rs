@@ -11,6 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::time::Instant;
 
 use crate::pure::config::Config;
 use crate::pure::decode::{Format, decoder_for};
@@ -418,7 +419,8 @@ struct Shared<'s, 'a> {
 }
 
 /// A reading thread: takes jobs in turn, reads each, and for a packet file
-/// waits for its ids and finishes its segment. An error or a panic is the
+/// waits for its ids and finishes its segment; with `PACKETLANE_TIMING`
+/// set, says how long each part took. An error or a panic is the
 /// job's failure; the thread goes on with the next.
 fn work<'a>(shared: &Shared<'_, 'a>, events: mpsc::Sender<Event<'a>>) {
     let Shared {
@@ -429,8 +431,10 @@ fn work<'a>(shared: &Shared<'_, 'a>, events: mpsc::Sender<Event<'a>>) {
         hook,
         gate,
     } = shared;
+    let timing = std::env::var_os("PACKETLANE_TIMING").is_some();
     while let Some(job) = gate.claim(jobs.len()) {
         let j = &jobs[job];
+        let started = Instant::now();
         let read = caught(|| {
             let stem = stem(job);
             let read = read_file(
@@ -458,6 +462,7 @@ fn work<'a>(shared: &Shared<'_, 'a>, events: mpsc::Sender<Event<'a>>) {
             }
             continue;
         };
+        let read_in = started.elapsed();
         let (reply, ids) = mpsc::channel();
         let event = Event::Read {
             job,
@@ -471,12 +476,23 @@ fn work<'a>(shared: &Shared<'_, 'a>, events: mpsc::Sender<Event<'a>>) {
         let Ok(ids) = ids.recv() else {
             continue;
         };
+        let waited = started.elapsed() - read_in;
         let result = caught(|| {
             if let Some(hook) = hook {
                 hook(&j.rel, Stage::Finish);
             }
             writer.finish_with(&ids)
         });
+        if timing {
+            let finished = started.elapsed() - read_in - waited;
+            eprintln!(
+                "  file {}: read {:.2} s, waited {:.2} s, finished {:.2} s",
+                j.rel,
+                read_in.as_secs_f64(),
+                waited.as_secs_f64(),
+                finished.as_secs_f64()
+            );
+        }
         let event = Event::Finished {
             job,
             finished: (ids, result),

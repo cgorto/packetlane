@@ -7,7 +7,7 @@ use std::path::Path;
 
 use flate2::read::MultiGzDecoder;
 
-use crate::pure::checksum::{FNV_OFFSET, fnv1a_update};
+use crate::pure::checksum::FileSum;
 use crate::pure::config::Config;
 use crate::pure::decode::cadu::MAX_CADU_LEN;
 use crate::pure::decode::{
@@ -18,6 +18,8 @@ use crate::pure::frame::SYNC;
 use crate::pure::tc;
 
 const CHUNK: usize = 64 * 1024;
+/// What hashing a whole file reads at a time.
+const FILE_SUM_CHUNK: usize = 256 * 1024;
 
 /// A log file's content: the file itself, or what its gzip wrapper holds.
 /// Offsets everywhere else in this program count bytes of this content.
@@ -202,10 +204,11 @@ pub fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
-/// Passes reads through while keeping a checksum and byte count of them.
+/// Passes reads through while keeping a checksum ([`FileSum`]) and byte
+/// count of them.
 pub struct Hashing<R> {
     inner: R,
-    state: u64,
+    sum: FileSum,
     bytes: u64,
 }
 
@@ -213,23 +216,23 @@ impl<R: Read> Hashing<R> {
     pub fn new(inner: R) -> Self {
         Self {
             inner,
-            state: FNV_OFFSET,
+            sum: FileSum::default(),
             bytes: 0,
         }
     }
 
     /// Reads whatever is left, then returns (checksum, total bytes).
     pub fn finish(mut self) -> io::Result<(u64, u64)> {
-        let mut sink = vec![0u8; CHUNK];
+        let mut sink = vec![0u8; FILE_SUM_CHUNK];
         while self.read(&mut sink)? > 0 {}
-        Ok((self.state, self.bytes))
+        Ok((self.sum.finish(), self.bytes))
     }
 }
 
 impl<R: Read> Read for Hashing<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.state = fnv1a_update(self.state, &buf[..n]);
+        self.sum.update(&buf[..n]);
         self.bytes += n as u64;
         Ok(n)
     }
@@ -453,6 +456,8 @@ mod tests {
         assert_eq!(records.by_ref().take(2).count(), 2);
         let (sum, bytes) = records.into_inner().finish().unwrap();
         assert_eq!(bytes, data.len() as u64);
-        assert_eq!(sum, crate::pure::checksum::fnv1a(&data));
+        let mut whole = FileSum::default();
+        whole.update(&data);
+        assert_eq!(sum, whole.finish());
     }
 }
