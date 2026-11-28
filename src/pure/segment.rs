@@ -936,6 +936,131 @@ pub fn choose_levels(base: u32, records: &[u64], packets: u64) -> Vec<u32> {
     kept
 }
 
+/// Lane ids below this are looked up by index in a [`LaneTable`]; the
+/// others in a map.
+const DENSE_LANES: u32 = 1 << 16;
+
+/// Something per lane: by index for lanes below [`DENSE_LANES`], else in
+/// a map. Holds at most a slot per lane id up to the highest seen below
+/// that, 64 K of them.
+#[derive(Debug)]
+pub struct LaneTable<T> {
+    dense: Vec<Option<T>>,
+    sparse: Map<u32, T>,
+}
+
+impl<T> Default for LaneTable<T> {
+    fn default() -> Self {
+        LaneTable {
+            dense: Vec::new(),
+            sparse: Map::default(),
+        }
+    }
+}
+
+impl<T> LaneTable<T> {
+    pub fn get_mut(&mut self, lane: u32) -> Option<&mut T> {
+        if lane < DENSE_LANES {
+            self.dense.get_mut(lane as usize).and_then(Option::as_mut)
+        } else {
+            self.sparse.get_mut(&lane)
+        }
+    }
+
+    pub fn insert(&mut self, lane: u32, value: T) {
+        if lane < DENSE_LANES {
+            if self.dense.len() <= lane as usize {
+                self.dense.resize_with(lane as usize + 1, || None);
+            }
+            self.dense[lane as usize] = Some(value);
+        } else {
+            self.sparse.insert(lane, value);
+        }
+    }
+
+    /// The value of `lane`, inserted with `make` if it has none.
+    pub fn get_or_insert_with(&mut self, lane: u32, make: impl FnOnce() -> T) -> &mut T {
+        if self.get_mut(lane).is_none() {
+            self.insert(lane, make());
+        }
+        match self.get_mut(lane) {
+            Some(v) => v,
+            None => unreachable!("inserted just above"),
+        }
+    }
+
+    /// Every lane and its value, in lane order.
+    pub fn into_sorted(self) -> Vec<(u32, T)> {
+        let mut out: Vec<(u32, T)> = self
+            .dense
+            .into_iter()
+            .enumerate()
+            .filter_map(|(lane, v)| v.map(|v| (lane as u32, v)))
+            .collect();
+        let mut sparse: Vec<(u32, T)> = self.sparse.into_iter().collect();
+        sparse.sort_unstable_by_key(|s| s.0);
+        out.extend(sparse);
+        out
+    }
+}
+
+/// How many records each bucket grid of a clock would hold, counted from
+/// the clock's values as they come, in ascending order within each lane.
+/// A lane's value starts a record on every grid whose bucket differs from
+/// that of the lane's value before it; for `t` after `last` those are the
+/// grids of a shift below the bit length of `t ^ last` (buckets are an
+/// arithmetic shift, so this holds for negative values too). So it keeps
+/// one count per bit length rather than per grid, and a value costs a
+/// lookup and an addition however many grids there are.
+#[derive(Debug)]
+pub struct LevelCounter {
+    last: LaneTable<i64>,
+    lanes: u64,
+    values: u64,
+    /// Values by the bit length of their difference from the lane's last.
+    changes: [u64; 65],
+}
+
+impl Default for LevelCounter {
+    fn default() -> Self {
+        LevelCounter {
+            last: LaneTable::default(),
+            lanes: 0,
+            values: 0,
+            changes: [0; 65],
+        }
+    }
+}
+
+impl LevelCounter {
+    pub fn add(&mut self, lane: u32, t: i64) {
+        self.values += 1;
+        match self.last.get_mut(lane) {
+            Some(last) => {
+                let bits = 64 - ((*last ^ t) as u64).leading_zeros();
+                self.changes[bits as usize] += 1;
+                *last = t;
+            }
+            None => {
+                self.last.insert(lane, t);
+                self.lanes += 1;
+            }
+        }
+    }
+
+    /// How many records each grid from shift `base` up (at most
+    /// [`MAX_LEVELS`], never past 63) holds, and how many values were
+    /// counted: what [`choose_levels`] takes.
+    pub fn records(&self, base: u32) -> (Vec<u64>, u64) {
+        let base = base.min(63);
+        let levels = (64 - base).min(MAX_LEVELS);
+        let records = (base..base + levels)
+            .map(|shift| self.lanes + self.changes[shift as usize + 1..].iter().sum::<u64>())
+            .collect();
+        (records, self.values)
+    }
+}
+
 /// The level a view with buckets `width` wide reads: the coarsest stored
 /// level whose buckets are no wider than the view's, if any.
 pub fn level_for(levels: &[u32], width: i64) -> Option<u32> {
@@ -1657,6 +1782,55 @@ mod tests {
         // Too narrow to hold one stored bucket whole.
         assert_eq!(plan(5, 7, 4, 2).whole, None);
         assert_eq!(plan(i64::MIN, i64::MAX, i64::MAX, 63).whole, None);
+    }
+
+    #[test]
+    fn level_counts_are_the_records_each_grid_would_hold() {
+        // Lanes, some past the dense ids, with values ascending in each:
+        // negative, tied, small steps and enormous jumps.
+        let mut state = 0x853c_49e6_748f_ea9bu64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let lanes = [0u32, 3, 9, 70_000, u32::MAX];
+        let mut last = [i64::MIN; 5];
+        let mut values = Vec::new();
+        for _ in 0..3_000 {
+            let i = (random() % 5) as usize;
+            let step = match random() % 4 {
+                0 => 0,
+                1 => random() % 8,
+                2 => random() % 100_000,
+                _ => random() >> (random() % 64),
+            };
+            last[i] = if last[i] == i64::MIN {
+                (random() as i64) >> (random() % 64)
+            } else {
+                last[i].saturating_add((step >> 1) as i64)
+            };
+            values.push((lanes[i], last[i]));
+        }
+        let mut counter = LevelCounter::default();
+        for &(lane, t) in &values {
+            counter.add(lane, t);
+        }
+        for base in [0, 1, 7, 20, 40, 51, 62, 63, 70] {
+            let (records, n) = counter.records(base);
+            assert_eq!(n, values.len() as u64);
+            let levels = (64 - base.min(63)).min(MAX_LEVELS);
+            assert_eq!(records.len(), levels as usize);
+            for (i, &got) in records.iter().enumerate() {
+                let shift = base.min(63) + i as u32;
+                let mut seen = std::collections::BTreeSet::new();
+                for &(lane, t) in &values {
+                    seen.insert((lane, bucket_of(t, shift)));
+                }
+                assert_eq!(got, seen.len() as u64, "base {base} shift {shift}");
+            }
+        }
     }
 
     #[test]

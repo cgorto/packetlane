@@ -7,7 +7,6 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::hash::BuildHasherDefault;
 use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -18,9 +17,9 @@ use crate::pure::segment::{
     self as layout, BUCKET_BYTES, BucketRecord, CHECKSUM_BYTES, CHECKSUM_KEY_BYTES, ChecksumRecord,
     DELAY, ENTRY_BYTES, Entry, FormatError, GROUP_BYTES, GroupRecord, KIND_BUCKETS, KIND_CHECKSUMS,
     KIND_GROUPS, KIND_LABELS, KIND_PACKETS, KIND_SERIES, KIND_SERIES_BUCKETS, KIND_SERIES_NAMES,
-    KIND_TEXTS, KIND_TIME, KIND_VALUES, LaneStats, MAGIC, MixHasher, PACKET_BYTES, POINT_BYTES,
-    POINT_KEY_BYTES, PacketRecord, PointRecord, SERIES_BUCKET_BYTES, SeriesBucket, TAIL_BYTES,
-    TIME_BYTES, Tail, TimeRecord, VALUE_BYTES, ValueRecord,
+    KIND_TEXTS, KIND_TIME, KIND_VALUES, LaneStats, LaneTable, LevelCounter, MAGIC, PACKET_BYTES,
+    POINT_BYTES, POINT_KEY_BYTES, PacketRecord, PointRecord, SERIES_BUCKET_BYTES, SeriesBucket,
+    TAIL_BYTES, TIME_BYTES, Tail, TimeRecord, VALUE_BYTES, ValueRecord,
 };
 use crate::pure::sql::Clock;
 use crate::shell::store::Result;
@@ -606,7 +605,12 @@ pub struct Writer {
     /// The last packet added: its index, lane and times.
     current: Option<(u32, u32, [Option<i64>; 2])>,
     /// What has been added of each lane.
-    lanes: HashMap<u32, LaneStats>,
+    lanes: LaneTable<LaneStats>,
+    /// The records each bucket grid would hold, per clock (receive,
+    /// packet, order), counted as the values come in order: the order
+    /// clock's as packets are added, the time clocks' as their sections
+    /// are written.
+    levels: [LevelCounter; 3],
     /// Every space packet, to be sorted by checksum, sequence count,
     /// length, lane and index.
     sums: Option<Sorter<CHECKSUM_KEY_BYTES>>,
@@ -755,7 +759,8 @@ impl Writer {
             texts: Some(spool("texts")?),
             points: vec![points("receive-kept"), points("packet-kept")],
             current: None,
-            lanes: HashMap::new(),
+            lanes: LaneTable::default(),
+            levels: Default::default(),
             sums: Some(
                 Sorter::new(
                     folder.join(format!("{file_id}.sums")),
@@ -894,9 +899,9 @@ impl Writer {
         }
         let id = self.first_packet + i64::from(index);
         self.lanes
-            .entry(lane)
-            .or_insert_with(|| LaneStats::new(id))
+            .get_or_insert_with(lane, || LaneStats::new(id))
             .add(id, [row.receive_ns, row.packet_ns]);
+        self.levels[2].add(lane, id);
         self.current = Some((index, lane, [row.receive_ns, row.packet_ns]));
         self.count += 1;
         Ok(())
@@ -943,10 +948,13 @@ impl Writer {
         for (c, sorter) in std::mem::take(&mut self.sorters).into_iter().enumerate() {
             let start = self.at;
             let out = &mut self.out;
+            let levels = &mut self.levels[c];
             let mut length = 0u64;
             sorter.finish(|keys| {
                 for key in keys {
-                    out.write_all(&TimeRecord::from_sort_key(key).encode())?;
+                    let record = TimeRecord::from_sort_key(key);
+                    levels.add(record.lane, record.ns);
+                    out.write_all(&record.encode())?;
                 }
                 length += (keys.len() * TIME_BYTES) as u64;
                 Ok(())
@@ -961,10 +969,11 @@ impl Writer {
                 param: 0,
             });
         }
-        // The buckets are counted from the sections just written, read back
-        // in their order: time order for the time clocks, id order for the
-        // order clock. First how many records each level would hold, then
-        // the levels worth keeping.
+        // How many records each level would hold was counted as the values
+        // came in order; the levels worth keeping are written finest first,
+        // the finest counted from the section just written read back in its
+        // order (time order for the time clocks, id order for the order
+        // clock), each coarser one from the level before it.
         self.out.flush()?;
         let last_packet = self.first_packet + self.count as i64 - 1;
         let order_shift = layout::grid_shift(self.first_packet, last_packet);
@@ -979,9 +988,15 @@ impl Writer {
         }
         grids.push((2, order_shift, entries[0]));
         for (clock, base, source) in grids {
-            let (records, values) = self.level_records(clock, base, source)?;
+            let (records, values) = self.levels[usize::from(clock)].records(base);
+            let mut finer: Option<(Entry, u32)> = None;
             for shift in layout::choose_levels(base, &records, values) {
-                entries.push(self.bucket_section(clock, shift, source)?);
+                let entry = match finer {
+                    None => self.bucket_section(clock, shift, source)?,
+                    Some((finer, from)) => self.coarser_section(clock, shift, finer, from)?,
+                };
+                entries.push(entry);
+                finer = Some((entry, shift));
             }
         }
 
@@ -1073,8 +1088,7 @@ impl Writer {
         // Renamed: the temporary file is gone, nothing to remove on drop.
         self.temp.path = PathBuf::new();
         File::open(&self.folder)?.sync_all()?;
-        let mut lanes: Vec<(u32, LaneStats)> = self.lanes.drain().collect();
-        lanes.sort_unstable_by_key(|l| l.0);
+        let lanes = std::mem::take(&mut self.lanes).into_sorted();
         Ok(Some(Written {
             name,
             first_packet: self.first_packet,
@@ -1163,59 +1177,45 @@ impl Writer {
         Ok([series, bucket_entry, group_entry])
     }
 
-    /// How many bucket records each level from `base` up would hold, and
-    /// how many values the clock has, in one pass. A record is a lane and a
-    /// bucket with packets; values come in order, so a lane starts a new
-    /// record at a level when its bucket there differs from its last one.
-    fn level_records(&self, clock: u8, base: u32, source: Entry) -> Result<(Vec<u64>, u64)> {
-        let levels = (64 - base.min(63)).min(layout::MAX_LEVELS) as usize;
-        let mut records = vec![0u64; levels];
-        let mut slots: HashMap<u32, usize, BuildHasherDefault<MixHasher>> = HashMap::default();
-        // The last bucket of each lane at each level, lane after lane.
-        let mut last: Vec<i64> = Vec::new();
-        let mut values = 0u64;
-        let file = self.temp.file.try_clone()?;
-        each_value(&file, self.first_packet, clock, source, |t, lane| {
-            values += 1;
-            let slot = match slots.get(&lane) {
-                Some(&slot) => slot,
-                None => {
-                    slots.insert(lane, slots.len());
-                    for (i, n) in records.iter_mut().enumerate() {
-                        last.push(layout::bucket_of(t, base + i as u32));
-                        *n += 1;
-                    }
-                    return Ok(());
-                }
-            };
-            let last = &mut last[slot * levels..(slot + 1) * levels];
-            for (i, n) in records.iter_mut().enumerate() {
-                let bucket = layout::bucket_of(t, base + i as u32);
-                if last[i] != bucket {
-                    last[i] = bucket;
-                    *n += 1;
-                }
-            }
-            Ok(())
-        })?;
-        Ok((records, values))
-    }
-
     /// Counts one clock's buckets on the grid of `shift` by reading
     /// `source` from end to end, and appends them.
     fn bucket_section(&mut self, clock: u8, shift: u32, source: Entry) -> Result<Entry> {
         let start = self.at;
-        let mut tally = Tally {
-            shift,
-            current: None,
-            lanes: HashMap::default(),
-            written: 0,
-        };
+        let mut tally = Tally::new(shift);
         let file = self.temp.file.try_clone()?;
         let out = &mut self.out;
         each_value(&file, self.first_packet, clock, source, |t, lane| {
-            tally.add(t, lane, out)
+            tally.add(t, lane, 1, out)
         })?;
+        tally.flush(out)?;
+        self.at += tally.written;
+        Ok(Entry {
+            kind: KIND_BUCKETS,
+            clock,
+            record: BUCKET_BYTES as u32,
+            offset: start,
+            length: tally.written,
+            param: i64::from(shift),
+        })
+    }
+
+    /// Counts one clock's buckets on the grid of `shift` from those of the
+    /// finer grid of shift `from`, in section `finer` just written, and
+    /// appends them: a bucket of the coarser grid is a run of whole buckets
+    /// of the finer one.
+    fn coarser_section(&mut self, clock: u8, shift: u32, finer: Entry, from: u32) -> Result<Entry> {
+        self.out.flush()?;
+        let start = self.at;
+        let step = shift.saturating_sub(from);
+        let mut tally = Tally::new(0);
+        let file = self.temp.file.try_clone()?;
+        let out = &mut self.out;
+        let end = finer.offset + finer.length;
+        let mut r = RangeReader::<BUCKET_BYTES>::new(&file, finer.offset, end, IO_BUFFER);
+        while let Some(rec) = r.read()? {
+            let b = BucketRecord::decode(&rec);
+            tally.add(layout::bucket_of(b.bucket, step), b.lane, b.count, out)?;
+        }
         tally.flush(out)?;
         self.at += tally.written;
         Ok(Entry {
@@ -1262,18 +1262,35 @@ fn each_value(
 struct Tally {
     shift: u32,
     current: Option<i64>,
-    lanes: HashMap<u32, u32, BuildHasherDefault<MixHasher>>,
+    /// Each lane's count in the current bucket, and the lanes counted.
+    counts: LaneTable<u32>,
+    touched: Vec<u32>,
     written: u64,
 }
 
 impl Tally {
-    fn add(&mut self, t: i64, lane: u32, out: &mut impl Write) -> Result<()> {
+    fn new(shift: u32) -> Tally {
+        Tally {
+            shift,
+            current: None,
+            counts: LaneTable::default(),
+            touched: Vec::new(),
+            written: 0,
+        }
+    }
+
+    /// Adds `n` packets of `lane` at `t`.
+    fn add(&mut self, t: i64, lane: u32, n: u32, out: &mut impl Write) -> Result<()> {
         let bucket = layout::bucket_of(t, self.shift);
         if self.current != Some(bucket) {
             self.flush(out)?;
             self.current = Some(bucket);
         }
-        *self.lanes.entry(lane).or_default() += 1;
+        let count = self.counts.get_or_insert_with(lane, || 0);
+        if *count == 0 {
+            self.touched.push(lane);
+        }
+        *count += n;
         Ok(())
     }
 
@@ -1281,9 +1298,13 @@ impl Tally {
         let Some(bucket) = self.current else {
             return Ok(());
         };
-        let mut lanes: Vec<(u32, u32)> = self.lanes.drain().collect();
-        lanes.sort_unstable();
-        for (lane, count) in lanes {
+        self.touched.sort_unstable();
+        for lane in std::mem::take(&mut self.touched) {
+            let count = self
+                .counts
+                .get_mut(lane)
+                .map(std::mem::take)
+                .unwrap_or_default();
             out.write_all(
                 &BucketRecord {
                     bucket,
