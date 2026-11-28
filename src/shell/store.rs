@@ -21,6 +21,7 @@ use crate::pure::finding::{Kind, Severity};
 use crate::pure::ingest::{LaneKey, ptype_code};
 use crate::pure::oracle;
 use crate::pure::pipeline::{FileCheck, Seen};
+use crate::pure::segment as segment_layout;
 use crate::pure::sql::{self, Cell, Param, Query, Table};
 use crate::pure::textlog::{Assembler, Entry};
 use crate::shell::cross;
@@ -1228,7 +1229,7 @@ fn remove_orphans(conn: &Connection, folder: &Path) -> Result<()> {
 struct Lanes<'a> {
     run_id: i64,
     source: &'a str,
-    known: HashMap<LaneKey, i64>,
+    known: segment_layout::Map<LaneKey, i64>,
 }
 
 impl<'a> Lanes<'a> {
@@ -1236,7 +1237,7 @@ impl<'a> Lanes<'a> {
         Self {
             run_id,
             source,
-            known: HashMap::new(),
+            known: segment_layout::Map::default(),
         }
     }
 
@@ -1290,7 +1291,7 @@ fn ingest_packets(
     let mut end = None;
     // How many numbers were kept of each field of each lane, for the list
     // of what the run has to plot.
-    let mut series: HashMap<(i64, &str, &str), i64> = HashMap::new();
+    let mut series: segment_layout::Map<(i64, &str, &str), i64> = segment_layout::Map::default();
 
     let mut records = Records::new(BufReader::new(file), decoder);
     for item in &mut records {

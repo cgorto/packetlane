@@ -1130,7 +1130,8 @@ pub fn view_bucket(t: i64, from: i64, width: i64) -> i64 {
     (offset / width.max(1) as u64) as i64
 }
 
-/// A hasher for keys that are already well spread small integers.
+/// A quick hasher for in-memory maps whose keys no one chooses to collide:
+/// integers, and names from a file's definitions.
 #[derive(Default)]
 pub struct MixHasher(u64);
 
@@ -1140,8 +1141,17 @@ impl Hasher for MixHasher {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(u64::from(b));
+        let mut words = bytes.chunks_exact(8);
+        for w in &mut words {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(w);
+            self.write_u64(u64::from_le_bytes(a));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut a = [0u8; 8];
+            a[..rest.len()].copy_from_slice(rest);
+            self.write_u64(u64::from_le_bytes(a) ^ ((rest.len() as u64) << 59));
         }
     }
 
@@ -1163,7 +1173,8 @@ const TABLE_CELLS: u64 = 1 << 22;
 /// Lane ids below this find their row in a table by index.
 const SMALL_LANES: u32 = 1 << 16;
 
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<MixHasher>>;
+/// A map hashed with [`MixHasher`].
+pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<MixHasher>>;
 
 /// Packet counts per lane and view bucket over a window, gathered from
 /// stored buckets and single packets. Counts go to a map, whose cost

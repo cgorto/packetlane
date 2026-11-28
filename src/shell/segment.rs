@@ -4,7 +4,7 @@
 //! reader holds no more than a few pages whatever the size of the file.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
@@ -588,12 +588,12 @@ pub struct Writer {
     out: BufWriter<File>,
     at: u64,
     count: u64,
-    labels: HashMap<String, u32>,
+    labels: layout::Map<String, u32>,
     label_list: Vec<String>,
     sorters: Vec<Sorter<TIME_BYTES>>,
     ranges: [Option<(i64, i64)>; 2],
     /// Kept series numbered by packet name, then field name.
-    series: HashMap<String, HashMap<String, u32>>,
+    series: layout::Map<String, layout::Map<String, u32>>,
     series_list: Vec<(String, String)>,
     /// Kept values in packet order and their texts, until they are copied
     /// into the segment at the end.
@@ -749,11 +749,11 @@ impl Writer {
             out,
             at: MAGIC.len() as u64,
             count: 0,
-            labels: HashMap::new(),
+            labels: layout::Map::default(),
             label_list: Vec::new(),
             sorters: vec![sorter("receive"), sorter("packet")],
             ranges: [None, None],
-            series: HashMap::new(),
+            series: layout::Map::default(),
             series_list: Vec::new(),
             values: Some(spool("values")?),
             texts: Some(spool("texts")?),
