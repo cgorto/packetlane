@@ -598,6 +598,162 @@ impl<const N: usize> Sorter<N> {
     }
 }
 
+/// Parts a [`Spread`] sorter divides its records into, by first byte.
+const PARTS: usize = 256;
+
+/// Sorts fixed-width records whose byte order is their sort order and
+/// whose first byte is spread evenly (checksums): what a [`Sorter`] does,
+/// at less cost for input in no order. Each record goes to one of
+/// [`PARTS`] parts by its first byte, buffered in memory a block at a time;
+/// a full block is appended to one temporary file, pointing back at the
+/// part's block before it. At the end each part is read back and sorted in
+/// memory, the parts in order: every record is written once and read once,
+/// and no runs are merged. A part larger than [`MERGE_MEMORY`] (records
+/// that share a first byte far more than their share, or a file of
+/// hundreds of millions of packets) is sorted by a [`Sorter`] of its own.
+pub struct Spread<const N: usize> {
+    stem: PathBuf,
+    chunk: usize,
+    /// Records a block holds.
+    block: usize,
+    /// Each part's records not yet in a block of the file.
+    held: Vec<Vec<[u8; N]>>,
+    /// Each part's last block in the file (its start), and how many
+    /// records the part has in all.
+    last: Vec<Option<u64>>,
+    counts: Vec<u64>,
+    file: Option<TempFile>,
+    end: u64,
+    /// The most bytes of one part sorted in memory.
+    part_memory: usize,
+}
+
+impl<const N: usize> Spread<N> {
+    /// Temporary files are named from `stem` (a path) plus `.tmp`; the
+    /// blocks held in memory together take about `chunk` records.
+    pub fn new(stem: PathBuf, chunk: usize) -> Self {
+        Spread {
+            stem,
+            chunk: chunk.max(1),
+            block: (chunk / PARTS).max(16),
+            held: (0..PARTS).map(|_| Vec::new()).collect(),
+            last: vec![None; PARTS],
+            counts: vec![0; PARTS],
+            file: None,
+            end: 0,
+            part_memory: MERGE_MEMORY,
+        }
+    }
+
+    /// Sorts a part in memory only if it takes at most `bytes`.
+    pub fn sorting_in_memory(mut self, bytes: usize) -> Self {
+        self.part_memory = bytes;
+        self
+    }
+
+    fn block_bytes(&self) -> usize {
+        8 + self.block * N
+    }
+
+    pub fn push(&mut self, record: [u8; N]) -> Result<()> {
+        let part = usize::from(record.first().copied().unwrap_or(0));
+        let block = self.block;
+        let held = &mut self.held[part];
+        if held.capacity() == 0 {
+            held.reserve_exact(block);
+        }
+        held.push(record);
+        self.counts[part] += 1;
+        if held.len() >= block {
+            self.spill(part)?;
+        }
+        Ok(())
+    }
+
+    /// Appends a part's held records to the file as a block: the start of
+    /// the part's block before it (`u64::MAX` for none), then the records.
+    fn spill(&mut self, part: usize) -> Result<()> {
+        if self.file.is_none() {
+            let mut name = self.stem.clone().into_os_string();
+            name.push(".tmp");
+            self.file = Some(TempFile::create(PathBuf::from(name))?);
+        }
+        let Some(file) = &self.file else {
+            return Err("spread sorter has no file".into());
+        };
+        let mut bytes = Vec::with_capacity(self.block_bytes());
+        bytes.extend_from_slice(&self.last[part].unwrap_or(u64::MAX).to_le_bytes());
+        bytes.extend_from_slice(self.held[part].as_flattened());
+        bytes.resize(self.block_bytes(), 0);
+        file.file.write_all_at(&bytes, self.end)?;
+        self.last[part] = Some(self.end);
+        self.end += bytes.len() as u64;
+        self.held[part].clear();
+        Ok(())
+    }
+
+    /// Hands every record of a part to `f`, its blocks from the last back,
+    /// then what is held of it.
+    fn each_of(&self, part: usize, mut f: impl FnMut(&[[u8; N]]) -> Result<()>) -> Result<()> {
+        let mut at = self.last[part];
+        let mut buf = vec![0u8; self.block_bytes()];
+        while let (Some(start), Some(file)) = (at, &self.file) {
+            file.file.read_exact_at(&mut buf, start)?;
+            let mut prev = [0u8; 8];
+            prev.copy_from_slice(&buf[..8]);
+            let prev = u64::from_le_bytes(prev);
+            let records: Vec<[u8; N]> = buf[8..]
+                .chunks_exact(N)
+                .map(|r| {
+                    let mut a = [0u8; N];
+                    a.copy_from_slice(r);
+                    a
+                })
+                .collect();
+            f(&records)?;
+            at = (prev != u64::MAX).then_some(prev);
+        }
+        f(&self.held[part])
+    }
+
+    /// Hands every record to `out`, in order, a slice at a time.
+    pub fn finish(mut self, mut out: impl FnMut(&[[u8; N]]) -> Result<()>) -> Result<()> {
+        let fits = (self.part_memory / N) as u64;
+        let mut part_buf: Vec<[u8; N]> = Vec::new();
+        for part in 0..PARTS {
+            let count = self.counts[part];
+            if count == 0 {
+                continue;
+            }
+            if count <= fits {
+                part_buf.clear();
+                part_buf.reserve_exact(count as usize);
+                self.each_of(part, |records| {
+                    part_buf.extend_from_slice(records);
+                    Ok(())
+                })?;
+                part_buf.sort_unstable();
+                out(&part_buf)?;
+            } else {
+                let mut stem = self.stem.clone().into_os_string();
+                stem.push(format!(".part{part}"));
+                let mut sorter = Sorter::<N>::new(PathBuf::from(stem), self.chunk, FAN_IN)
+                    .ordered(ChunkOrder::Radix);
+                self.each_of(part, |records| {
+                    for &r in records {
+                        sorter.push(r)?;
+                    }
+                    Ok(())
+                })?;
+                sorter.finish(&mut out)?;
+            }
+            // Done with: its memory goes now.
+            self.held[part] = Vec::new();
+        }
+        Ok(())
+    }
+}
+
 // ---- writing ------------------------------------------------------------------
 
 /// The ids a segment is finished with. A file's segment is written as the
@@ -673,7 +829,7 @@ pub struct Writer {
     levels: [LevelCounter; 3],
     /// Every space packet, to be sorted by checksum, sequence count,
     /// length and index.
-    sums: Option<Sorter<CHECKSUM_KEY_BYTES>>,
+    sums: Option<Spread<CHECKSUM_KEY_BYTES>>,
     /// Every kept value, to be sorted by series, number, index and place.
     by_value: Option<Sorter<VALUE_KEY_BYTES>>,
 }
@@ -898,10 +1054,7 @@ impl Writer {
             lanes: LaneTable::default(),
             lane_bound: 0,
             levels: Default::default(),
-            sums: Some(
-                Sorter::new(path("sums"), chunk(CHECKSUM_KEY_BYTES), FAN_IN)
-                    .ordered(ChunkOrder::Radix),
-            ),
+            sums: Some(Spread::new(path("sums"), chunk(CHECKSUM_KEY_BYTES))),
             by_value: Some(Sorter::new(
                 path("by-value"),
                 chunk(VALUE_KEY_BYTES),
@@ -2690,6 +2843,69 @@ mod tests {
             })
             .unwrap();
         (out, widest, files)
+    }
+
+    #[test]
+    fn the_spread_sorter_gives_the_order_of_a_plain_sort_whatever_the_input() {
+        let scratch = Scratch::new();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let n = 3_000u64;
+        let shapes: Vec<(&str, Vec<[u8; 10]>)> = vec![
+            ("random", (0..n).map(|_| key(random(), 0)).collect()),
+            (
+                "random with ties",
+                (0..n)
+                    .map(|_| key((random() % 40) << 56, random() as u16 % 3))
+                    .collect(),
+            ),
+            (
+                "one first byte",
+                (0..n)
+                    .map(|i| key((0x42 << 56) | (random() % 100), i as u16))
+                    .collect(),
+            ),
+            ("all equal", (0..n).map(|_| key(7, 7)).collect()),
+            ("sorted", (0..n).map(|i| key(i << 48, 0)).collect()),
+            ("reversed", (0..n).map(|i| key((n - i) << 48, 0)).collect()),
+            ("few", (0..5).map(|_| key(random(), 1)).collect()),
+            ("none", Vec::new()),
+        ];
+        fn key(a: u64, b: u16) -> [u8; 10] {
+            let mut k = [0u8; 10];
+            k[..8].copy_from_slice(&a.to_be_bytes());
+            k[8..].copy_from_slice(&b.to_be_bytes());
+            k
+        }
+        for (name, input) in &shapes {
+            let mut expected = input.clone();
+            expected.sort_unstable();
+            for chunk in [1, 300, 5_000, 100_000] {
+                // In memory always, never, or as a part's size has it.
+                for memory in [usize::MAX, 0, 400] {
+                    let mut sorter =
+                        Spread::<10>::new(scratch.0.join("p"), chunk).sorting_in_memory(memory);
+                    for r in input {
+                        sorter.push(*r).unwrap();
+                    }
+                    let mut out = Vec::new();
+                    sorter
+                        .finish(|records| {
+                            out.extend_from_slice(records);
+                            Ok(())
+                        })
+                        .unwrap();
+                    let what = format!("{name} chunk {chunk} memory {memory}");
+                    assert!(out == expected, "{what}");
+                    assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0, "{what}");
+                }
+            }
+        }
     }
 
     #[test]
