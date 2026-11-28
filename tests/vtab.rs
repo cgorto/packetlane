@@ -470,6 +470,8 @@ fn statements_over_the_tables_give_what_the_tables_gave() {
             t(5)
         ),
         format!("SELECT * FROM {{P}} WHERE receive_ns > {}", i64::MAX - 1),
+        "SELECT COUNT(*) FROM {P} WHERE receive_ns < 1e30 AND packet_ns > -1e30".into(),
+        "SELECT COUNT(*) FROM {P} WHERE id < 1e300".into(),
         // Ordered by time with no range: packets without the time first
         // when ascending, last when descending.
         "SELECT id, receive_ns FROM {P} ORDER BY receive_ns, id LIMIT 80".into(),

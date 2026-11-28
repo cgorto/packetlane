@@ -578,7 +578,9 @@ impl Range {
                 return;
             }
             ValueRef::Integer(v) => (v, v),
-            ValueRef::Real(f) if !f.is_nan() => (f.floor() as i64, f.ceil() as i64),
+            // Beyond what an i64 holds, a real bounds nothing here; SQLite
+            // still compares it.
+            ValueRef::Real(f) if f.abs() < 9.2e18 => (f.floor() as i64, f.ceil() as i64),
             _ => return,
         };
         self.bounded = true;
