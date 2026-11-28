@@ -63,9 +63,25 @@ page's reads of the segment files do the same, with all their SQL in one
 read transaction. Constraints only ever skip what cannot match, and
 SQLite checks every row it gets; `packets` is read in id order or in
 order of a time clock (from the time-order sections), either way up,
-`field_values` in packet order. The time limit of a read-only connection
-is checked inside those reads, where SQLite's own progress handler does
-not run.
+`field_values` in packet order, or for a field in order of number (from
+the value-order section, merged across series and segments), and a
+field's narrow range of numbers is gathered from there and handed out in
+packet order. A count of every packet or every value reads no record. The
+time limit of a read-only connection is checked inside those reads,
+where SQLite's own progress handler does not run.
+
+A segment's sorted sections (time orders, kept numbers by lane and
+series, checksums, values by series and number) are written through
+bounded sorters (`shell::segment::Sorter`): what arrives after everything
+written so far extends one long run in a file of its own, the rest
+extends or starts other runs, and runs are merged with a heap, the run
+with the lowest record handing out everything up to the next run's head
+at once. Input in order costs one write and one read of the section;
+grouped input (kept numbers arrive interleaved by lane and series, each
+group in time order) costs a heap step per group per run, not per record;
+only real disorder (checksums) pays a full merge. Bucket levels are sized
+as the values come in order, and each coarser level is counted from the
+one before it rather than from the packets again.
 
 The format is described in `src/pure/segment.rs`. A store from a build
 before schema 7 is refused, and a segment of a format version other than

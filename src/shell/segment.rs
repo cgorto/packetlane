@@ -257,7 +257,7 @@ fn merge_runs<const N: usize>(
             }
             let n = match &bound {
                 None => ready.len(),
-                Some(b) => ready.partition_point(|r| r <= b),
+                Some(b) => gallop(ready, b),
             };
             out(&ready[..n])?;
             let next = ready.get(n).copied();
@@ -269,6 +269,19 @@ fn merge_runs<const N: usize>(
         }
     }
     Ok(())
+}
+
+/// How many of the sorted `records` are at most `bound`: an exponential
+/// search from the start, so that one record costs a comparison or two,
+/// as it does when runs interleave record by record.
+fn gallop<const N: usize>(records: &[[u8; N]], bound: &[u8; N]) -> usize {
+    let mut hi = 1;
+    while hi <= records.len() && records[hi - 1] <= *bound {
+        hi *= 2;
+    }
+    let lo = hi / 2;
+    let end = hi.min(records.len() + 1) - 1;
+    lo + records[lo..end].partition_point(|r| r <= bound)
 }
 
 /// How a sorter puts one chunk in order before writing it as a run. All
@@ -2604,6 +2617,17 @@ mod tests {
                         assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0, "{what}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn galloping_finds_what_a_binary_search_finds() {
+        for len in 0..40u8 {
+            let records: Vec<[u8; 1]> = (0..len).map(|i| [i / 3 * 2]).collect();
+            for bound in 0..90u8 {
+                let want = records.partition_point(|r| r[0] <= bound);
+                assert_eq!(gallop(&records, &[bound]), want, "{len} {bound}");
             }
         }
     }
