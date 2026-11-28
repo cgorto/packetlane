@@ -77,14 +77,16 @@ pub fn origin_finding(
 // given back once ([`Comparison::replay`]).
 
 /// One space packet as the comparison of sources reads it, ordered as it
-/// is read: checksum, sequence count, length, lane, id.
+/// is read: checksum, sequence count, length, id. The lane orders nothing
+/// (no two packets share an id), so packets of one checksum, sequence count
+/// and length may come in any order of lanes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Logged {
     pub sum: i64,
     pub seq: u16,
     pub length: i64,
-    pub lane: u32,
     pub id: i64,
+    pub lane: u32,
 }
 
 /// What one pair of lanes comes to.
@@ -185,9 +187,9 @@ impl Comparison {
             self.end_sub();
         }
         self.sub = Some(key);
-        match self.sub_lanes.last_mut() {
-            Some(l) if l.0 == p.lane => l.1 += 1,
-            _ => self.sub_lanes.push((p.lane, 1)),
+        match self.sub_lanes.iter_mut().find(|l| l.0 == p.lane) {
+            Some(l) => l.1 += 1,
+            None => self.sub_lanes.push((p.lane, 1)),
         }
         match self.lanes.iter_mut().find(|l| l.lane == p.lane) {
             Some(l) => {
@@ -435,6 +437,27 @@ mod tests {
             // A lane that is not traced, and a lane of another stream.
             assert_eq!(c.copies(2, 1), 0);
             assert_eq!(c.copies(1, 4), 0);
+        }
+    }
+
+    /// Packets of one checksum, sequence count and length come in order of
+    /// id, so their lanes interleave: what the comparison makes of them is
+    /// what it makes of the same packets with each lane's together.
+    #[test]
+    fn lanes_interleaved_within_a_checksum_compare_as_lanes_together() {
+        for seed in 1..20 {
+            let by_id = mixed_packets(400, seed);
+            let mut by_lane = by_id.clone();
+            by_lane.sort_by_key(|p| (p.sum, p.seq, p.length, p.lane, p.id));
+            assert_ne!(by_id, by_lane, "seed {seed}: no lanes interleave");
+            let a = compare_all(&PAIRS, &[1, 2, 5], by_id.iter().copied());
+            let b = compare_all(&PAIRS, &[1, 2, 5], by_lane.iter().copied());
+            assert_eq!(a.counts(), b.counts(), "seed {seed}");
+            for x in [1u32, 2, 5] {
+                for l in 1..=5 {
+                    assert_eq!(a.copies(x, l), b.copies(x, l), "seed {seed} {x} in {l}");
+                }
+            }
         }
     }
 }

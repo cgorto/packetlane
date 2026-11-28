@@ -25,19 +25,16 @@ use crate::pure::segment::{
 use crate::pure::sql::Clock;
 use crate::shell::store::Result;
 
-/// Records a time-order sorter holds before it writes a sorted run: about
-/// 1 MB each. Six sorters of 1 MB run beside SQLite's page cache during
-/// ingest (two of these, two of [`POINT_CHUNK`], one of [`CHECKSUM_CHUNK`]
-/// and one of [`VALUE_CHUNK`]); putting a chunk in order by group or by
-/// radix takes a scratch copy of it for as long as that runs, one at a
+/// What each of a segment writer's six sorters holds before it writes a
+/// sorted run, unless the writer is given another figure: 1 MB (two sorters
+/// of times, two of kept numbers and arrival delays, one of checksums and
+/// one of kept values in value order). Putting a chunk in order by group or
+/// by radix takes a scratch copy of it for as long as that runs, one at a
 /// time, and merging what they spilled [`MERGE_MEMORY`].
-const SORT_CHUNK: usize = (1 << 20) / TIME_BYTES;
-/// The same for the sorters of kept numbers and arrival delays.
-const POINT_CHUNK: usize = (1 << 20) / POINT_KEY_BYTES;
-/// The same for the sorter of checksums.
-const CHECKSUM_CHUNK: usize = (1 << 20) / CHECKSUM_KEY_BYTES;
-/// The same for the sorter of kept values in value order.
-const VALUE_CHUNK: usize = (1 << 20) / VALUE_KEY_BYTES;
+pub const CHUNK_BYTES: usize = 1 << 20;
+/// Records a time-order sorter of [`CHUNK_BYTES`] holds; given to
+/// [`Writer::with_chunk`], every sorter holds [`CHUNK_BYTES`].
+const SORT_CHUNK: usize = CHUNK_BYTES / TIME_BYTES;
 /// Buffer for each of the temporary files kept values and their texts are
 /// written to.
 const SPOOL_BUFFER: usize = 64 << 10;
@@ -580,6 +577,20 @@ impl<const N: usize> Sorter<N> {
 
 // ---- writing ------------------------------------------------------------------
 
+/// The ids a segment is finished with. A file's segment is written as the
+/// file is read, before the store has given the file, its packets or its
+/// lanes their ids: until then lanes are numbered from 0 in the order the
+/// file first meets them (its own numbers), and packets by index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ids {
+    pub file_id: i64,
+    /// Part of the name, if given: `<file id>.<serial>.seg`.
+    pub serial: Option<i64>,
+    pub first_packet: i64,
+    /// The store's id of each of the file's own lane numbers.
+    pub lanes: Vec<u32>,
+}
+
 /// What the store keeps about a written segment, in its `segments` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Written {
@@ -594,15 +605,18 @@ pub struct Written {
     pub lanes: Vec<(u32, LaneStats)>,
 }
 
-/// Writes one segment as a file's packets are read. Nothing is visible
-/// under the segment's own name until [`Writer::finish`]; dropped before
-/// that, it leaves nothing behind.
+/// Writes one segment as a file's packets are read, with the file's own
+/// lane numbers; [`Writer::finish_with`] writes the rest with the store's
+/// ids. Nothing is visible under the segment's own name until then; dropped
+/// before that, it leaves nothing behind.
 pub struct Writer {
     folder: PathBuf,
-    file_id: i64,
-    /// Part of the name, if given: see [`Writer::with_serial`].
-    serial: Option<i64>,
-    first_packet: i64,
+    /// Names the temporary files.
+    stem: String,
+    /// The ids [`Writer::finish`] uses, for a writer made by
+    /// [`Writer::create`] or [`Writer::with_chunk`]: file id, serial, first
+    /// packet id.
+    given: (i64, Option<i64>, i64),
     temp: TempFile,
     out: BufWriter<File>,
     at: u64,
@@ -623,15 +637,17 @@ pub struct Writer {
     points: Vec<Sorter<POINT_KEY_BYTES>>,
     /// The last packet added: its index, lane and times.
     current: Option<(u32, u32, [Option<i64>; 2])>,
-    /// What has been added of each lane.
+    /// What has been added of each lane, with indexes for ids.
     lanes: LaneTable<LaneStats>,
+    /// One more than the highest lane number added.
+    lane_bound: u32,
     /// The records each bucket grid would hold, per clock (receive,
     /// packet, order), counted as the values come in order: the order
-    /// clock's as packets are added, the time clocks' as their sections
-    /// are written.
+    /// clock's from the packets once their ids are known, the time clocks'
+    /// as their sections are written.
     levels: [LevelCounter; 3],
     /// Every space packet, to be sorted by checksum, sequence count,
-    /// length, lane and index.
+    /// length and index.
     sums: Option<Sorter<CHECKSUM_KEY_BYTES>>,
     /// Every kept value, to be sorted by series, number, index and place.
     by_value: Option<Sorter<VALUE_KEY_BYTES>>,
@@ -725,7 +741,8 @@ impl OpenGroup {
 
 impl Writer {
     /// Starts the segment of file `file_id`, whose first packet has id
-    /// `first_packet`.
+    /// `first_packet`, with lanes numbered as the store numbers them:
+    /// [`Writer::finish`] keeps every number as it is.
     pub fn create(folder: &Path, file_id: i64, first_packet: i64) -> Result<Writer> {
         Writer::with_chunk(folder, file_id, first_packet, SORT_CHUNK)
     }
@@ -735,7 +752,7 @@ impl Writer {
     /// again, so that a name a reader has listed never comes to mean
     /// another segment.
     pub fn with_serial(mut self, serial: i64) -> Writer {
-        self.serial = Some(serial);
+        self.given.1 = Some(serial);
         self
     }
 
@@ -746,26 +763,38 @@ impl Writer {
         first_packet: i64,
         chunk: usize,
     ) -> Result<Writer> {
-        let temp = TempFile::create(folder.join(format!("{file_id}.seg.tmp")))?;
+        let mut w = if chunk == SORT_CHUNK {
+            Writer::start(folder, &file_id.to_string(), CHUNK_BYTES)?
+        } else {
+            Writer::build(folder, &file_id.to_string(), |_| chunk)?
+        };
+        w.given = (file_id, None, first_packet);
+        Ok(w)
+    }
+
+    /// Starts a segment whose ids are given when it is finished
+    /// ([`Writer::finish_with`]). Its temporary files are named from
+    /// `stem`, which no other writer in the folder may be using; each of
+    /// its six sorters holds about `chunk_bytes` of records at once.
+    pub fn start(folder: &Path, stem: &str, chunk_bytes: usize) -> Result<Writer> {
+        Writer::build(folder, stem, |record| (chunk_bytes / record).max(1))
+    }
+
+    /// A writer whose sorters of records `n` bytes long hold `chunk(n)`.
+    fn build(folder: &Path, stem: &str, chunk: impl Fn(usize) -> usize) -> Result<Writer> {
+        let temp = TempFile::create(folder.join(format!("{stem}.seg.tmp")))?;
         let mut out = BufWriter::with_capacity(IO_BUFFER, temp.file.try_clone()?);
         out.write_all(&MAGIC)?;
-        let sorter =
-            |clock: &str| Sorter::new(folder.join(format!("{file_id}.{clock}")), chunk, FAN_IN);
+        let path = |what: &str| folder.join(format!("{stem}.{what}"));
+        let sorter = |clock: &str| Sorter::new(path(clock), chunk(TIME_BYTES), FAN_IN);
         let points = |clock: &str| {
-            let chunk = if chunk == SORT_CHUNK {
-                POINT_CHUNK
-            } else {
-                chunk
-            };
-            Sorter::new(folder.join(format!("{file_id}.{clock}")), chunk, FAN_IN)
-                .ordered(ChunkOrder::Grouped)
+            Sorter::new(path(clock), chunk(POINT_KEY_BYTES), FAN_IN).ordered(ChunkOrder::Grouped)
         };
-        let spool = |what: &str| Spool::create(folder.join(format!("{file_id}.{what}.tmp")));
+        let spool = |what: &str| Spool::create(folder.join(format!("{stem}.{what}.tmp")));
         Ok(Writer {
             folder: folder.to_path_buf(),
-            file_id,
-            serial: None,
-            first_packet,
+            stem: stem.to_string(),
+            given: (0, None, 1),
             temp,
             out,
             at: MAGIC.len() as u64,
@@ -781,26 +810,15 @@ impl Writer {
             points: vec![points("receive-kept"), points("packet-kept")],
             current: None,
             lanes: LaneTable::default(),
+            lane_bound: 0,
             levels: Default::default(),
             sums: Some(
-                Sorter::new(
-                    folder.join(format!("{file_id}.sums")),
-                    if chunk == SORT_CHUNK {
-                        CHECKSUM_CHUNK
-                    } else {
-                        chunk
-                    },
-                    FAN_IN,
-                )
-                .ordered(ChunkOrder::Radix),
+                Sorter::new(path("sums"), chunk(CHECKSUM_KEY_BYTES), FAN_IN)
+                    .ordered(ChunkOrder::Radix),
             ),
             by_value: Some(Sorter::new(
-                folder.join(format!("{file_id}.by-value")),
-                if chunk == SORT_CHUNK {
-                    VALUE_CHUNK
-                } else {
-                    chunk
-                },
+                path("by-value"),
+                chunk(VALUE_KEY_BYTES),
                 FAN_IN,
             )),
         })
@@ -876,12 +894,17 @@ impl Writer {
         Ok(())
     }
 
-    /// Adds the next packet. Its id is the first packet's plus the number
-    /// added before it.
-    pub fn push(&mut self, lane_id: i64, row: &PacketRow, label: Option<&str>) -> Result<()> {
+    /// Adds the next packet, of lane `lane` (the file's own number for it,
+    /// see [`Ids`]). Its id is the first packet's plus the number added
+    /// before it.
+    pub fn push(&mut self, lane: i64, row: &PacketRow, label: Option<&str>) -> Result<()> {
         let index = u32::try_from(self.count)
             .map_err(|_| "more packets in one file than a segment holds")?;
-        let lane = u32::try_from(lane_id).map_err(|_| "lane id out of range for a segment")?;
+        let lane = u32::try_from(lane)
+            .ok()
+            .filter(|&l| l < u32::MAX)
+            .ok_or("lane id out of range for a segment")?;
+        self.lane_bound = self.lane_bound.max(lane + 1);
         let label = match label {
             None => None,
             Some(text) => Some(match self.labels.get(text) {
@@ -937,13 +960,40 @@ impl Writer {
             };
             sums.push(record.sort_key())?;
         }
-        let id = self.first_packet + i64::from(index);
+        let at = i64::from(index);
         self.lanes
-            .get_or_insert_with(lane, || LaneStats::new(id))
-            .add(id, [row.receive_ns, row.packet_ns]);
-        self.levels[2].add(lane, id);
+            .get_or_insert_with(lane, || LaneStats::new(at))
+            .add(at, [row.receive_ns, row.packet_ns]);
         self.current = Some((index, lane, [row.receive_ns, row.packet_ns]));
         self.count += 1;
+        Ok(())
+    }
+
+    /// Puts the store's lane ids (`lanes`, by the file's own number) in the
+    /// packets section in place of the file's own numbers, and counts the
+    /// order clock's bucket levels, which need the packets' ids. One pass
+    /// over the section, already flushed, a buffer at a time.
+    fn seal_packets(&mut self, lanes: &[u32], first_packet: i64) -> Result<()> {
+        let mut buf = vec![0u8; IO_BUFFER / PACKET_BYTES * PACKET_BYTES];
+        let mut at = MAGIC.len() as u64;
+        let end = at + self.count * PACKET_BYTES as u64;
+        let mut id = first_packet;
+        while at < end {
+            let n = ((end - at) as usize).min(buf.len());
+            let part = &mut buf[..n];
+            self.temp.file.read_exact_at(part, at)?;
+            for record in part.chunks_exact_mut(PACKET_BYTES) {
+                let own = PacketRecord::lane_of(record);
+                let lane = *lanes
+                    .get(own as usize)
+                    .ok_or("a lane of the segment has no id")?;
+                self.levels[2].add(own, id);
+                PacketRecord::set_lane(record, lane);
+                id += 1;
+            }
+            self.temp.file.write_all_at(part, at)?;
+            at += n as u64;
+        }
         Ok(())
     }
 
@@ -955,14 +1005,35 @@ impl Writer {
         Ok(start)
     }
 
-    /// Writes the rest of the segment, syncs it and gives it its own name.
-    /// Returns `None`, leaving nothing behind, if no packet was added. The
-    /// caller adds the `segments` row in the transaction that commits the
-    /// file's rows.
-    pub fn finish(mut self) -> Result<Option<Written>> {
+    /// [`Writer::finish_with`] the ids the writer was made with, every lane
+    /// keeping its number.
+    pub fn finish(self) -> Result<Option<Written>> {
+        let (file_id, serial, first_packet) = self.given;
+        let lanes = (0..self.lane_bound).collect();
+        self.finish_with(&Ids {
+            file_id,
+            serial,
+            first_packet,
+            lanes,
+        })
+    }
+
+    /// Writes the rest of the segment with the store's ids, syncs it and
+    /// gives it its own name. Returns `None`, leaving nothing behind, if no
+    /// packet was added. The caller adds the `segments` row in the
+    /// transaction that commits the file's rows, and checks there that the
+    /// ids are the ones the store gives.
+    pub fn finish_with(mut self, ids: &Ids) -> Result<Option<Written>> {
         if self.count == 0 {
             return Ok(None);
         }
+        if ids.lanes.len() < self.lane_bound as usize {
+            return Err("a lane of the segment has no id".into());
+        }
+        let lanes = ids.lanes.as_slice();
+        let first_packet = ids.first_packet;
+        self.out.flush()?;
+        self.seal_packets(lanes, first_packet)?;
         let mut entries = vec![Entry {
             kind: KIND_PACKETS,
             clock: 0,
@@ -992,8 +1063,9 @@ impl Writer {
             let mut length = 0u64;
             sorter.finish(|keys| {
                 for key in keys {
-                    let record = TimeRecord::from_sort_key(key);
+                    let mut record = TimeRecord::from_sort_key(key);
                     levels.add(record.lane, record.ns);
+                    record.lane = lanes[record.lane as usize];
                     out.write_all(&record.encode())?;
                 }
                 length += (keys.len() * TIME_BYTES) as u64;
@@ -1015,8 +1087,8 @@ impl Writer {
         // order (time order for the time clocks, id order for the order
         // clock), each coarser one from the level before it.
         self.out.flush()?;
-        let last_packet = self.first_packet + self.count as i64 - 1;
-        let order_shift = layout::grid_shift(self.first_packet, last_packet);
+        let last_packet = first_packet + self.count as i64 - 1;
+        let order_shift = layout::grid_shift(first_packet, last_packet);
         let mut times = [None, None];
         let mut grids = Vec::new();
         for c in 0..2 {
@@ -1032,7 +1104,7 @@ impl Writer {
             let mut finer: Option<(Entry, u32)> = None;
             for shift in layout::choose_levels(base, &records, values) {
                 let entry = match finer {
-                    None => self.bucket_section(clock, shift, source)?,
+                    None => self.bucket_section(clock, shift, source, first_packet)?,
                     Some((finer, from)) => self.coarser_section(clock, shift, finer, from)?,
                 };
                 entries.push(entry);
@@ -1075,7 +1147,7 @@ impl Writer {
         }
         for (c, sorter) in std::mem::take(&mut self.points).into_iter().enumerate() {
             let shift = times[c].map_or(0, |t| layout::series_shift(t.2));
-            entries.extend(self.series_sections(c as u8, shift, sorter)?);
+            entries.extend(self.series_sections(c as u8, shift, sorter, lanes)?);
         }
         // Every space packet by checksum, for the comparison of sources.
         let sums = self.sums.take().ok_or("segment finished twice")?;
@@ -1084,7 +1156,9 @@ impl Writer {
         let mut length = 0u64;
         sums.finish(|keys| {
             for key in keys {
-                out.write_all(&ChecksumRecord::from_sort_key(key).encode())?;
+                let mut record = ChecksumRecord::from_sort_key(key);
+                record.lane = lanes[record.lane as usize];
+                out.write_all(&record.encode())?;
             }
             length += (keys.len() * CHECKSUM_BYTES) as u64;
             Ok(())
@@ -1149,7 +1223,7 @@ impl Writer {
         });
 
         let tail = Tail {
-            first_packet: self.first_packet,
+            first_packet,
             packets: self.count,
             entries: entries.len() as u32,
         };
@@ -1162,9 +1236,9 @@ impl Writer {
 
         // The name is free if no earlier segment holds it, including the
         // one this file had before, which stays until the commit.
-        let stem = match self.serial {
-            Some(serial) => format!("{}.{serial}", self.file_id),
-            None => self.file_id.to_string(),
+        let stem = match ids.serial {
+            Some(serial) => format!("{}.{serial}", ids.file_id),
+            None => ids.file_id.to_string(),
         };
         let name = (0..)
             .map(|n| match n {
@@ -1177,29 +1251,41 @@ impl Writer {
         // Renamed: the temporary file is gone, nothing to remove on drop.
         self.temp.path = PathBuf::new();
         File::open(&self.folder)?.sync_all()?;
-        let lanes = std::mem::take(&mut self.lanes).into_sorted();
+        let mut held: Vec<(u32, LaneStats)> = std::mem::take(&mut self.lanes)
+            .into_sorted()
+            .into_iter()
+            .map(|(own, mut s)| {
+                s.first_id += first_packet;
+                s.last_id += first_packet;
+                (lanes[own as usize], s)
+            })
+            .collect();
+        held.sort_unstable_by_key(|l| l.0);
         Ok(Some(Written {
             name,
-            first_packet: self.first_packet,
+            first_packet,
             last_packet,
             times,
             order_shift,
-            lanes,
+            lanes: held,
         }))
     }
 
     /// Writes one time clock's kept numbers and delays from their sorter,
     /// grouped by lane and series, with each group's buckets on the grid of
-    /// `shift` where they pay, and the groups. Returns the three entries.
+    /// `shift` where they pay, and the groups. The points come grouped by
+    /// the file's own lane numbers; the groups are written with the store's
+    /// (`lanes`), in order of those. Returns the three entries.
     fn series_sections(
         &mut self,
         clock: u8,
         shift: u32,
         sorter: Sorter<POINT_KEY_BYTES>,
+        lanes: &[u32],
     ) -> Result<[Entry; 3]> {
         let mut buckets = Spool::create(
             self.folder
-                .join(format!("{}.buckets{clock}.tmp", self.file_id)),
+                .join(format!("{}.buckets{clock}.tmp", self.stem)),
         )?;
         let mut groups: Vec<GroupRecord> = Vec::new();
         let mut open: Option<OpenGroup> = None;
@@ -1232,6 +1318,10 @@ impl Writer {
         if let Some(g) = open.take() {
             groups.push(g.close(&mut buckets)?);
         }
+        for g in &mut groups {
+            g.lane = lanes[g.lane as usize];
+        }
+        groups.sort_unstable_by_key(|g| (g.lane, g.series));
         self.at += written * POINT_BYTES as u64;
         let series = Entry {
             kind: KIND_SERIES,
@@ -1268,12 +1358,18 @@ impl Writer {
 
     /// Counts one clock's buckets on the grid of `shift` by reading
     /// `source` from end to end, and appends them.
-    fn bucket_section(&mut self, clock: u8, shift: u32, source: Entry) -> Result<Entry> {
+    fn bucket_section(
+        &mut self,
+        clock: u8,
+        shift: u32,
+        source: Entry,
+        first_packet: i64,
+    ) -> Result<Entry> {
         let start = self.at;
         let mut tally = Tally::new(shift);
         let file = self.temp.file.try_clone()?;
         let out = &mut self.out;
-        each_value(&file, self.first_packet, clock, source, |t, lane| {
+        each_value(&file, first_packet, clock, source, |t, lane| {
             tally.add(t, lane, 1, out)
         })?;
         tally.flush(out)?;

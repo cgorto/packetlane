@@ -35,7 +35,7 @@ pub const GROUP_MEMORY: usize = 1 << 16;
 /// Buffer for writing a temporary file, and for reading one back.
 const IO_BUFFER: usize = 64 << 10;
 
-/// A packet in a merged run: checksum, sequence count, length, lane, id.
+/// A packet in a merged run: checksum, sequence count, length, id, lane.
 const LOGGED_BYTES: usize = 30;
 /// A packet of one group: lane, id.
 const HELD_BYTES: usize = 12;

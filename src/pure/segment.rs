@@ -60,8 +60,9 @@
 //!
 //! Clocks are numbered 0 receive, 1 packet, 2 order.
 //!
-//! Sections in version 5 (version 4 had all but kinds 12 and 13; version 3
-//! not kind 11 either):
+//! Sections in version 6 (version 5 had the same sections, with kind 8 in
+//! the order of its groups and kind 11 ordered by lane before index;
+//! version 4 had all but kinds 12 and 13; version 3 not kind 11 either):
 //!
 //! - kind 1, packets: one 56-byte record per logged item, in id order;
 //!   packet id = first packet id + index. Record: receive time (i64), packet
@@ -115,7 +116,10 @@
 //!   packet): a 20-byte record (time i64, index u32, number f64) for every
 //!   value with a number on a packet with that time, and one for the
 //!   arrival delay of every packet with both times, in groups of one lane
-//!   and one series, each sorted by time and then index. A delay is the
+//!   and one series, each sorted by time and then index. The groups lie in
+//!   the order the file first met their lanes (the segment is written
+//!   before the store gives the lanes their ids), and are found through
+//!   kind 9, never by walking from one to the next. A delay is the
 //!   series [`DELAY`]; its number is milliseconds, worked out once as
 //!   SQLite does ([`delay_ms`]), so plotting it is the same as plotting a
 //!   kept field.
@@ -138,13 +142,14 @@
 //! - kind 11, checksum order: a 28-byte record for every logged item that
 //!   is a space packet (has a header): checksum (i64), length (i64), lane
 //!   (u32), index (u32), sequence count (u16), two zero bytes. Sorted by
-//!   checksum, sequence count, length, lane and index. The checksum comes
-//!   first because packets are matched across sources by it; the sequence
-//!   count and length come before the lane because the tracing of
-//!   interleaved streams matches on all three, so that the packets that
-//!   match lie together whatever their lanes and tracing needs no more than
-//!   a count per lane (see `pure::cross`). A run's
-//!   sections are merged in that order, with ids in place of indexes.
+//!   checksum, sequence count, length and index. The checksum comes first
+//!   because packets are matched across sources by it; the sequence count
+//!   and length come next because the tracing of interleaved streams
+//!   matches on all three, so that the packets that match lie together
+//!   whatever their lanes and tracing needs no more than a count per lane
+//!   (see `pure::cross`). The lane orders nothing, so that the order does
+//!   not depend on the ids the store gives lanes. A run's sections are
+//!   merged in that order, with ids in place of indexes.
 //!
 //! For `field_values` in order of value (version 5; earlier versions had
 //! none of these, and are not read):
@@ -170,7 +175,7 @@ use crate::pure::sql::Clock;
 
 pub const MAGIC: [u8; 8] = *b"PLSEGMNT";
 pub const TAIL_MAGIC: [u8; 8] = *b"PLSEGEND";
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 pub const PACKET_BYTES: usize = 56;
 pub const TIME_BYTES: usize = 16;
@@ -347,6 +352,11 @@ impl PacketRecord {
     /// The lane of an encoded record, without decoding the rest.
     pub fn lane_of(b: &[u8]) -> u32 {
         u32_at(b, 40)
+    }
+
+    /// Sets the lane of an encoded record.
+    pub fn set_lane(b: &mut [u8], lane: u32) {
+        b[40..44].copy_from_slice(&lane.to_le_bytes());
     }
 }
 
@@ -629,8 +639,8 @@ pub struct ChecksumRecord {
     pub sum: i64,
     pub seq: u16,
     pub length: i64,
-    pub lane: u32,
     pub index: u32,
+    pub lane: u32,
 }
 
 impl ChecksumRecord {
@@ -655,14 +665,15 @@ impl ChecksumRecord {
     }
 
     /// Bytes whose order is the section's order: checksum, sequence count,
-    /// length, lane, index.
+    /// length, index (the lane follows, and orders nothing:
+    /// no two records share an index).
     pub fn sort_key(&self) -> [u8; CHECKSUM_KEY_BYTES] {
         let mut b = [0u8; CHECKSUM_KEY_BYTES];
         b[0..8].copy_from_slice(&(((self.sum as u64) ^ (1 << 63)).to_be_bytes()));
         b[8..10].copy_from_slice(&self.seq.to_be_bytes());
         b[10..18].copy_from_slice(&(((self.length as u64) ^ (1 << 63)).to_be_bytes()));
-        b[18..22].copy_from_slice(&self.lane.to_be_bytes());
-        b[22..26].copy_from_slice(&self.index.to_be_bytes());
+        b[18..22].copy_from_slice(&self.index.to_be_bytes());
+        b[22..26].copy_from_slice(&self.lane.to_be_bytes());
         b
     }
 
@@ -676,8 +687,8 @@ impl ChecksumRecord {
             sum: flipped(0),
             seq: u16::from_be_bytes([b[8], b[9]]),
             length: flipped(10),
-            lane: u32::from_be_bytes([b[18], b[19], b[20], b[21]]),
-            index: u32::from_be_bytes([b[22], b[23], b[24], b[25]]),
+            index: u32::from_be_bytes([b[18], b[19], b[20], b[21]]),
+            lane: u32::from_be_bytes([b[22], b[23], b[24], b[25]]),
         }
     }
 }

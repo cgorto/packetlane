@@ -5,9 +5,10 @@
 use serde::Serialize;
 use serde::ser::Serializer;
 
-/// Layout 7: the segments hold their kept values in order of number too
-/// (segment format version 5); a store of an earlier layout is refused.
-pub const SCHEMA_VERSION: i64 = 7;
+/// Layout 8: segments of format version 6, whose sections do not depend on
+/// the ids the store gives lanes until the segment is finished; a store of
+/// an earlier layout is refused.
+pub const SCHEMA_VERSION: i64 = 8;
 
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS runs (
