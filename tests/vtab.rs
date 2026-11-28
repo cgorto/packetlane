@@ -765,3 +765,95 @@ fn the_file_holds_no_trace_of_the_tables() {
     assert!(err.to_string().contains("no such table"), "{err}");
     assert!(Path::new(&s.db()).exists());
 }
+
+/// A file read again after a reader listed the segments and before it
+/// opened them: the reader finds the listed segment gone, reads the list
+/// again and answers from the new one, for SQL and for the page's reads
+/// alike.
+#[test]
+fn a_segment_replaced_after_it_was_listed_is_read_from_a_new_list() {
+    use packetlane::pure::sql::Clock;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let s = stored();
+    let db = s.db();
+    let run = fs::canonicalize(s.0.join("a")).unwrap();
+    let dense = run.join("bench/dense.bin");
+    let original = fs::read(&dense).unwrap();
+    // Each time the hook is armed, the dense file is read again twice:
+    // shorter, then whole with its last byte changed, so that it ends as
+    // long as before but not the same. A name a reader listed must not
+    // come to mean the last of these.
+    let armed = Arc::new(AtomicBool::new(false));
+    let shorter = Arc::new(AtomicUsize::new(0));
+    let mut reader = s.reader();
+    // The connection learns the tables before the hook is set.
+    reader
+        .query_user("SELECT COUNT(*) FROM packets", 1)
+        .unwrap();
+    {
+        let (armed, shorter) = (Arc::clone(&armed), Arc::clone(&shorter));
+        let (db, run, dense) = (db.clone(), run.clone(), dense.clone());
+        reader.after_listing(Box::new(move || {
+            if !armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let k = shorter.fetch_add(1, Ordering::SeqCst);
+            let mut changed = original.clone();
+            if let Some(last) = changed.last_mut() {
+                *last = last.wrapping_add(k as u8 + 1);
+            }
+            for bytes in [&original[..original.len() * 2 / 3], &changed[..]] {
+                fs::write(&dense, bytes).unwrap();
+                let mut store = Store::open_with_oracle(&db).unwrap();
+                ingest_targets(&mut store, std::slice::from_ref(&run), None, None, None).unwrap();
+            }
+        }));
+    }
+    let fresh = || s.reader();
+    let sql = "SELECT COUNT(*), SUM(p.length), MAX(p.id), SUM(p.sum % 1000) FROM packets p JOIN files f ON f.id = p.file_id
+               WHERE f.rel = 'bench/dense.bin'";
+    armed.store(true, Ordering::SeqCst);
+    let got = reader.query_user(sql, 10).unwrap();
+    assert!(!armed.load(Ordering::SeqCst), "the file was not read again");
+    assert_eq!(
+        got.rows,
+        fresh()
+            .query_user(&sql.replace("packets", "oracle_packets"), 10)
+            .unwrap()
+            .rows
+    );
+
+    let (from, to) = (T0, T0 + 2_000_000_000);
+    type Read<'a> = Box<dyn Fn(&Store) -> Table + 'a>;
+    let reads: Vec<(&str, Read)> = vec![
+        (
+            "density",
+            Box::new(|r| r.packet_density(1, Clock::Receive, from, to, 50).unwrap()),
+        ),
+        (
+            "items",
+            Box::new(|r| r.packet_items(1, Clock::Packet, from, to, 100).unwrap()),
+        ),
+        (
+            "series",
+            Box::new(|r| {
+                r.series(1, Clock::Receive, 1, Some(("HK", "V")), from, to, 20)
+                    .unwrap()
+            }),
+        ),
+        ("detail", Box::new(|r| r.packet_detail(6_400).unwrap())),
+        ("values", Box::new(|r| r.packet_values(6_400).unwrap())),
+        ("findings", Box::new(|r| r.run_findings(1, 1000).unwrap())),
+    ];
+    for (name, read) in &reads {
+        armed.store(true, Ordering::SeqCst);
+        let got = read(&reader);
+        assert!(
+            !armed.load(Ordering::SeqCst),
+            "{name}: the file was not read again"
+        );
+        assert_eq!(got, read(&fresh()), "{name}");
+    }
+}

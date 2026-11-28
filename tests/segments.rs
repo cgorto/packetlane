@@ -1030,14 +1030,19 @@ fn damaged_kept_value_sections_are_errors_not_panics() {
         vec![],
     );
     let (first, lane) = (r[0][0], r[0][1]);
-    let name = format!(
-        "{}.seg",
-        ask(
-            &store,
-            "SELECT file_id FROM segments WHERE first_packet = ?",
-            vec![first.into()]
-        )[0][0]
-    );
+    let name = store
+        .query(
+            &Query::new(
+                "SELECT name FROM segments WHERE first_packet = ?",
+                vec![first.into()],
+            ),
+            1,
+        )
+        .unwrap()
+        .rows[0][0]
+        .text()
+        .unwrap()
+        .to_string();
     let path = folder.join(&name);
     let good = fs::read(&path).unwrap();
     let reads = |store: &Store| -> [bool; 4] {
@@ -1379,7 +1384,7 @@ fn a_file_read_again_after_it_grows_gets_a_new_segment() {
         segment_of("aa/early.bin"),
         segment_of("zz/late.bin"),
     );
-    assert_eq!(late_seg, format!("{late_id}.seg"));
+    assert!(late_seg.starts_with(&format!("{late_id}.")) && late_seg.ends_with(".seg"));
 
     let grow = |rel: &str, source: &mut Source, n: usize| {
         let mut bytes = fs::read(scratch.0.join("run").join(rel)).unwrap();
@@ -1395,19 +1400,23 @@ fn a_file_read_again_after_it_grows_gets_a_new_segment() {
         )[0][0]
     };
 
-    // The last file grows. It is given its old id again, so its new segment
-    // cannot take the old one's name while that is still listed.
+    // The last file grows. It is given its old id again, and its new
+    // segment a name of its own.
     grow("zz/late.bin", &mut late, 50);
     assert_eq!(file_id("zz/late.bin"), late_id);
-    assert_eq!(segment_of("zz/late.bin"), format!("{late_id}.1.seg"));
+    let second = segment_of("zz/late.bin");
+    assert_ne!(second, late_seg);
     assert!(!folder.join(&late_seg).exists());
     assert_eq!(files_in(&folder), listed(&store));
     assert_eq!(count("zz/late.bin"), 350);
     check_records(&scratch, &store);
 
-    // Again: now the plain name is free.
+    // Again: the first name is free, and is not taken again, so that no
+    // reader that listed it finds another segment under it.
     grow("zz/late.bin", &mut late, 1);
-    assert_eq!(segment_of("zz/late.bin"), format!("{late_id}.seg"));
+    assert_eq!(file_id("zz/late.bin"), late_id);
+    let third = segment_of("zz/late.bin");
+    assert!(third != late_seg && third != second, "{third}");
     assert_eq!(files_in(&folder), listed(&store));
 
     // A file in the middle grows: a new id, a new segment, the old one gone.

@@ -129,6 +129,9 @@ CREATE TABLE IF NOT EXISTS segment_lanes (
   PRIMARY KEY (lane_id, file_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS segment_lanes_file ON segment_lanes (file_id);
+-- Hands out the serial in each segment's name; AUTOINCREMENT never hands
+-- out a committed one again, so no name a reader listed is ever reused.
+CREATE TABLE IF NOT EXISTS segment_serial (id INTEGER PRIMARY KEY AUTOINCREMENT);
 DROP VIEW IF EXISTS value_view;
 CREATE VIEW value_view AS
   SELECT v.packet_id AS id, r.root AS run, l.source, f.rel AS file, p.apid, v.packet, v.field,
@@ -578,6 +581,10 @@ pub const INSERT_SEGMENT: &str = "INSERT INTO segments
      (file_id, name, first_packet, last_packet, receive_min, receive_max, receive_shift,
       packet_min, packet_max, packet_shift, order_shift)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+/// Takes a new serial for a segment's name: the row's id, read with
+/// `last_insert_rowid`, then [`DROP_SEGMENT_SERIAL`].
+pub const NEXT_SEGMENT_SERIAL: &str = "INSERT INTO segment_serial DEFAULT VALUES";
+pub const DROP_SEGMENT_SERIAL: &str = "DELETE FROM segment_serial";
 /// The segment of one file, if it has one. Columns: name.
 pub const FILE_SEGMENT: &str = "SELECT name FROM segments WHERE file_id = ?";
 /// The segments of a run's files. Columns: name.

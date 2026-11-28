@@ -47,6 +47,8 @@ pub struct Store {
     oracle: bool,
     /// What the tables `packets` and `field_values` on this connection read.
     shared: Arc<vtab::Shared>,
+    /// See [`Store::after_listing`].
+    after_listing: Option<Box<dyn Fn() + Send>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -209,6 +211,7 @@ impl Store {
             segments,
             oracle: false,
             shared,
+            after_listing: None,
         })
     }
 
@@ -251,11 +254,20 @@ impl Store {
             segments,
             oracle: false,
             shared,
+            after_listing: None,
         })
     }
 
     /// Runs one of the tool's own statements.
     pub fn query(&self, q: &Query, limit: usize) -> Result<Table> {
+        // A statement on a connection that has never named `packets` or
+        // `field_values` needs no list of segments, nor a transaction.
+        {
+            let mut stmt = self.conn.prepare_cached(&q.sql)?;
+            if !self.shared.used() {
+                return collect(&mut stmt, &q.params, limit);
+            }
+        }
         self.with_segments(|| {
             let mut stmt = self.conn.prepare_cached(&q.sql)?;
             if self.shared.used() && !self.shared.loaded() {
@@ -277,26 +289,15 @@ impl Store {
         let mut retried = false;
         loop {
             self.shared.forget();
-            let own = self.conn.is_autocommit();
-            if own {
-                self.conn.execute_batch("BEGIN")?;
-            }
-            let result = (|| {
+            let result = self.in_read_transaction(|| {
                 if self.shared.used() {
                     self.shared.load(&self.conn)?;
                 }
+                self.listed_now();
                 run()
-            })();
+            });
             let stale = self.shared.take_stale();
             self.shared.forget();
-            if own && !self.conn.is_autocommit() {
-                let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
-                if let Err(e) = self.conn.execute_batch(end)
-                    && result.is_ok()
-                {
-                    return Err(e.into());
-                }
-            }
             match result {
                 Err(_) if stale && !retried => retried = true,
                 other => return other,
@@ -304,10 +305,127 @@ impl Store {
         }
     }
 
+    /// Runs a read of the segment files, all its statements in one read
+    /// transaction, and once more if a segment it listed turned out to have
+    /// been replaced meanwhile ([`segment::Stale`]): the list is read again,
+    /// and finds the new one.
+    fn again_if_stale<T>(&self, read: impl Fn() -> Result<T>) -> Result<T> {
+        match self.in_read_transaction(&read) {
+            Err(e) if e.is::<segment::Stale>() => self.in_read_transaction(read),
+            other => other,
+        }
+    }
+
+    /// Runs `f` in a read transaction of its own, unless one is open, so
+    /// that every statement in it sees the store as it was when the first
+    /// one started.
+    fn in_read_transaction<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let own = self.conn.is_autocommit();
+        if own {
+            self.conn.execute_batch("BEGIN")?;
+        }
+        let result = f();
+        if own && !self.conn.is_autocommit() {
+            let end = if result.is_ok() { "COMMIT" } else { "ROLLBACK" };
+            if let Err(e) = self.conn.execute_batch(end)
+                && result.is_ok()
+            {
+                return Err(e.into());
+            }
+        }
+        result
+    }
+
+    /// Calls the hook a test set with [`Store::after_listing`], if any.
+    fn listed_now(&self) {
+        if let Some(hook) = &self.after_listing {
+            hook();
+        }
+    }
+
+    /// For tests: something to do each time segments have been listed and
+    /// before they are opened, such as replacing one, to show what a
+    /// reader does when that happens between the two.
+    #[doc(hidden)]
+    pub fn after_listing(&mut self, hook: Box<dyn Fn() + Send>) {
+        self.after_listing = Some(hook);
+    }
+
     /// Packet counts per lane and bucket over a window, from the segment
     /// files, by the rule in `pure::segment::plan`. Columns: lane, bucket,
     /// count; one row per lane and bucket.
     pub fn packet_density(
+        &self,
+        run: i64,
+        clock: sql::Clock,
+        from: i64,
+        to: i64,
+        buckets: i64,
+    ) -> Result<Table> {
+        self.again_if_stale(|| self.packet_density_once(run, clock, from, to, buckets))
+    }
+
+    /// Individual packets in a window, as `oracle::packet_items` had them
+    /// (columns: id, lane, time, seq, length), from the segment files: at
+    /// most `limit`, in order of time and then id, `truncated` if there
+    /// were more.
+    pub fn packet_items(
+        &self,
+        run: i64,
+        clock: sql::Clock,
+        from: i64,
+        to: i64,
+        limit: usize,
+    ) -> Result<Table> {
+        self.again_if_stale(|| self.packet_items_once(run, clock, from, to, limit))
+    }
+
+    /// One lane's kept field (packet name and field name), or its arrival
+    /// delay in milliseconds if `field` is `None`, over a window in
+    /// `buckets` buckets (columns: bucket, min, max, count), from the
+    /// segment files.
+    #[allow(clippy::too_many_arguments)]
+    pub fn series(
+        &self,
+        run: i64,
+        clock: sql::Clock,
+        lane: i64,
+        field: Option<(&str, &str)>,
+        from: i64,
+        to: i64,
+        buckets: i64,
+    ) -> Result<Table> {
+        self.again_if_stale(|| self.series_once(run, clock, lane, field, from, to, buckets))
+    }
+
+    /// One packet, as `oracle::packet_detail` had it: its record from its
+    /// segment file, its file and source from the store. No rows if there
+    /// is no such packet.
+    pub fn packet_detail(&self, id: i64) -> Result<Table> {
+        self.again_if_stale(|| self.packet_detail_once(id))
+    }
+
+    /// A packet's kept values, as its `field_values` rows have them
+    /// (columns: packet, field, num, text), in the order they were kept,
+    /// from its segment file.
+    pub fn packet_values(&self, id: i64) -> Result<Table> {
+        self.again_if_stale(|| self.packet_values_once(id))
+    }
+
+    /// A run's findings, as `oracle::run_findings` had them (columns: id,
+    /// severity, kind, message, lane, file, packet, the packet's receive
+    /// and packet time, the file's rel), in its order: problems first, then
+    /// by the packet's time (receive, else packet, else its id), then by
+    /// id. The times come from the segment files. At most `limit`,
+    /// `truncated` if there were more.
+    pub fn run_findings(&self, run: i64, limit: usize) -> Result<Table> {
+        self.again_if_stale(|| self.run_findings_once(run, limit))
+    }
+
+    /// Packet counts per lane and bucket over a window, from the segment
+    /// files, by the rule in `pure::segment::plan`. Columns: lane, bucket,
+    /// count; one row per lane and bucket.
+    fn packet_density_once(
         &self,
         run: i64,
         clock: sql::Clock,
@@ -340,6 +458,7 @@ impl Store {
         to: i64,
     ) -> Result<Vec<segment::Listed>> {
         let listed = self.query(&sql::segments_in_window(run, clock, from, to), usize::MAX)?;
+        self.listed_now();
         Ok(listed
             .rows
             .iter()
@@ -358,7 +477,7 @@ impl Store {
     /// (columns: id, lane, time, seq, length), from the segment files: at
     /// most `limit`, in order of time and then id, `truncated` if there
     /// were more.
-    pub fn packet_items(
+    fn packet_items_once(
         &self,
         run: i64,
         clock: sql::Clock,
@@ -402,7 +521,7 @@ impl Store {
     /// `buckets` buckets, as `sql::series` and `sql::merge_series` have it
     /// (columns: bucket, min, max, count), from the segment files.
     #[allow(clippy::too_many_arguments)]
-    pub fn series(
+    fn series_once(
         &self,
         run: i64,
         clock: sql::Clock,
@@ -439,6 +558,7 @@ impl Store {
     /// segment holds it.
     fn packet_segment(&self, id: i64) -> Result<Option<(segment::Segment, u64, Vec<Cell>)>> {
         let found = self.query(&sql::packet_segment(id), 1)?;
+        self.listed_now();
         let Some(row) = found.rows.into_iter().next() else {
             return Ok(None);
         };
@@ -459,7 +579,7 @@ impl Store {
     /// One packet, as `oracle::packet_detail` had it: its record from its
     /// segment file, its file and source from the store. No rows if there
     /// is no such packet.
-    pub fn packet_detail(&self, id: i64) -> Result<Table> {
+    fn packet_detail_once(&self, id: i64) -> Result<Table> {
         let columns = [
             "id",
             "idx",
@@ -532,7 +652,7 @@ impl Store {
     /// A packet's kept values, as its `field_values` rows have them
     /// (columns: packet, field, num, text), in the order they were kept,
     /// from its segment file.
-    pub fn packet_values(&self, id: i64) -> Result<Table> {
+    fn packet_values_once(&self, id: i64) -> Result<Table> {
         let mut table = Table {
             columns: ["packet", "field", "num", "text"]
                 .map(str::to_string)
@@ -560,11 +680,12 @@ impl Store {
     /// by the packet's time (receive, else packet, else its id), then by
     /// id. The times come from the segment files. At most `limit`,
     /// `truncated` if there were more.
-    pub fn run_findings(&self, run: i64, limit: usize) -> Result<Table> {
+    fn run_findings_once(&self, run: i64, limit: usize) -> Result<Table> {
         // First what they are ordered by, which is small whatever their
         // messages; then the text of the ones shown.
         let keys = self.query(&sql::run_finding_keys(run), usize::MAX)?;
         let ranges = self.query(&sql::run_segment_ranges(run), usize::MAX)?;
+        self.listed_now();
         let ranges: Vec<segment::Listed> = ranges
             .rows
             .iter()
@@ -928,7 +1049,11 @@ impl Store {
             Some(decoder) => {
                 // Created after the file's row, inside its transaction, so
                 // that no other writer can be sweeping the folder meanwhile.
-                let mut writer = Writer::create(&self.segments, file_id, first_packet)?;
+                tx.execute(sql::NEXT_SEGMENT_SERIAL, [])?;
+                let serial = tx.last_insert_rowid();
+                tx.execute(sql::DROP_SEGMENT_SERIAL, [])?;
+                let mut writer =
+                    Writer::create(&self.segments, file_id, first_packet)?.with_serial(serial);
                 let (packets, note) = ingest_packets(
                     &tx,
                     &mut file,

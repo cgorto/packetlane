@@ -5,20 +5,21 @@
 //!
 //! # Where they are
 //!
-//! Every packet file ingested gets one segment, written alongside its rows in
-//! SQLite, in a folder beside the store named after it: the store
-//! `packetlane.db` keeps its segments in `packetlane.db.seg/`. A segment is
-//! never changed once written. A file that is read again gets a new segment
-//! and the old one is removed. Text logs get none.
+//! Every packet file ingested gets one segment, in a folder beside the store
+//! named after it: the store `packetlane.db` keeps its segments in
+//! `packetlane.db.seg/`. A segment is never changed once written. A file
+//! that is read again gets a new segment and the old one is removed. Text
+//! logs get none. The tables `packets` and `field_values` that SQL sees are
+//! read from them (see `shell::vtab`).
 //!
 //! The `segments` table in the store (see `sql::SCHEMA`) has one row per
 //! segment: the file it was read from, its file name in the folder, its first
 //! and last packet id, and for each clock its lowest and highest value and the
 //! shift of its bucket grid. Readers prune with that row and open only the
-//! segments a window touches. The file name is usually `<file id>.seg`; it is
-//! `<file id>.<n>.seg` when a file that is read again is given the id its
-//! earlier version had (SQLite hands out the highest id plus one), because
-//! the earlier segment must stay in place until the new one is committed.
+//! segments a window touches. The file name is `<file id>.<serial>.seg`, with
+//! a serial the store hands out once (`segment_serial`), so that a name never
+//! comes to mean another segment, even when a file read again is given the
+//! id its earlier version had (SQLite hands out the highest id plus one).
 //!
 //! # Writing order
 //!
@@ -29,10 +30,13 @@
 //! and the file after the commit. A segment with no row (left by a crash) is
 //! removed the next time the store is opened for writing.
 //!
-//! Known limitation, for a later milestone: a reader that loaded the
-//! `segments` rows before a segment was replaced finds the file missing, or
-//! finds a file whose first packet differs from its row, and fails. The fix
-//! is to read the rows again and retry.
+//! A reader reads the `segments` rows and everything else it needs from
+//! SQLite in one read transaction. If a segment it listed was replaced after
+//! that transaction started, it finds the file gone, or a file that is not
+//! the one listed (its first packet or count differs): it ends the transaction,
+//! reads the rows again in a new one and tries once more; a second failure
+//! is an error. That holds for the page's reads and for SQL over `packets`
+//! and `field_values` alike (see `shell::vtab`).
 //!
 //! # Layout
 //!

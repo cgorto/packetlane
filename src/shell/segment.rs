@@ -312,6 +312,8 @@ pub struct Written {
 pub struct Writer {
     folder: PathBuf,
     file_id: i64,
+    /// Part of the name, if given: see [`Writer::with_serial`].
+    serial: Option<i64>,
     first_packet: i64,
     temp: TempFile,
     out: BufWriter<File>,
@@ -433,6 +435,15 @@ impl Writer {
         Writer::with_chunk(folder, file_id, first_packet, SORT_CHUNK)
     }
 
+    /// Names the segment `<file id>.<serial>.seg` instead of
+    /// `<file id>.seg`. The store gives each segment a serial it never gives
+    /// again, so that a name a reader has listed never comes to mean
+    /// another segment.
+    pub fn with_serial(mut self, serial: i64) -> Writer {
+        self.serial = Some(serial);
+        self
+    }
+
     /// As [`Writer::create`], with sorters that hold `chunk` records.
     pub fn with_chunk(
         folder: &Path,
@@ -457,6 +468,7 @@ impl Writer {
         Ok(Writer {
             folder: folder.to_path_buf(),
             file_id,
+            serial: None,
             first_packet,
             temp,
             out,
@@ -768,10 +780,14 @@ impl Writer {
 
         // The name is free if no earlier segment holds it, including the
         // one this file had before, which stays until the commit.
+        let stem = match self.serial {
+            Some(serial) => format!("{}.{serial}", self.file_id),
+            None => self.file_id.to_string(),
+        };
         let name = (0..)
             .map(|n| match n {
-                0 => format!("{}.seg", self.file_id),
-                n => format!("{}.{n}.seg", self.file_id),
+                0 => format!("{stem}.seg"),
+                n => format!("{stem}.{n}.seg"),
             })
             .find(|name| !self.folder.join(name).exists())
             .ok_or("no free segment name")?;
@@ -1701,11 +1717,33 @@ pub fn density(
     Ok(counts.rows())
 }
 
-/// Opens a listed segment, checking it is still the one listed.
+/// A listed segment that is gone, or is not the one listed: its file was
+/// read again, and the segment replaced, after the list was read. Reading
+/// the list again finds the new one.
+#[derive(Debug)]
+pub struct Stale(pub String);
+
+impl std::fmt::Display for Stale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Stale {}
+
+/// Opens a listed segment, checking it is still the one listed; [`Stale`]
+/// if it is not.
 pub fn open_listed(folder: &Path, s: &Listed) -> Result<Segment> {
-    let segment = Segment::open(&folder.join(&s.name))?;
+    let path = folder.join(&s.name);
+    let segment = match Segment::open(&path) {
+        Ok(segment) => segment,
+        Err(_) if !path.exists() => {
+            return Err(Stale(format!("{}: gone since it was listed", s.name)).into());
+        }
+        Err(e) => return Err(e),
+    };
     if segment.first_packet() != s.first_packet {
-        return Err(format!("{}: replaced since it was listed", s.name).into());
+        return Err(Stale(format!("{}: replaced since it was listed", s.name)).into());
     }
     Ok(segment)
 }
