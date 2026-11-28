@@ -1077,6 +1077,7 @@ unsafe impl<'vtab> VTab<'vtab> for PacketsTab {
                 bounds: None,
                 row: None,
                 block: None,
+                plan: None,
             })
         })
     }
@@ -1498,6 +1499,9 @@ struct PacketsCursor {
     bounds: Option<PacketBounds>,
     row: Option<PacketRow>,
     block: Option<Block>,
+    /// The plan's constraints as last decoded, and the text they came from:
+    /// a join looks packets up with the same plan once a row.
+    plan: Option<(String, Vec<(char, Op)>)>,
 }
 
 impl PacketsCursor {
@@ -1714,7 +1718,12 @@ impl PacketsCursor {
 unsafe impl VTabCursor for PacketsCursor {
     fn filter(&mut self, plan: c_int, idx_str: Option<&str>, args: &Filters<'_>) -> VResult<()> {
         guard(|| {
-            let b = PacketBounds::read(&decode_plan(idx_str), args);
+            let text = idx_str.unwrap_or("");
+            if self.plan.as_ref().is_none_or(|(t, _)| t != text) {
+                self.plan = Some((text.to_string(), decode_plan(idx_str)));
+            }
+            let constraints = self.plan.as_ref().map_or(&[][..], |(_, p)| p.as_slice());
+            let b = PacketBounds::read(constraints, args);
             self.start(Access::decode(plan), b)
         })
     }
