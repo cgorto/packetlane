@@ -36,11 +36,14 @@ const CHECKSUM_CHUNK: usize = (1 << 20) / CHECKSUM_KEY_BYTES;
 /// Buffer for each of the temporary files kept values and their texts are
 /// written to.
 const SPOOL_BUFFER: usize = 64 << 10;
-/// Most sorted runs merged at once. More are merged in passes, so open
-/// files and buffers stay the same however long the input.
-const FAN_IN: usize = 32;
-/// Buffer each sorted run is read through while merging.
-const RUN_BUFFER: usize = 32 << 10;
+/// Most sorted runs merged at once. More are merged in passes, the
+/// smallest first, so buffers stay the same however long the input.
+const FAN_IN: usize = 128;
+/// What the buffers of the runs being merged hold in all: each run gets
+/// an equal share, at least [`MIN_RUN_BUFFER`] and at most [`IO_BUFFER`],
+/// so at most 2 MB however many runs (128 of 16 KB).
+const MERGE_MEMORY: usize = 2 << 20;
+const MIN_RUN_BUFFER: usize = 16 << 10;
 /// Buffer for writing, and for reading a section from end to end.
 const IO_BUFFER: usize = 256 << 10;
 /// Buffer for scanning a range of a section.
@@ -171,74 +174,263 @@ impl<'a, const N: usize> RangeReader<'a, N> {
     }
 }
 
-/// Merges sorted runs of one file into one sorted stream.
-struct Merger<'a, const N: usize> {
-    readers: Vec<RangeReader<'a, N>>,
-    heap: BinaryHeap<Reverse<([u8; N], usize)>>,
+/// Reads one sorted run of a sorter's temporary files through a buffer of
+/// records, for merging: the records ready are handed out as a slice.
+struct RunReader<'a, const N: usize> {
+    file: &'a File,
+    next: u64,
+    end: u64,
+    /// Records per read.
+    cap: usize,
+    buf: Vec<[u8; N]>,
+    at: usize,
 }
 
-impl<'a, const N: usize> Merger<'a, N> {
-    fn new(file: &'a File, runs: &[(u64, u64)]) -> Result<Self> {
-        let mut readers = Vec::with_capacity(runs.len());
-        let mut heap = BinaryHeap::with_capacity(runs.len());
-        for (i, &(start, len)) in runs.iter().enumerate() {
-            let mut r = RangeReader::new(file, start, start + len, RUN_BUFFER);
-            if let Some(first) = r.read()? {
-                heap.push(Reverse((first, i)));
-            }
-            readers.push(r);
+impl<'a, const N: usize> RunReader<'a, N> {
+    fn new(file: &'a File, start: u64, end: u64, buffer: usize) -> Self {
+        RunReader {
+            file,
+            next: start,
+            end,
+            cap: (buffer / N).max(1),
+            buf: Vec::new(),
+            at: 0,
         }
-        Ok(Merger { readers, heap })
     }
 
-    fn next(&mut self) -> Result<Option<[u8; N]>> {
-        let Some(Reverse((record, i))) = self.heap.pop() else {
-            return Ok(None);
-        };
-        if let Some(next) = self.readers[i].read()? {
-            self.heap.push(Reverse((next, i)));
+    /// The records read and not yet taken; empty once the run is done.
+    fn ready(&mut self) -> Result<&[[u8; N]]> {
+        if self.at >= self.buf.len() {
+            let left = self.end.saturating_sub(self.next) / N as u64;
+            let want = left.min(self.cap as u64) as usize;
+            self.buf.resize(want, [0; N]);
+            self.at = 0;
+            if want > 0 {
+                self.file
+                    .read_exact_at(self.buf.as_flattened_mut(), self.next)?;
+                self.next += (want * N) as u64;
+            }
         }
-        Ok(Some(record))
+        Ok(&self.buf[self.at..])
     }
+}
+
+/// Hands the records of sorted `runs` to `out` in order, slice by slice.
+/// The run with the lowest next record gives every record up to the next
+/// record of any other run in one slice, so that runs which do not
+/// overlap, or groups of records that lie together in every run, cost a
+/// comparison of a few bytes each and no work on the heap.
+fn merge_runs<const N: usize>(
+    files: &[Option<TempFile>],
+    runs: &[Run<N>],
+    mut out: impl FnMut(&[[u8; N]]) -> Result<()>,
+) -> Result<()> {
+    let buffer = (MERGE_MEMORY / runs.len().max(1)).clamp(MIN_RUN_BUFFER, IO_BUFFER);
+    let mut readers = Vec::with_capacity(runs.len());
+    for r in runs {
+        let file = files
+            .get(r.file)
+            .and_then(Option::as_ref)
+            .ok_or("sorter has no file")?;
+        readers.push(RunReader::<N>::new(
+            &file.file,
+            r.start,
+            r.start + r.len,
+            buffer,
+        ));
+    }
+    let mut heap = BinaryHeap::with_capacity(runs.len());
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(&head) = reader.ready()?.first() {
+            heap.push(Reverse((head, i)));
+        }
+    }
+    while let Some(Reverse((_, i))) = heap.pop() {
+        let bound = heap.peek().map(|Reverse((head, _))| *head);
+        let reader = &mut readers[i];
+        loop {
+            let ready = reader.ready()?;
+            if ready.is_empty() {
+                break;
+            }
+            let n = match &bound {
+                None => ready.len(),
+                Some(b) => ready.partition_point(|r| r <= b),
+            };
+            out(&ready[..n])?;
+            let next = ready.get(n).copied();
+            reader.at += n;
+            if let Some(next) = next {
+                heap.push(Reverse((next, i)));
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How a sorter puts one chunk in order before writing it as a run. All
+/// give the order of the records' bytes; they differ in what input they
+/// are quick for. A chunk already in order is left as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkOrder {
+    /// A comparison sort.
+    Compare,
+    /// Records interleaved from groups named by their first eight bytes,
+    /// each group arriving in order or nearly: a stable sort by group, then
+    /// a sort of each group that is not in order.
+    Grouped,
+    /// Records whose first two bytes are spread evenly: a radix sort on
+    /// those two bytes, then a sort of each set of records sharing them.
+    Radix,
+}
+
+/// The group of a record sorted [`ChunkOrder::Grouped`].
+fn group_of<const N: usize>(r: &[u8; N]) -> u64 {
+    r.first_chunk::<8>().map_or(0, |b| u64::from_be_bytes(*b))
+}
+
+/// Puts `buf` in the order of its records' bytes. [`ChunkOrder::Grouped`]
+/// and [`ChunkOrder::Radix`] take a scratch buffer as large as `buf` for
+/// the time they run.
+fn order_chunk<const N: usize>(how: ChunkOrder, buf: &mut Vec<[u8; N]>) {
+    if buf.is_sorted() {
+        return;
+    }
+    match how {
+        ChunkOrder::Grouped if N >= 8 => {
+            buf.sort_by_key(group_of);
+            let mut rest = &mut buf[..];
+            while let Some(first) = rest.first() {
+                let g = group_of(first);
+                let n = rest.partition_point(|r| group_of(r) == g);
+                let (part, after) = rest.split_at_mut(n);
+                if !part.is_sorted() {
+                    part.sort_unstable();
+                }
+                rest = after;
+            }
+        }
+        ChunkOrder::Radix if N >= 2 => {
+            let mut scratch = vec![[0u8; N]; buf.len()];
+            for byte in [1, 0] {
+                let mut starts = [0usize; 257];
+                for r in buf.iter() {
+                    starts[usize::from(r[byte]) + 1] += 1;
+                }
+                for i in 0..256 {
+                    starts[i + 1] += starts[i];
+                }
+                for r in buf.iter() {
+                    let slot = &mut starts[usize::from(r[byte])];
+                    scratch[*slot] = *r;
+                    *slot += 1;
+                }
+                std::mem::swap(buf, &mut scratch);
+            }
+            drop(scratch);
+            let mut rest = &mut buf[..];
+            while let Some(first) = rest.first() {
+                let lead = [first[0], first[1]];
+                let n = rest.partition_point(|r| r[..2] == lead);
+                let (part, after) = rest.split_at_mut(n);
+                if n > 1 {
+                    part.sort_unstable();
+                }
+                rest = after;
+            }
+        }
+        _ => buf.sort_unstable(),
+    }
+}
+
+/// One sorted run: where it lies in which temporary file, and its last
+/// record.
+#[derive(Debug, Clone, Copy)]
+struct Run<const N: usize> {
+    file: usize,
+    start: u64,
+    len: u64,
+    last: [u8; N],
 }
 
 /// Sorts fixed-width records whose byte order is their sort order, holding
-/// at most `chunk` of them in memory. Each full chunk is sorted and written
-/// to a temporary file as a run; the runs are merged at the end, at most
-/// `fan_in` at a time. Temporary files are removed when it is dropped,
-/// whether or not it finished.
+/// at most `chunk` of them in memory. Each full chunk is put in order and
+/// written out. What sorting costs follows how far the input is from
+/// order: the part of a chunk that comes after everything written so far
+/// extends one long run, in a file of its own; the rest extends the last
+/// of the other runs if it comes after it, or starts a new one. Input in
+/// order is one run, read back as it was written; a few late records make
+/// a few short runs. The runs are merged at the end, at most `fan_in` at a
+/// time, the smallest first. Temporary files are removed when it is
+/// dropped, whether or not it finished.
 pub struct Sorter<const N: usize> {
     stem: PathBuf,
     chunk: usize,
     fan_in: usize,
+    how: ChunkOrder,
     buf: Vec<[u8; N]>,
-    spill: Option<TempFile>,
-    runs: Vec<(u64, u64)>,
-    written: u64,
-    passes: u32,
+    /// Temporary files by number, and how long each is: 0 holds the long
+    /// run, 1 the others, later ones what merging passes write. A file is
+    /// closed and removed once no run lies in it.
+    files: Vec<Option<TempFile>>,
+    ends: Vec<u64>,
+    runs: Vec<Run<N>>,
+    /// The long run, and the last run of file 1.
+    main: Option<usize>,
+    tail: Option<usize>,
+    names: u32,
 }
 
 impl<const N: usize> Sorter<N> {
     /// Temporary files are named from `stem` (a path) plus a number and
-    /// `.tmp`.
+    /// `.tmp`. Chunks are put in order by comparison; see
+    /// [`Sorter::ordered`].
     pub fn new(stem: PathBuf, chunk: usize, fan_in: usize) -> Self {
         Sorter {
             stem,
             chunk: chunk.max(1),
             fan_in: fan_in.max(2),
+            how: ChunkOrder::Compare,
             buf: Vec::new(),
-            spill: None,
+            files: Vec::new(),
+            ends: Vec::new(),
             runs: Vec::new(),
-            written: 0,
-            passes: 0,
+            main: None,
+            tail: None,
+            names: 0,
         }
     }
 
+    /// Puts chunks in order the way `how` says.
+    pub fn ordered(mut self, how: ChunkOrder) -> Self {
+        self.how = how;
+        self
+    }
+
     fn temp(&mut self) -> Result<TempFile> {
-        self.passes += 1;
+        self.names += 1;
         let mut name = self.stem.clone().into_os_string();
-        name.push(format!(".{}.tmp", self.passes));
+        name.push(format!(".{}.tmp", self.names));
         TempFile::create(PathBuf::from(name))
+    }
+
+    /// Writes `records` at the end of file `slot`, creating the files up
+    /// to it if need be; returns where they start.
+    fn append(&mut self, slot: usize, records: &[[u8; N]]) -> Result<u64> {
+        while self.files.len() <= slot {
+            let temp = self.temp()?;
+            self.files.push(Some(temp));
+            self.ends.push(0);
+        }
+        let Some(temp) = &self.files[slot] else {
+            return Err("sorter has no file".into());
+        };
+        let start = self.ends[slot];
+        let bytes = records.as_flattened();
+        temp.file.write_all_at(bytes, start)?;
+        self.ends[slot] += bytes.len() as u64;
+        Ok(start)
     }
 
     pub fn push(&mut self, record: [u8; N]) -> Result<()> {
@@ -256,68 +448,114 @@ impl<const N: usize> Sorter<N> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        self.buf.sort_unstable();
-        if self.spill.is_none() {
-            let temp = self.temp()?;
-            self.spill = Some(temp);
-        }
-        let Some(temp) = &self.spill else {
-            return Err("sorter has no file".into());
+        let mut buf = std::mem::take(&mut self.buf);
+        order_chunk(self.how, &mut buf);
+        let result = self.write_chunk(&buf);
+        buf.clear();
+        self.buf = buf;
+        result
+    }
+
+    /// Writes a chunk in order: what comes after the long run extends it,
+    /// the rest extends or follows the last other run.
+    fn write_chunk(&mut self, buf: &[[u8; N]]) -> Result<()> {
+        let split = match self.main {
+            Some(m) => buf.partition_point(|r| *r < self.runs[m].last),
+            None => 0,
         };
-        let bytes = self.buf.as_flattened();
-        temp.file.write_all_at(bytes, self.written)?;
-        self.runs.push((self.written, bytes.len() as u64));
-        self.written += bytes.len() as u64;
-        self.buf.clear();
+        let (before, after) = buf.split_at(split);
+        if let Some(&last) = after.last() {
+            let start = self.append(0, after)?;
+            let len = after.as_flattened().len() as u64;
+            match self.main {
+                Some(m) => {
+                    self.runs[m].len += len;
+                    self.runs[m].last = last;
+                }
+                None => {
+                    self.main = Some(self.runs.len());
+                    self.runs.push(Run {
+                        file: 0,
+                        start,
+                        len,
+                        last,
+                    });
+                }
+            }
+        }
+        if let (Some(first), Some(&last)) = (before.first(), before.last()) {
+            let start = self.append(1, before)?;
+            let len = before.as_flattened().len() as u64;
+            match self.tail {
+                Some(t) if self.runs[t].last <= *first => {
+                    self.runs[t].len += len;
+                    self.runs[t].last = last;
+                }
+                _ => {
+                    self.tail = Some(self.runs.len());
+                    self.runs.push(Run {
+                        file: 1,
+                        start,
+                        len,
+                        last,
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
-    /// Hands every record to `out`, in order. Returns the most sorted runs
-    /// that were merged at once.
-    pub fn finish(mut self, mut out: impl FnMut([u8; N]) -> Result<()>) -> Result<usize> {
+    /// Hands every record to `out`, in order, a slice at a time. Returns
+    /// the most sorted runs that were merged at once.
+    pub fn finish(mut self, mut out: impl FnMut(&[[u8; N]]) -> Result<()>) -> Result<usize> {
         if self.runs.is_empty() {
-            self.buf.sort_unstable();
-            for record in std::mem::take(&mut self.buf) {
-                out(record)?;
+            let mut buf = std::mem::take(&mut self.buf);
+            order_chunk(self.how, &mut buf);
+            if !buf.is_empty() {
+                out(&buf)?;
             }
             return Ok(0);
         }
         self.spill()?;
         self.buf = Vec::new();
         let mut widest = 0;
-        // Merge groups of runs into longer runs until few enough are left.
+        // Merge the smallest runs into one until few enough are left:
+        // just enough of them that `fan_in` remain, at most `fan_in` at once.
         while self.runs.len() > self.fan_in {
-            let Some(from) = self.spill.take() else {
-                return Err("sorter has no file".into());
-            };
+            let k = (self.runs.len() - self.fan_in + 1).min(self.fan_in);
+            widest = widest.max(k);
+            self.runs.sort_by_key(|r| r.len);
+            let group: Vec<Run<N>> = self.runs.drain(..k).collect();
             let to = self.temp()?;
-            let mut runs = Vec::new();
             let mut writer = BufWriter::with_capacity(IO_BUFFER, &to.file);
-            let mut at = 0u64;
-            for group in self.runs.chunks(self.fan_in) {
-                widest = widest.max(group.len());
-                let mut merge = Merger::<N>::new(&from.file, group)?;
-                let start = at;
-                while let Some(record) = merge.next()? {
-                    writer.write_all(&record)?;
-                    at += N as u64;
+            let mut len = 0u64;
+            let mut last = [0u8; N];
+            merge_runs(&self.files, &group, |records| {
+                writer.write_all(records.as_flattened())?;
+                len += records.as_flattened().len() as u64;
+                if let Some(&r) = records.last() {
+                    last = r;
                 }
-                runs.push((start, at - start));
-            }
+                Ok(())
+            })?;
             writer.flush()?;
             drop(writer);
-            drop(from);
-            self.runs = runs;
-            self.spill = Some(to);
+            self.files.push(Some(to));
+            self.ends.push(len);
+            self.runs.push(Run {
+                file: self.files.len() - 1,
+                start: 0,
+                len,
+                last,
+            });
+            for (i, file) in self.files.iter_mut().enumerate() {
+                if !self.runs.iter().any(|r| r.file == i) {
+                    *file = None;
+                }
+            }
         }
-        let Some(file) = &self.spill else {
-            return Err("sorter has no file".into());
-        };
         widest = widest.max(self.runs.len());
-        let mut merge = Merger::<N>::new(&file.file, &self.runs)?;
-        while let Some(record) = merge.next()? {
-            out(record)?;
-        }
+        merge_runs(&self.files, &self.runs, out)?;
         Ok(widest)
     }
 }
@@ -495,6 +733,7 @@ impl Writer {
                 chunk
             };
             Sorter::new(folder.join(format!("{file_id}.{clock}")), chunk, FAN_IN)
+                .ordered(ChunkOrder::Grouped)
         };
         let spool = |what: &str| Spool::create(folder.join(format!("{file_id}.{what}.tmp")));
         Ok(Writer {
@@ -517,15 +756,18 @@ impl Writer {
             points: vec![points("receive-kept"), points("packet-kept")],
             current: None,
             lanes: HashMap::new(),
-            sums: Some(Sorter::new(
-                folder.join(format!("{file_id}.sums")),
-                if chunk == SORT_CHUNK {
-                    CHECKSUM_CHUNK
-                } else {
-                    chunk
-                },
-                FAN_IN,
-            )),
+            sums: Some(
+                Sorter::new(
+                    folder.join(format!("{file_id}.sums")),
+                    if chunk == SORT_CHUNK {
+                        CHECKSUM_CHUNK
+                    } else {
+                        chunk
+                    },
+                    FAN_IN,
+                )
+                .ordered(ChunkOrder::Radix),
+            ),
         })
     }
 
@@ -702,9 +944,11 @@ impl Writer {
             let start = self.at;
             let out = &mut self.out;
             let mut length = 0u64;
-            sorter.finish(|key| {
-                out.write_all(&TimeRecord::from_sort_key(&key).encode())?;
-                length += TIME_BYTES as u64;
+            sorter.finish(|keys| {
+                for key in keys {
+                    out.write_all(&TimeRecord::from_sort_key(key).encode())?;
+                }
+                length += (keys.len() * TIME_BYTES) as u64;
                 Ok(())
             })?;
             self.at += length;
@@ -783,9 +1027,11 @@ impl Writer {
         let start = self.at;
         let out = &mut self.out;
         let mut length = 0u64;
-        sums.finish(|key| {
-            out.write_all(&ChecksumRecord::from_sort_key(&key).encode())?;
-            length += CHECKSUM_BYTES as u64;
+        sums.finish(|keys| {
+            for key in keys {
+                out.write_all(&ChecksumRecord::from_sort_key(key).encode())?;
+            }
+            length += (keys.len() * CHECKSUM_BYTES) as u64;
             Ok(())
         })?;
         self.at += length;
@@ -857,25 +1103,27 @@ impl Writer {
         let start = self.at;
         let mut written = 0u64;
         let out = &mut self.out;
-        sorter.finish(|key| {
-            let (lane, series, point) = layout::from_point_key(&key);
-            if open
-                .as_ref()
-                .is_some_and(|g| (g.lane, g.series) != (lane, series))
-                && let Some(g) = open.take()
-            {
-                groups.push(g.close(&mut buckets)?);
+        sorter.finish(|keys| {
+            for key in keys {
+                let (lane, series, point) = layout::from_point_key(key);
+                if open
+                    .as_ref()
+                    .is_some_and(|g| (g.lane, g.series) != (lane, series))
+                    && let Some(g) = open.take()
+                {
+                    groups.push(g.close(&mut buckets)?);
+                }
+                let group = open.get_or_insert_with(|| OpenGroup {
+                    lane,
+                    series,
+                    first: written,
+                    count: 0,
+                    buckets: Vec::new(),
+                });
+                group.add(shift, &point);
+                out.write_all(&point.encode())?;
+                written += 1;
             }
-            let group = open.get_or_insert_with(|| OpenGroup {
-                lane,
-                series,
-                first: written,
-                count: 0,
-                buckets: Vec::new(),
-            });
-            group.add(shift, &point);
-            out.write_all(&point.encode())?;
-            written += 1;
             Ok(())
         })?;
         if let Some(g) = open.take() {
@@ -2040,8 +2288,8 @@ mod tests {
         }
     }
 
-    /// The sorted output, the most runs merged at once, and how many files
-    /// were in the folder while the last merge ran.
+    /// The sorted output, the most runs merged at once, and how many bytes
+    /// the files in the folder held while the last merge ran.
     fn sort_all(
         scratch: &Scratch,
         input: &[u64],
@@ -2055,11 +2303,14 @@ mod tests {
         let mut out = Vec::new();
         let mut files = 0;
         let widest = sorter
-            .finish(|b| {
+            .finish(|records| {
                 if out.is_empty() {
-                    files = fs::read_dir(&scratch.0).unwrap().count();
+                    files = fs::read_dir(&scratch.0)
+                        .unwrap()
+                        .map(|e| e.unwrap().metadata().unwrap().len() as usize)
+                        .sum();
                 }
-                out.push(u64::from_be_bytes(b));
+                out.extend(records.iter().map(|b| u64::from_be_bytes(*b)));
                 Ok(())
             })
             .unwrap();
@@ -2069,24 +2320,126 @@ mod tests {
     #[test]
     fn the_sorter_merges_more_runs_than_it_opens_at_once() {
         let scratch = Scratch::new();
-        // A scrambled sequence with repeats: 5,000 records in runs of 7 is
-        // 715 runs, merged 4 at a time in five passes.
+        // A scrambled sequence with repeats: 5,000 records in chunks of 7
+        // is hundreds of runs, merged 4 at a time in many passes.
         let input: Vec<u64> = (0..5_000u64).map(|i| (i * 7_919) % 1_009).collect();
         let mut expected = input.clone();
         expected.sort_unstable();
-        // Never more runs at once than allowed, and only the last pass's
-        // file is left by the time the output is handed out.
-        assert_eq!(sort_all(&scratch, &input, 7, 4), (expected.clone(), 4, 1));
-        assert_eq!(sort_all(&scratch, &input, 7, 32), (expected.clone(), 32, 1));
+        // Never more runs at once than allowed, and by the time the output
+        // is handed out the temporary files hold at most twice the input.
+        for fan_in in [4, 32] {
+            let (out, widest, files) = sort_all(&scratch, &input, 7, fan_in);
+            assert_eq!((out == expected, widest), (true, fan_in));
+            assert!(files <= 2 * 8 * input.len(), "{files}");
+        }
         // Few enough runs to merge in one go; one chunk, sorted in memory.
         assert_eq!(
             sort_all(&scratch, &input, 1_000, 32),
-            (expected.clone(), 5, 1)
+            (expected.clone(), 5, 8 * input.len())
         );
         assert_eq!(sort_all(&scratch, &input, 100_000, 4), (expected, 0, 0));
         assert_eq!(sort_all(&scratch, &[], 7, 4), (Vec::new(), 0, 0));
+        // Input in order is one run, whatever the chunk.
+        let sorted: Vec<u64> = (0..5_000).collect();
+        assert_eq!(sort_all(&scratch, &sorted, 7, 4), (sorted, 1, 8 * 5_000));
         // Its temporary files are gone.
         assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_sorter_gives_the_order_of_a_plain_sort_whatever_the_input() {
+        let scratch = Scratch::new();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Records of a group (eight bytes) and a value (four), as the
+        // sorter of kept numbers has them.
+        let record = |group: u64, value: u32| {
+            let mut b = [0u8; 12];
+            b[..8].copy_from_slice(&group.to_be_bytes());
+            b[8..].copy_from_slice(&value.to_be_bytes());
+            b
+        };
+        let n = 600u32;
+        let shapes: Vec<(&str, Vec<[u8; 12]>)> = vec![
+            ("sorted", (0..n).map(|i| record(0, i)).collect()),
+            ("ties", (0..n).map(|i| record(0, i / 40)).collect()),
+            (
+                "late",
+                (0..n)
+                    .map(|i| {
+                        record(
+                            0,
+                            if i % 97 == 0 {
+                                i.saturating_sub(150)
+                            } else {
+                                i
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                "blocks swapped",
+                (0..n).map(|i| record(0, (i + 250) % n)).collect(),
+            ),
+            ("reversed", (0..n).map(|i| record(0, n - i)).collect()),
+            (
+                "random",
+                (0..n)
+                    .map(|_| record(random() % 50, random() as u32 % 100))
+                    .collect(),
+            ),
+            ("all equal", (0..n).map(|_| record(7, 7)).collect()),
+            (
+                "streams apart",
+                (0..n)
+                    .map(|i| record(0, i * 10 + (i % 3) * 2_000))
+                    .collect(),
+            ),
+            (
+                "groups",
+                (0..n)
+                    .map(|i| record(u64::from(i % 9) << 40, i - i % 9 + (i % 4)))
+                    .collect(),
+            ),
+            (
+                "first bytes spread",
+                (0..n)
+                    .map(|_| record(random(), random() as u32 % 3))
+                    .collect(),
+            ),
+        ];
+        for (name, input) in &shapes {
+            let mut expected = input.clone();
+            expected.sort_unstable();
+            for how in [ChunkOrder::Compare, ChunkOrder::Grouped, ChunkOrder::Radix] {
+                for chunk in [1, 3, 64, 1_000] {
+                    for fan_in in [2, 3, 8, 128] {
+                        let mut sorter =
+                            Sorter::<12>::new(scratch.0.join("s"), chunk, fan_in).ordered(how);
+                        for r in input {
+                            sorter.push(*r).unwrap();
+                        }
+                        let mut out = Vec::new();
+                        let widest = sorter
+                            .finish(|records| {
+                                out.extend_from_slice(records);
+                                Ok(())
+                            })
+                            .unwrap();
+                        let what = format!("{name} {how:?} chunk {chunk} fan-in {fan_in}");
+                        assert!(out == expected, "{what}");
+                        assert!(widest <= fan_in, "{what}");
+                        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 0, "{what}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
