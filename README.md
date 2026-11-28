@@ -194,58 +194,89 @@ Limits of working from counters alone are listed at the top of
 - Files are read on several threads at once, four unless
   `PACKETLANE_INGEST_THREADS` says otherwise (0 to 64; never more than
   the machine has cores by default; 0 reads each file on the calling
-  thread and stores it before the next is read). One file is read on one
-  thread, so a run of one large file gains nothing. What is stored is the
-  same whatever the number: a file is read, checked and its segment
-  written with lanes numbered as the file meets them, then the files are
-  stored in their order, each in its own transaction as before; the ids
-  a segment holds (its first packet, its lanes) are foreseen from the
-  files before it and checked by that transaction, and a file not given
-  the ids foreseen (another writer stored meanwhile, or a file before it
-  failed) is read again. The six sorting buffers of every thread share
-  12 MB (1 MB each up to two threads, 512 KB at four, never under
-  256 KB).
-- Writing uses about 18 MB of memory whatever the size of the run
-  (measured: 18 MB for three million packets in 900 lanes and for ten
-  million in 12). Sorting a segment's time order, its kept numbers, its
-  checksums and its values in order of number takes six 1 MB buffers, and
-  merging what they spilled 2 MB more; comparing sources about 5 MB more
-  whatever the number of files or of repeats, and SQLite's page cache up
-  to 2 MB, filled only as far as it writes (`PACKETLANE_CACHE_MB` sets
-  it). SQLite holds no packets, so it writes little: measured, a cache of
-  2, 4 or 8 MB ingests either run in the same time (8.8 s and 5.8 s,
-  within 0.2 s), and peaks at 18, 20.5 and 23.3 MB on the ten million
-  (18.3 MB whatever the cache on the three million).
+  thread and stores it before the next is read). A packet file is
+  decoded and checked on one thread and written to its segment on
+  another, and its segment is written back to disk on a third as it is
+  finished; one file is never split further, so a run of one large file
+  goes no faster than that file. What is stored is the same whatever the
+  number, row for row and segment byte for byte: a file is read, checked
+  and its segment written with lanes numbered as the file meets them,
+  then the files are stored in their order, each in its own transaction
+  as before; the ids a segment holds (its first packet, its lanes) are
+  foreseen from the files before it and checked by that transaction, and
+  a file not given the ids foreseen (another writer stored meanwhile) is
+  read again, as is every file read ahead of one that fails. The first
+  passes of the comparison of sources run on the same number of threads.
+- Writing uses at most about 50 MB with four threads, whatever the size
+  of the run or the number of files (measured: 25 MB for ten million
+  packets in 12 lanes, 31 MB for three million in 900 lanes with six
+  million values kept, 49 MB for 200 files of 50,000 packets in 3,000
+  lanes from ten sources; 19, 21 and 33 MB on one thread). Each thread's
+  six sorters (time orders, kept numbers and delays, checksums, values in
+  order of number) share 12 MB with the others' (1 MB each on one or two
+  threads, 512 KB on four, never under 256 KB), taken when a file is
+  started; up to four batches of 512 records wait between a file's two
+  threads (under 1 MB with kept values); finishing a segment takes a
+  2 MB merge buffer, or 2 MB for one part of the checksums and 2 MB to
+  put it in order, and 0.8 MB of write buffers. That is about 9 MB a
+  thread at four, beside the process, SQLite's page cache (2 MB, filled
+  only as far as it writes; `PACKETLANE_CACHE_MB` sets it) and the
+  comparison of sources (5 MB, 13 MB for the 27,000 pairs of lanes of
+  the 200 files). The allocator keeps what each thread has held, so more
+  threads cost more than the arithmetic says: eight threads peaked at
+  59 MB on the 200 files. More than four is a choice of memory for
+  speed.
 - The store file holds no packets either: 6.6 MB for that run of ten
   million packets (1.95 GB before layout 6), 1.5 MB for the run of three
-  million (1.0 GB), beside segment folders of 1.76 GB and 1.05 GB (1.71
-  and 0.93 GB at layout 6: the values in order of number take 20 bytes
-  each, 44 MB and 120 MB here).
-- Ingest takes 8.6 s for the ten million packets in 12 lanes and 5.9 s for
-  the three million in 900 lanes with six million values kept (19.5 s and
-  10.1 s at layout 6), measured with a game running on the same machine
-  (16 cores, NVMe; with the machine quiet, an earlier build of this
-  milestone took 8.1 and 5.3 s where this one is about 0.7 s quicker).
-  Reading the files with nothing written takes 3.6 and 2.2 s; of the
-  rest, the checksums (sorting them, and comparing sources from them)
-  take about 2.4 s and 0.8 s,
-  the kept numbers and delays 1.3 and 1.5 s, the time orders 0.65 and
-  0.35 s, the values in order of number 0.3 and 0.9 s. Sorting costs what
-  the input's disorder costs: input in time order is written once and
-  read back once, kept numbers (interleaved by lane and series, each in
-  time order) cost a step a group, and only the checksums, which are in
-  no order, pay a full merge. A file read again costs only itself: 2.9 s
-  for 96 MB of one file of that run with 1% added, the other segments
-  untouched; a small run added to a store that holds the ten million
-  costs 0.03 to 0.05 s.
+  million (1.0 GB), beside segment folders of 1.76 GB and 1.05 GB (176
+  and 350 bytes a packet; 1.71 and 0.93 GB at layout 6: the values in
+  order of number take 20 bytes each, 44 MB and 120 MB here); 11.4 MB
+  and 1.82 GB for the 200 files.
+- Ingest takes 3.1 s for the ten million packets in 12 lanes (3.2
+  million a second), 1.85 s for the three million in 900 lanes (1.6
+  million a second) and 6.5 s for the 200 files (1.5 million a second)
+  on four threads; 5.4, 4.2 and 10.9 s on one; 7.3, 4.9 and 12.4 s at
+  c991d80. Medians of three, alternating builds, on an i7-11700K (8
+  cores, 16 threads), NVMe and btrfs, with a desktop session running
+  (load about 1). By threads:
+
+  | threads | long | wide | 200 files | peak MB (long, wide, 200 files) |
+  |---|---|---|---|---|
+  | 1 | 5.3–5.4 s | 4.2–4.3 s | 10.8–11.0 s | 19, 21, 33 |
+  | 2 | 4.3 s | 3.0 s | 7.9 s | 25, 33, 44 |
+  | 3 | 4.0–4.1 s | 1.8–2.4 s | 6.9–7.0 s | 26, 34, 47 |
+  | 4 | 3.1–3.3 s | 1.9 s | 6.4 s | 25, 31, 49 |
+  | 8 | 3.2 s | 1.9–2.4 s | 5.9–6.0 s | 24, 27, 59 |
+
+  The long run's largest file (five million packets) bounds it: read in
+  1.25 s on its two threads and finished in 1.1 s, then 0.45 s to
+  compare sources. With three threads that file is taken last of the
+  three large ones, which is why three are slower than four there. The
+  200 files are bound by the comparison of ten sources logging the same
+  300 streams at the end: 2.9 s to merge the checksums and 0.9 s to count
+  what partners lack, mostly on one thread. With every sorter off the
+  largest files take 1.2 and 0.8 s (long, wide run); of the rest the kept
+  numbers and delays take about 0.5 and 0.4 s, the checksums 0.5 and
+  0.05 s, the time orders 0.3 and 0.1 s, the values in order of number
+  0.05 and 0.25 s. Sorting costs what the input's disorder costs: input
+  in time order is written once and read back once, kept numbers
+  (interleaved by lane and series, each in time order) cost a step a
+  group, and the checksums, which are in no order, are spread over 256
+  parts by their first byte as they come and each part put in order in
+  memory at the end. A file's checksum (to tell it has not changed) is
+  taken eight bytes at a time: ingesting the ten million again with
+  nothing changed takes 0.06 s (0.5 s at c991d80). A file read again
+  costs only itself: 2.9 s for 96 MB of one file of that run with 1%
+  added, the other segments untouched; a small run added to a store that
+  holds the ten million costs 0.03 to 0.05 s (both measured at c991d80).
 - An ingest writes temporary files in the segment folder, each removed
   when done with (or, after a crash, the next time the store is opened for
-  writing): while a file is read, its segment under a temporary name and
-  the sorted runs of its sections, together up to about twice the size
-  of that segment (the most measured at once: 1.1 GB for a run of ten
-  million packets in four files, 420 MB for one of three million in
-  three; the segment folder peaked at 1.9 and 1.1 GB while they were
-  ingested); and when a run
+  writing and no ingest holds the folder): while a file is read, its
+  segment under a temporary name and the sorted runs of its sections,
+  together up to about twice the size of that segment, for each file
+  being read at once (at c991d80, one file at a time, the most measured
+  was 1.1 GB for a run of ten million packets in four files and 420 MB
+  for one of three million in three); and when a run
   that more than one source logged is compared, 12 bytes for each packet
   that a source holds and another source logging the same stream lacks,
   12 for each copy of a packet repeated more than 65,536 times, and for a
@@ -282,6 +313,16 @@ running on the same machine. The same rows come back from both.
 Values after a receive time look each value's packet up to test its
 time, one lookup a value; SQLite's own tables did that in 414 ms on the
 wide run, the segment files take about 150 ms more.
+
+Measured again for files read in parallel (c991d80 against this build,
+the same statements, two rounds of medians of five, alternating, in the
+state described for ingest): every statement returns the same rows, and
+every time is within the rounds' own spread (statements of a few
+milliseconds move between 4 and 20 ms in both builds); the slowest,
+packets per APID over the whole store, took 2454–2459 and 2483 ms on
+the long run, 629–631 and 625–628 ms on the wide one. A plot or a
+density read straight from the store (no server) takes the same at both,
+to 0.01 ms.
 
 ### Timeline
 
@@ -497,6 +538,13 @@ been built here.
   two places. One description per record, with the writer and the reader
   both made from it, would rule out a field written at one offset and read
   at another. For when the format has settled.
+- **Ingest beyond one file a thread**: a file is read on two threads and
+  finished on one, and the comparison of sources at the end of an ingest
+  runs on one thread after its first passes; the first bounds a run of one
+  large file, the second a run of many sources logging the same streams
+  (2.9 s of the 6.4 s of 200 files from ten sources). Files are also taken
+  in their order, so with fewer threads than large files the largest may
+  start last.
 - **An export of packets to a plain SQLite file**, with `packets` and
   `field_values` as real tables, for tools that open the store without
   this program.
@@ -549,6 +597,8 @@ tests/        end-to-end tests, decoders against damaged input, and the test
               vtab.rs runs the same SQL over the tables served from the segment
               files and over the oracle tables a store opened for tests
               writes, and pins the plans of the query builder's statements
+              parallel.rs checks that files read on several threads, out of
+              order or failing, are stored as files read one at a time
 tools/        ui-load.js measures the page in a headless Chrome
 docs/         architecture.md, parsing.md
 container/    development container stub and editor settings
@@ -565,8 +615,9 @@ cargo test --release --test load -- --ignored --nocapture --test-threads 1
 
 generates a long run (few streams, a million packets) and a wide one (900
 lanes from three hosts, values kept and limits on every stream), ingests
-each with the built program, and prints how long ingest took, the memory it
-held, and how long the server took to answer each request the page makes,
+each with the built program (on the threads `PACKETLANE_INGEST_THREADS`
+says), and prints how long ingest took and how long each file took to
+read and to finish, the memory it held, and how long the server took to answer each request the page makes,
 at four zoom levels and while another ingest is running. `LOAD_PACKETS`
 sets the size and `LOAD_DIR` keeps the stores; the top of `tests/load.rs`
 lists the other settings. It fails on what does not depend on the machine:
@@ -579,26 +630,36 @@ time is printed with its change, and marked where that is more than the
 times move on their own. `LOAD_PACKETS=300000` does both runs in under a
 minute.
 
-Measured at `LOAD_PACKETS=1000000` with a game running on the same machine
-(16 cores, NVMe), ebc1b5f against this build (medians; everything the page
-asks for moved by less than the noise except where shown):
+Measured at `LOAD_PACKETS=1000000` on an i7-11700K (8 cores, 16 threads),
+NVMe and btrfs with a desktop session running, c991d80 against this build
+(medians; two runs of each, both shown where they differ):
 
 | | long before | long now | wide before | wide now |
 |---|---|---|---|---|
-| ingest | 1.6 s | 1.0 s | 2.9 s | 2.3 s |
-| peak memory of ingest | 14 MB | 16 MB | 15 MB | 17 MB |
-| store with segments | 180 MB | 185 MB | 311 MB | 351 MB |
-| opening the page | 1.4 ms | 1.2 ms | 47 ms | 44 ms |
-| one view with 6 plots, a tenth | 6.5 ms | 6.7 ms | 43 ms | 43 ms |
-| query: count packets | 29 ms | 19 ms | 32 ms | 20 ms |
-| query: largest values of a field | 47 ms | 0.9 ms | 660 ms | 3.7 ms |
-| query: packets per stream | 334 ms | 341 ms | 291 ms | 297 ms |
-| query: newest packets | 1452 ms | 1427 ms | 1421 ms | 1434 ms |
+| ingest | 0.7–0.8 s | 0.3 s | 1.6 s | 0.6–0.7 s |
+| peak memory of ingest | 16 MB | 23 MB | 17 MB | 28 MB |
+| ingest again, nothing changed | 0.06 s | 0.02 s | 0.06 s | 0.02 s |
+| store with segments | 185 MB | 185 MB | 351 MB | 351 MB |
+| opening the page | 1.0–1.1 ms | 1.1–4.6 ms | 33–36 ms | 32 ms |
+| one view with 6 plots, a tenth | 5.3–5.5 ms | 5.0–5.6 ms | 33 ms | 32–33 ms |
+| query: count packets | 17 ms | 17 ms | 16–19 ms | 17 ms |
+| query: largest values of a field | 1.0 ms | 1.0 ms | 2.6–2.7 ms | 2.5–2.6 ms |
+| query: packets per stream | 281 ms | 282–284 ms | 228 ms | 230–231 ms |
+| query: newest packets | 1154–1167 ms | 1145–1179 ms | 1146–1150 ms | 1133–1163 ms |
 
-At `LOAD_PACKETS=10000000` (the long run only), in the same state:
-ingest 21.5 s and 21 MB at ebc1b5f, 9.9 s and 18 MB now; store 1.72 GB
-and 1.76 GB; count packets 302 and 192 ms; largest values of a field 475
-and 1.0 ms. At both, the "newest packets" query is stopped by the
+Requests of a millisecond or two are marked as changed now and then by
+the test (opening the long run's page 1.1 ms one run, 4.6 ms the next;
+the wide run's narrowest plots 0.7 and 1.8 ms), and the earlier build's
+two runs differ as much (its whole-run density 5.3 and 2.3 ms); read
+straight from the stores those requests take the same at both builds.
+
+At `LOAD_PACKETS=10000000`, in the same state: the long run ingested in
+7.4 s with 18 MB at c991d80 and 3.1 s with 24 MB now (3.3 million
+packets a second), the wide one in 16.6 s with 19 MB and 6.8 s with
+33 MB (1.5 million a second); ingesting again with nothing changed 0.52
+and 0.06 s, 0.48 and 0.04 s; stores 1.76 and 3.43 GB at both; count
+packets 160 and 157 ms at both, packets per stream 3270 and 3289 ms on
+the long run. At both, the "newest packets" query is stopped by the
 server's 10 s time limit.
 
 ```
