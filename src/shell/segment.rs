@@ -643,6 +643,8 @@ pub struct Writer {
     temp: TempFile,
     out: BufWriter<File>,
     at: u64,
+    /// Has the segment written back to disk as it grows.
+    flusher: Flusher,
     count: u64,
     labels: layout::Map<String, u32>,
     label_list: Vec<String>,
@@ -674,6 +676,65 @@ pub struct Writer {
     sums: Option<Sorter<CHECKSUM_KEY_BYTES>>,
     /// Every kept value, to be sorted by series, number, index and place.
     by_value: Option<Sorter<VALUE_KEY_BYTES>>,
+}
+
+/// How much of a segment is written between asking for it to be written
+/// back to disk.
+const FLUSH_EVERY: u64 = 64 << 20;
+
+/// Asks, on a thread of its own, for a segment to be written back to disk
+/// every [`FLUSH_EVERY`] bytes while it is finished, so that the sync that
+/// ends it has little left to wait for. Asking again while it is still
+/// writing back asks for nothing more. (Asked while the file is read as
+/// well, it held up the reading more than it saved: measured on btrfs.)
+struct Flusher {
+    wake: Option<std::sync::mpsc::SyncSender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    next: u64,
+}
+
+impl Flusher {
+    fn start(file: &File) -> Result<Flusher> {
+        let file = file.try_clone()?;
+        let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
+        let thread = std::thread::Builder::new()
+            .name("segment-flush".into())
+            .stack_size(64 << 10)
+            .spawn(move || {
+                while woken.recv().is_ok() {
+                    // The sync that ends the segment reports any failure.
+                    let _ = file.sync_data();
+                }
+            })?;
+        Ok(Flusher {
+            wake: Some(wake),
+            thread: Some(thread),
+            next: FLUSH_EVERY,
+        })
+    }
+
+    /// The file is `at` bytes long now.
+    fn at(&mut self, at: u64) {
+        if at >= self.next {
+            self.next = at + FLUSH_EVERY;
+            if let Some(wake) = &self.wake {
+                let _ = wake.try_send(());
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        self.wake = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for Flusher {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// Bytes written one after another to a temporary file, to be copied into
@@ -806,6 +867,7 @@ impl Writer {
     /// A writer whose sorters of records `n` bytes long hold `chunk(n)`.
     fn build(folder: &Path, stem: &str, chunk: impl Fn(usize) -> usize) -> Result<Writer> {
         let temp = TempFile::create(folder.join(format!("{stem}.seg.tmp")))?;
+        let flusher = Flusher::start(&temp.file)?;
         let mut out = BufWriter::with_capacity(IO_BUFFER, temp.file.try_clone()?);
         out.write_all(&MAGIC)?;
         let path = |what: &str| folder.join(format!("{stem}.{what}"));
@@ -821,6 +883,7 @@ impl Writer {
             temp,
             out,
             at: MAGIC.len() as u64,
+            flusher,
             count: 0,
             labels: layout::Map::default(),
             label_list: Vec::new(),
@@ -1028,6 +1091,7 @@ impl Writer {
         let start = self.at;
         self.out.write_all(bytes)?;
         self.at += bytes.len() as u64;
+        self.flusher.at(self.at);
         Ok(start)
     }
 
@@ -1087,7 +1151,9 @@ impl Writer {
             let out = &mut self.out;
             let levels = &mut self.levels[c];
             let mut length = 0u64;
+            let flusher = &mut self.flusher;
             sorter.finish(|keys| {
+                flusher.at(start + length);
                 for key in keys {
                     let mut record = TimeRecord::from_sort_key(key);
                     levels.add(record.lane, record.ns);
@@ -1180,7 +1246,9 @@ impl Writer {
         let start = self.at;
         let out = &mut self.out;
         let mut length = 0u64;
+        let flusher = &mut self.flusher;
         sums.finish(|keys| {
+            flusher.at(start + length);
             for key in keys {
                 let mut record = ChecksumRecord::from_sort_key(key);
                 record.lane = lanes[record.lane as usize];
@@ -1258,6 +1326,7 @@ impl Writer {
         }
         self.out.write_all(&tail.encode())?;
         self.out.flush()?;
+        self.flusher.stop();
         self.temp.file.sync_all()?;
 
         // The name is free if no earlier segment holds it, including the
@@ -1318,7 +1387,9 @@ impl Writer {
         let start = self.at;
         let mut written = 0u64;
         let out = &mut self.out;
+        let flusher = &mut self.flusher;
         sorter.finish(|keys| {
+            flusher.at(start + written * POINT_BYTES as u64);
             for key in keys {
                 let (lane, series, point) = layout::from_point_key(key);
                 if open
