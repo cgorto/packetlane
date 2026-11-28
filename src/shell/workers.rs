@@ -122,6 +122,7 @@ pub fn read_file<'a>(
     stem: &str,
     chunk_bytes: usize,
     stop: &AtomicBool,
+    hook: Option<&Hook>,
 ) -> Result<(Read<'a>, Option<Writer>)> {
     let (checksum, size) = Hashing::new(File::open(&job.path)?).finish()?;
     let (checksum, size) = (checksum as i64, i64::try_from(size)?);
@@ -154,7 +155,8 @@ pub fn read_file<'a>(
     // segment on another, a batch at a time.
     let (batches, to_write) = mpsc::sync_channel::<Vec<Item<'a>>>(BATCHES_AHEAD);
     let (writer, read) = std::thread::scope(|scope| {
-        let writing = scope.spawn(move || write_batches(writer, to_write));
+        let rel = job.rel.as_str();
+        let writing = scope.spawn(move || write_batches(writer, to_write, rel, hook));
         let read = (|| -> Result<()> {
             let mut batch = Vec::with_capacity(BATCH);
             let mut seen = 0u64;
@@ -175,6 +177,11 @@ pub fn read_file<'a>(
                     }
                 };
                 let Seen { row, values } = check.observe(&record);
+                if seen == 1
+                    && let Some(hook) = hook
+                {
+                    hook(&job.rel, Stage::Decoding);
+                }
                 let lane = lanes.number(row.lane())?;
                 for v in &values {
                     if v.num.is_some() {
@@ -266,8 +273,18 @@ struct Item<'a> {
 
 /// Writes batches of records to a segment until there are no more, and
 /// hands the writer back.
-fn write_batches(mut writer: Writer, batches: mpsc::Receiver<Vec<Item<'_>>>) -> Result<Writer> {
-    for batch in batches {
+fn write_batches(
+    mut writer: Writer,
+    batches: mpsc::Receiver<Vec<Item<'_>>>,
+    rel: &str,
+    hook: Option<&Hook>,
+) -> Result<Writer> {
+    for (n, batch) in batches.into_iter().enumerate() {
+        if n == 0
+            && let Some(hook) = hook
+        {
+            hook(rel, Stage::Writing);
+        }
         for item in batch {
             if let Some(text) = item.new_label {
                 writer.add_label(text)?;
@@ -345,6 +362,11 @@ impl Settings {
 /// Where a reading thread is with a file, as a [`Hook`] is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
+    /// Its first record decoded and checked, on the thread that reads it.
+    Decoding,
+    /// Its first records taken, on the thread that writes them to the
+    /// segment.
+    Writing,
     /// Read, its segment written as far as it can be without ids.
     Read,
     /// About to finish its segment, the ids given.
@@ -523,6 +545,7 @@ fn work<'a>(shared: &Shared<'_, 'a>, events: mpsc::Sender<Event<'a>>) {
                 &stem,
                 settings.chunk_bytes,
                 &gate.stopping,
+                *hook,
             )?;
             if let Some(hook) = hook {
                 hook(&j.rel, Stage::Read);

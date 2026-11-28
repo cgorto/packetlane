@@ -959,7 +959,9 @@ impl Store {
             }
             phases.mark("text log buckets");
             tx.execute(sql::DELETE_CROSS_FINDINGS, params![run_id])?;
-            let threads = self.readers.workers.max(1);
+            // At most four: each merges up to 64 sections at once, their read
+            // buffers sharing one budget.
+            let threads = self.readers.workers.clamp(1, 4);
             for finding in cross_findings(&tx, &self.segments, run_id, threads, &mut phases)? {
                 tx.execute(
                     sql::INSERT_FINDING,
@@ -1108,8 +1110,15 @@ impl Store {
         };
         let stem = workers::stem(0);
         let stop = AtomicBool::new(false);
-        let (read, writer) =
-            workers::read_file(&job, config, &self.segments, &stem, CHUNK_BYTES, &stop)?;
+        let (read, writer) = workers::read_file(
+            &job,
+            config,
+            &self.segments,
+            &stem,
+            CHUNK_BYTES,
+            &stop,
+            hook,
+        )?;
         if let Some(hook) = hook {
             hook(rel, workers::Stage::Read);
             if writer.is_some() {

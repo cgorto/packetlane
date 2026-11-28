@@ -476,3 +476,40 @@ fn files_read_while_another_writer_stores_are_given_the_ids_the_store_gives() {
         count("SELECT sum(packets) FROM files")
     );
 }
+
+/// A file whose reading fails partway, on the thread that decodes it or on
+/// the one writing its segment (with batches still to come, so that the
+/// decoding thread is waiting on it): that file fails, the ingest goes
+/// on, and every other file is stored as when files are read one at a
+/// time.
+#[test]
+fn a_file_that_fails_while_it_is_read_fails_alone() {
+    let s = Scratch::new();
+    mixed_run(&s);
+    // Many batches' worth of records.
+    s.write("extra/big.bin", &raw(&[0x61, 0x62, 0x63], 3_000, 4));
+    let failing: Hook = Arc::new(|rel: &str, stage: Stage| match (rel, stage) {
+        ("extra/raw-02.bin", Stage::Decoding) => panic!("made to fail decoding"),
+        ("extra/big.bin", Stage::Writing) => panic!("made to fail writing"),
+        ("bench-b/gen.bin", Stage::Writing) => panic!("made to fail writing"),
+        _ => {}
+    });
+    let one = ingest(&s, &s.db("one"), 0, Some(failing.clone()));
+    let failed: Vec<&str> = one
+        .files
+        .iter()
+        .filter(|f| f.note.contains("made to fail"))
+        .map(|f| f.rel.as_str())
+        .collect();
+    assert_eq!(
+        failed,
+        ["bench-b/gen.bin", "extra/big.bin", "extra/raw-02.bin"]
+    );
+    let want = dump(&s.db("one"));
+    for threads in [1, 4] {
+        let name = format!("many{threads}");
+        let got = ingest(&s, &s.db(&name), threads, Some(failing.clone()));
+        assert_eq!(outcomes(&one), outcomes(&got), "{threads} threads");
+        same(&want, &dump(&s.db(&name)), &format!("{threads} threads"));
+    }
+}
